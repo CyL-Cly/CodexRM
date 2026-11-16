@@ -1,0 +1,25 @@
+[Unit]
+Description=CodexRM remote workspace relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codexrm
+Group=codexrm
+WorkingDirectory=/opt/codexrm
+EnvironmentFile=/opt/codexrm/server.env
+ExecStart=/opt/codexrm/bin/codexrm-server --addr 127.0.0.1:18080 --data /opt/codexrm/data
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/codexrm/data
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

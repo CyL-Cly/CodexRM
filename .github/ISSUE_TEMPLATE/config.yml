@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞私密报告
+    url: https://github.com/codexrm/codexrm/security/advisories/new
+    about: 不要通过公开 Issue 披露安全问题。

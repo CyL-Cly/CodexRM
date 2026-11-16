@@ -1,0 +1,33 @@
+# Local runtime state and credentials
+.state/
+.env
+.env.*
+!.env.example
+server.env
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Build and test output
+bin/
+dist/
+*.exe
+*.test
+*.log
+coverage.out
+
+# Local engineering notes and reference material (not distributed)
+.work/
+codex/
+ChatGPT.html
+ChatGPT_files/
+docs/deployments/
+docs/reviews/
+docs/provider-models-*.md
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
