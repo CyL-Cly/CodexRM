@@ -26,8 +26,12 @@ func TestNativeInstallationCreatesOnlyDirectRestartShortcut(t *testing.T) {
 		t.Fatalf("desktop entries: %v, %v", files, err)
 	}
 	target, args := readShortcut(t, filepath.Join(testRoot, "Desktop", files[0].Name()))
-	if target != filepath.Join(root, "bin", "codexrm-agent.exe") || args != "--restart" {
-		t.Fatalf("shortcut target=%q args=%q", target, args)
+	wantTarget := filepath.Join(root, "bin", "codexrm-agent.exe")
+	targetInfo, targetErr := os.Stat(target)
+	wantInfo, wantErr := os.Stat(wantTarget)
+	// Shell links may expand short paths or normalize path casing.
+	if targetErr != nil || wantErr != nil || !os.SameFile(targetInfo, wantInfo) || args != "--restart" {
+		t.Fatalf("shortcut target=%q (stat: %v), want=%q (stat: %v), args=%q", target, targetErr, wantTarget, wantErr, args)
 	}
 	if _, err := os.Stat(filepath.Join(root, "scripts")); !os.IsNotExist(err) {
 		t.Fatal("native installation contains a script directory")
