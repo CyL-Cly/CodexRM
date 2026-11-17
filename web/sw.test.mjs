@@ -113,9 +113,21 @@ function createHarness() {
   };
 }
 
-const SHELL = "codexrm-shell-0.6.0";
-const PAGES = "codexrm-pages-0.6.0";
-const RUNTIME = "codexrm-runtime-0.6.0";
+const VERSION = "20261116-9";
+const SHELL = `codexrm-shell-${VERSION}`;
+const PAGES = `codexrm-pages-${VERSION}`;
+const RUNTIME = `codexrm-runtime-${VERSION}`;
+
+test("HTML, manifest and service worker share the date asset version", () => {
+  const html = readFileSync(new URL("index.html", import.meta.url), "utf8");
+  for (const path of ["/styles.css", "/pwa.js", "/app.js", "/manifest.webmanifest", "/icons/icon.svg", "/icons/icon-192.png"])
+    assert.ok(html.includes(`${path}?v=${VERSION}`), `${path} is missing ?v=${VERSION}`);
+  const manifest = JSON.parse(readFileSync(new URL("manifest.webmanifest", import.meta.url), "utf8"));
+  for (const icon of manifest.icons)
+    assert.ok(icon.src.endsWith(`?v=${VERSION}`), `${icon.src} is missing the date version`);
+  const worker = readFileSync(new URL("sw.js", import.meta.url), "utf8");
+  assert.ok(worker.includes(`const VERSION = "${VERSION}"`));
+});
 
 test("manifest has installable identity and real 192/512 PNG icons", () => {
   const manifest = JSON.parse(readFileSync(new URL("manifest.webmanifest", import.meta.url), "utf8"));
@@ -123,7 +135,7 @@ test("manifest has installable identity and real 192/512 PNG icons", () => {
   assert.equal(manifest.display, "standalone");
   for (const size of [192, 512]) {
     const icon = manifest.icons.find((item) => item.sizes === `${size}x${size}` && item.purpose === "any");
-    const bytes = readFileSync(new URL(icon.src.slice(1), import.meta.url));
+    const bytes = readFileSync(new URL(icon.src.split("?")[0].slice(1), import.meta.url));
     assert.equal(bytes.subarray(1, 4).toString(), "PNG");
     assert.equal(bytes.readUInt32BE(16), size);
     assert.equal(bytes.readUInt32BE(20), size);
@@ -147,9 +159,9 @@ test("versioned assets use cache-first without another network request", async (
   const harness = createHarness();
   await harness.lifecycle("install");
   harness.networkCalls.length = 0;
-  const result = await harness.dispatchFetch(`/app.js?v=0.6.0`);
+  const result = await harness.dispatchFetch(`/app.js?v=${VERSION}`);
   assert.equal(result.controlled, true);
-  assert.equal(await result.response.text(), `network:${ORIGIN}/app.js?v=0.6.0`);
+  assert.equal(await result.response.text(), `network:${ORIGIN}/app.js?v=${VERSION}`);
   assert.equal(harness.networkCalls.length, 0);
 });
 
@@ -159,7 +171,7 @@ test("API, authenticated, non-GET and cross-origin requests bypass service-worke
     ["/api/v1/health", {}],
     ["/manifest.webmanifest", { headers: { Authorization: "Bearer secret" } }],
     ["/manifest.webmanifest", { method: "POST" }],
-    ["https://outside.invalid/app.js?v=0.6.0", {}],
+    [`https://outside.invalid/app.js?v=${VERSION}`, {}],
   ]) {
     const result = await harness.dispatchFetch(url, options);
     assert.equal(result.controlled, false);
@@ -184,15 +196,36 @@ test("navigation is network-first, then reuses the newest cached page offline", 
   assert.equal(await fallback.response.text(), `network:${ORIGIN}/`);
 });
 
-test("unversioned static assets use a runtime stale-while-revalidate cache", async () => {
+test("cache write failures never displace successful network responses", async () => {
+  const navigation = createHarness();
+  await navigation.lifecycle("install");
+  const pages = navigation.cache(PAGES);
+  await pages.put("/", new Response("stale cached page", { headers: { "Content-Type": "text/html" } }));
+  pages.put = async () => { throw new DOMException("storage full", "QuotaExceededError"); };
+  navigation.setNetworkHandler(async () => new Response("fresh online page", { headers: { "Content-Type": "text/html" } }));
+  const page = await navigation.dispatchFetch("/", { mode: "navigate" });
+  assert.equal(await page.response.text(), "fresh online page");
+
+  const assets = createHarness();
+  const runtime = assets.cache(RUNTIME);
+  runtime.put = async () => { throw new DOMException("storage full", "QuotaExceededError"); };
+  assets.setNetworkHandler(async () => new Response("fresh online asset"));
+  for (const url of ["/app.js?v=uncached", "/manifest.webmanifest"]) {
+    const result = await assets.dispatchFetch(url);
+    assert.equal(await result.response.text(), "fresh online asset");
+  }
+});
+
+test("versioned static assets use a runtime stale-while-revalidate cache", async () => {
   const harness = createHarness();
   await harness.lifecycle("install");
+  const path = `/manifest.webmanifest?v=${VERSION}`;
   harness.setNetworkHandler(async () => new Response("updated manifest", { headers: { "Content-Type": "application/manifest+json" } }));
-  const first = await harness.dispatchFetch("/manifest.webmanifest");
-  assert.equal(await first.response.text(), `network:${ORIGIN}/manifest.webmanifest`);
-  assert.equal(await (await harness.cache(RUNTIME).match("/manifest.webmanifest")).text(), "updated manifest");
+  const first = await harness.dispatchFetch(path);
+  assert.equal(await first.response.text(), `network:${ORIGIN}${path}`);
+  assert.equal(await (await harness.cache(RUNTIME).match(path)).text(), "updated manifest");
 
   harness.setNetworkHandler(async () => { throw new Error("offline"); });
-  const second = await harness.dispatchFetch("/manifest.webmanifest");
+  const second = await harness.dispatchFetch(path);
   assert.equal(await second.response.text(), "updated manifest");
 });

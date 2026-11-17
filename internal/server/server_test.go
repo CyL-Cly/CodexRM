@@ -8,8 +8,11 @@ import (
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/codexrm/codexrm/internal/server"
 	"github.com/gorilla/websocket"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +20,11 @@ import (
 
 func newServer(t *testing.T) (*server.Server, *httptest.Server) {
 	t.Helper()
-	s, e := server.New(server.Config{DataDir: t.TempDir(), AdminToken: "test-key"})
+	webDir, e := filepath.Abs(filepath.Join("..", "..", "web"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	s, e := server.New(server.Config{DataDir: t.TempDir(), WebDir: webDir, AdminToken: "test-key"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -99,7 +106,7 @@ func response(t *testing.T, c *websocket.Conn, id int) map[string]any {
 	return m["result"].(map[string]any)
 }
 
-func TestAuthOriginsAndEmbeddedUI(t *testing.T) {
+func TestAuthOriginsAndDiskUI(t *testing.T) {
 	_, h := newServer(t)
 	resp, e := http.Get(h.URL + "/")
 	if e != nil {
@@ -172,6 +179,93 @@ func TestAuthOriginsAndEmbeddedUI(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != 401 {
 		t.Fatal("revoked client still authenticated")
+	}
+}
+
+func TestAgentDeviceManagement(t *testing.T) {
+	_, h := newServer(t)
+	var enrolled protocol.EnrollResponse
+	post(t, h, "/api/v1/agent/enroll", "", "test-key", protocol.EnrollRequest{Name: "host", InstallationID: "device-management"}, &enrolled)
+	var pair protocol.PairStartResponse
+	post(t, h, "/api/v1/agent/pair", enrolled.Token, "", map[string]any{}, &pair)
+	var claimed protocol.PairClaimResponse
+	post(t, h, "/api/v1/client/claim", "", "", protocol.PairClaimRequest{Code: pair.ManualPairingCode, ClientName: "phone"}, &claimed)
+	if claimed.ExpiresAt != 0 {
+		t.Fatalf("authorization has an expiry: %d", claimed.ExpiresAt)
+	}
+	r, _ := http.NewRequest("GET", h.URL+"/api/v1/agent/clients", nil)
+	r.Header.Set("Authorization", "Bearer "+enrolled.Token)
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed struct {
+		Data []protocol.ClientInfo `json:"data"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 || len(listed.Data) != 1 || listed.Data[0].ClientName != "phone" {
+		t.Fatalf("unexpected device list: %d %+v", resp.StatusCode, listed.Data)
+	}
+	r, _ = http.NewRequest("DELETE", h.URL+"/api/v1/agent/clients/"+claimed.ClientID, nil)
+	r.Header.Set("Authorization", "Bearer "+enrolled.Token)
+	resp, err = http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("delete authorization: %d", resp.StatusCode)
+	}
+	r, _ = http.NewRequest("GET", h.URL+"/api/v1/agents", nil)
+	r.Header.Set("Authorization", "Bearer "+claimed.Token)
+	resp, err = http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("deleted client still authenticated: %d", resp.StatusCode)
+	}
+}
+
+func TestDiskWebChangesDoNotRequireServerRestart(t *testing.T) {
+	webDir := t.TempDir()
+	index := filepath.Join(webDir, "index.html")
+	if err := os.WriteFile(index, []byte("before"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := server.New(server.Config{DataDir: t.TempDir(), WebDir: webDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := httptest.NewServer(s.Handler())
+	t.Cleanup(func() { s.Close(); h.Close() })
+	readIndex := func() string {
+		resp, err := http.Get(h.URL + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("index status: %s", resp.Status)
+		}
+		return string(body)
+	}
+	if got := readIndex(); got != "before" {
+		t.Fatalf("initial index: %q", got)
+	}
+	if err := os.WriteFile(index, []byte("after"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readIndex(); got != "after" {
+		t.Fatalf("index after disk update: %q", got)
 	}
 }
 

@@ -109,9 +109,31 @@ func Load(ctx context.Context, path string) ([]Provider, error) {
 			hash := sha256.Sum256([]byte(id))
 			p = Provider{ID: "ccswitch_" + hex.EncodeToString(hash[:8]), Name: name, Source: "CCSwitch", Models: []Model{}, Warning: "供应商配置无效，请在 CCSwitch 中检查"}
 		}
-		if p.Official() && len(p.Models) == 0 {
-			p.Models = officialModels(filepath.Join(filepath.Dir(abs), "codex-official-models.json"))
-			if len(p.Models) > 0 {
+		if p.Official() {
+			cached := officialModels(filepath.Join(filepath.Dir(abs), "codex-official-models.json"))
+			if len(cached) > 0 {
+				indices := map[string]int{}
+				for i, model := range p.Models {
+					indices[model.Model] = i
+				}
+				for _, model := range cached {
+					if i, exists := indices[model.Model]; exists {
+						saved := &p.Models[i]
+						if saved.DisplayName == saved.Model {
+							saved.DisplayName = model.DisplayName
+						}
+						if len(saved.SupportedReasoningEfforts) == 0 {
+							saved.SupportedReasoningEfforts = model.SupportedReasoningEfforts
+						}
+						if saved.DefaultReasoningEffort == "" {
+							saved.DefaultReasoningEffort = model.DefaultReasoningEffort
+						}
+					} else {
+						indices[model.Model] = len(p.Models)
+						model.IsDefault = model.Model == p.DefaultModel
+						p.Models = append(p.Models, model)
+					}
+				}
 				p.Source = "CCSwitch 官方模型缓存"
 			}
 		}

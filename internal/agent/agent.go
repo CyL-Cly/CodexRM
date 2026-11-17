@@ -25,9 +25,11 @@ import (
 )
 
 type Config struct {
+	OnReady                                                                                                         func()
 	ServerURL, AppServerURL, AppServerToken, Name, DataDir, InstallationID, EnrollmentKey, CodexPath, Cwd, MockAddr string
 	CCSwitchDB                                                                                                      string
 	Mock                                                                                                            bool
+	NoAutoPair                                                                                                      bool
 }
 type creds struct {
 	AgentID        string `json:"agentId"`
@@ -46,13 +48,19 @@ type approval struct {
 	Sending  bool
 }
 type Agent struct {
-	cfg       Config
-	creds     creds
-	mu        sync.Mutex
-	writeMu   sync.Mutex
-	relay     *websocket.Conn
-	owners    map[string]string
-	approvals map[string]approval
+	cfg        Config
+	creds      creds
+	credsDirty bool
+	credsMu    sync.RWMutex
+	enrollMu   sync.Mutex
+	mu         sync.Mutex
+	writeMu    sync.Mutex
+	relay      *websocket.Conn
+	owners     map[string]string
+	approvals  map[string]approval
+	queueMu    sync.Mutex
+	queues     map[string]*messageQueue
+	queueCtx   context.Context
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -109,7 +117,24 @@ func New(cfg Config) (*Agent, error) {
 	a.creds.ServerURL = cfg.ServerURL
 	return a, nil
 }
+
+func (a *Agent) StateDir() string { return a.cfg.DataDir }
+
+func (a *Agent) Connected() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.relay != nil
+}
+
+func (a *Agent) credentials() (creds, bool) {
+	a.credsMu.RLock()
+	defer a.credsMu.RUnlock()
+	return a.creds, a.credsDirty
+}
+
 func (a *Agent) save() error {
+	a.credsMu.Lock()
+	defer a.credsMu.Unlock()
 	b, e := json.MarshalIndent(a.creds, "", "  ")
 	if e != nil {
 		return e
@@ -118,19 +143,28 @@ func (a *Agent) save() error {
 	if e = os.WriteFile(p+".tmp", b, 0600); e != nil {
 		return e
 	}
-	return os.Rename(p+".tmp", p)
+	if e = os.Rename(p+".tmp", p); e != nil {
+		return e
+	}
+	a.credsDirty = false
+	return nil
 }
 func (a *Agent) request(ctx context.Context, path string, input, output any) error {
+	return a.requestMethod(ctx, "POST", path, input, output)
+}
+
+func (a *Agent) requestMethod(ctx context.Context, method, path string, input, output any) error {
 	raw, e := json.Marshal(input)
 	if e != nil {
 		return e
 	}
-	req, e := http.NewRequestWithContext(ctx, "POST", a.cfg.ServerURL+path, bytes.NewReader(raw))
+	req, e := http.NewRequestWithContext(ctx, method, a.cfg.ServerURL+path, bytes.NewReader(raw))
 	if e != nil {
 		return e
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+a.creds.Token)
+	credentials, _ := a.credentials()
+	req.Header.Set("Authorization", "Bearer "+credentials.Token)
 	req.Header.Set("X-Enrollment-Key", a.cfg.EnrollmentKey)
 	resp, e := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if e != nil {
@@ -144,20 +178,34 @@ func (a *Agent) request(ctx context.Context, path string, input, output any) err
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("%s: HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
+	if output == nil {
+		return nil
+	}
 	return json.Unmarshal(data, output)
 }
 func (a *Agent) ensureEnrolled(ctx context.Context) error {
-	if a.creds.Token != "" && (a.creds.ExpiresAt == 0 || a.creds.ExpiresAt > time.Now().Add(24*time.Hour).Unix()) {
+	a.enrollMu.Lock()
+	defer a.enrollMu.Unlock()
+	credentials, dirty := a.credentials()
+	if dirty {
+		if err := a.save(); err != nil {
+			return err
+		}
+	}
+	if credentials.Token != "" && (credentials.ExpiresAt == 0 || credentials.ExpiresAt > time.Now().Add(24*time.Hour).Unix()) {
 		return nil
 	}
 	var out protocol.EnrollResponse
-	if e := a.request(ctx, "/api/v1/agent/enroll", protocol.EnrollRequest{Name: a.cfg.Name, OS: runtime.GOOS, Arch: runtime.GOARCH, AppVersion: protocol.Version, InstallationID: a.creds.InstallationID}, &out); e != nil {
+	if e := a.request(ctx, "/api/v1/agent/enroll", protocol.EnrollRequest{Name: a.cfg.Name, OS: runtime.GOOS, Arch: runtime.GOARCH, AppVersion: protocol.Version, InstallationID: credentials.InstallationID}, &out); e != nil {
 		return e
 	}
+	a.credsMu.Lock()
 	a.creds.AgentID = out.AgentID
 	a.creds.EnvironmentID = out.EnvironmentID
 	a.creds.Token = out.Token
 	a.creds.ExpiresAt = out.ExpiresAt
+	a.credsDirty = true
+	a.credsMu.Unlock()
 	return a.save()
 }
 func (a *Agent) Pair(ctx context.Context) (*protocol.PairStartResponse, error) {
@@ -170,14 +218,52 @@ func (a *Agent) Pair(ctx context.Context) (*protocol.PairStartResponse, error) {
 	}
 	return &out, nil
 }
-func (a *Agent) Run(ctx context.Context) error {
-	if e := a.ensureEnrolled(ctx); e != nil {
-		return e
+func (a *Agent) ListDevices(ctx context.Context) ([]protocol.ClientInfo, error) {
+	if err := a.ensureEnrolled(ctx); err != nil {
+		return nil, err
 	}
-	if p, e := a.Pair(ctx); e == nil {
-		log.Printf("Pairing code: %s (valid until %s). Open %s", p.ManualPairingCode, time.Unix(p.ExpiresAt, 0).Local().Format(time.RFC3339), a.cfg.ServerURL)
-	} else {
-		return e
+	var out struct {
+		Data []protocol.ClientInfo `json:"data"`
+	}
+	if err := a.requestMethod(ctx, "GET", "/api/v1/agent/clients", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
+}
+
+func (a *Agent) RemoveDevice(ctx context.Context, clientID string) error {
+	if err := a.ensureEnrolled(ctx); err != nil {
+		return err
+	}
+	return a.requestMethod(ctx, "DELETE", "/api/v1/agent/clients/"+url.PathEscape(clientID), nil, nil)
+}
+
+func (a *Agent) Run(ctx context.Context) error {
+	for {
+		e := a.ensureEnrolled(ctx)
+		if e == nil {
+			break
+		}
+		if _, dirty := a.credentials(); !dirty {
+			return e
+		}
+		log.Printf("save renewed agent credentials: %v; retrying", e)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+	if !a.cfg.NoAutoPair {
+		if p, e := a.Pair(ctx); e == nil {
+			instructions, e := a.PairingInstructions(p)
+			if e != nil {
+				return e
+			}
+			log.Print(instructions)
+		} else {
+			return e
+		}
 	}
 	if a.cfg.Mock {
 		mock, e := appserver.StartMock(a.cfg.MockAddr)
@@ -206,11 +292,21 @@ func (a *Agent) Run(ctx context.Context) error {
 			return fmt.Errorf("initialize Codex: %w", e)
 		}
 		log.Printf("Codex ready; workspace: %s; mock=%v", a.cfg.Cwd, a.cfg.Mock)
+		if a.cfg.OnReady != nil {
+			a.cfg.OnReady()
+		}
 		a.mu.Lock()
 		a.approvals = map[string]approval{}
 		a.mu.Unlock()
-		app.OnNotification(a.forward)
 		appCtx, stop := context.WithCancel(ctx)
+		a.queueMu.Lock()
+		a.queues = map[string]*messageQueue{}
+		a.queueCtx = appCtx
+		a.queueMu.Unlock()
+		app.OnNotification(func(raw json.RawMessage) {
+			a.forward(raw)
+			a.queueNotification(appCtx, app, raw)
+		})
 		go func() {
 			select {
 			case <-app.Done():
@@ -317,7 +413,8 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	} else {
 		u.Scheme = "ws"
 	}
-	conn, _, e := (&websocket.Dialer{HandshakeTimeout: 10 * time.Second}).DialContext(ctx, u.String(), http.Header{"Authorization": []string{"Bearer " + a.creds.Token}})
+	credentials, _ := a.credentials()
+	conn, _, e := (&websocket.Dialer{HandshakeTimeout: 10 * time.Second}).DialContext(ctx, u.String(), http.Header{"Authorization": []string{"Bearer " + credentials.Token}})
 	if e != nil {
 		return e
 	}
@@ -336,7 +433,7 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
-	log.Printf("relay connected as %s (%s)", a.creds.AgentID, a.cfg.Name)
+	log.Printf("relay connected as %s (%s)", credentials.AgentID, a.cfg.Name)
 	slots := make(chan struct{}, 32)
 	for {
 		var env protocol.Envelope
@@ -417,7 +514,7 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, conn *websock
 		return
 	}
 	if req.Method == "codexrm/info" {
-		a.respond(conn, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": protocol.Version, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "providerModels": true, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
+		a.respond(conn, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": protocol.Version, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "providerModels": true, "messageQueue": true, "desktopControl": runtime.GOOS == "windows", "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
 		a.mu.Lock()
 		pending := []approval{}
 		for _, p := range a.approvals {
@@ -453,6 +550,16 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, conn *websock
 		defer cancel()
 		result, err := a.threadSnapshot(callCtx, app, params)
 		a.respond(conn, env, result, err)
+		return
+	}
+	if strings.HasPrefix(req.Method, "codexrm/queue/") {
+		result, err := a.queueRPC(ctx, app, env.ClientID, req.Method, params)
+		a.respond(conn, env, mustJSON(result), err)
+		return
+	}
+	if strings.HasPrefix(req.Method, "codexrm/desktop/") {
+		result, err := a.desktopRPC(req.Method)
+		a.respond(conn, env, mustJSON(result), err)
 		return
 	}
 	if strings.HasPrefix(req.Method, "codexrm/") {

@@ -172,8 +172,26 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 				c.rpcError(id, "thread not found")
 			} else {
 				thread := copy.(map[string]any)
+				if msg.Method == "thread/read" && p["includeTurns"] == false {
+					delete(thread, "turns")
+				}
 				c.reply(id, map[string]any{"thread": thread, "model": thread["model"], "modelProvider": thread["modelProvider"]})
 			}
+		case "thread/turns/list":
+			h.mu.Lock()
+			t := h.threadLocked(tid)
+			data := []any{}
+			if t != nil {
+				turns := t["turns"].([]any)
+				for i := len(turns) - 1; i >= 0; i-- {
+					data = append(data, clone(turns[i]))
+					if limit, ok := p["limit"].(float64); ok && len(data) >= int(limit) {
+						break
+					}
+				}
+			}
+			h.mu.Unlock()
+			c.reply(id, map[string]any{"data": data, "nextCursor": nil})
 		case "thread/name/set":
 			h.mu.Lock()
 			t := h.threadLocked(tid)
@@ -200,7 +218,37 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 				cancel()
 			}
 			c.reply(id, map[string]any{})
-		case "turn/start":
+		case "turn/start", "turn/steer":
+			if msg.Method == "turn/steer" {
+				h.mu.Lock()
+				t := h.threadLocked(tid)
+				var turn map[string]any
+				if t != nil && h.active[tid] != nil {
+					turns := t["turns"].([]any)
+					if len(turns) > 0 {
+						turn = turns[len(turns)-1].(map[string]any)
+					}
+				}
+				if turn == nil || turn["id"] != p["expectedTurnId"] {
+					h.mu.Unlock()
+					c.rpcError(id, "active turn does not match expectedTurnId")
+					continue
+				}
+				input, _ := p["input"].([]any)
+				if len(input) == 0 {
+					h.mu.Unlock()
+					c.rpcError(id, "input is required")
+					continue
+				}
+				item := map[string]any{"id": fmt.Sprintf("user_%d", h.next.Add(1)), "type": "userMessage", "content": input}
+				turn["items"] = append(turn["items"].([]any), item)
+				turnID := turn["id"]
+				copy := clone(item)
+				h.mu.Unlock()
+				c.reply(id, map[string]any{"turnId": turnID})
+				c.event("item/completed", map[string]any{"threadId": tid, "turnId": turnID, "item": copy})
+				continue
+			}
 			h.mu.Lock()
 			t := h.threadLocked(tid)
 			if t == nil {

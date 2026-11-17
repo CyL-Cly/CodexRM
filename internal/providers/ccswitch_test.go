@@ -157,3 +157,23 @@ func TestOfficialCatalogDoesNotReuseCustomModels(t *testing.T) {
 		t.Fatal("official login should use the native OpenAI provider")
 	}
 }
+
+func TestOfficialCatalogIncludesCacheAlongsideSavedDefault(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{"config": "model = 'saved-default'\nmodel_provider = 'openai'\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := database(t, []string{"official", "codex", "Official", string(raw)})
+	cache := `{"official":{"fetched_at":1,"models":[{"slug":"saved-default","display_name":"Saved default","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium","description":"Medium"}]},{"slug":"another-official-model"}]}}`
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "codex-official-models.json"), []byte(cache), 0600); err != nil {
+		t.Fatal(err)
+	}
+	items, err := Load(context.Background(), path)
+	if err != nil || len(items) != 1 || len(items[0].Models) != 2 {
+		t.Fatalf("official model cache was hidden by the saved default: %v, %#v", err, items)
+	}
+	model := items[0].Models[0]
+	if !model.IsDefault || model.DefaultReasoningEffort != "medium" || len(model.SupportedReasoningEfforts) != 1 {
+		t.Fatalf("default model lost its cached metadata: %#v", model)
+	}
+}

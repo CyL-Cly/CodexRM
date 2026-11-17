@@ -15,6 +15,11 @@ import (
 )
 
 // Client multiplexes RPC calls and server-initiated approvals over stdio or WS.
+type managedProcess interface {
+	Kill() error
+	Close() error
+}
+
 type Client struct {
 	mu       sync.Mutex
 	writeMu  sync.Mutex
@@ -60,10 +65,13 @@ func Dial(ctx context.Context, rawURL string, token ...string) (*Client, error) 
 
 // Launch inherits the local login and config. Relay never receives login secrets.
 func Launch(ctx context.Context, executable, cwd string) (*Client, error) {
-	if executable == "" {
-		executable = "codex"
+	executable, err := resolveCodexExecutable(executable)
+	if err != nil {
+		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, executable, "app-server", "--listen", "stdio://")
+	hideChildProcess(cmd)
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = cwd
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
@@ -75,9 +83,11 @@ func Launch(ctx context.Context, executable, cwd string) (*Client, error) {
 		_ = stdin.Close()
 		return nil, err
 	}
-	if err = cmd.Start(); err != nil {
+	process, err := startManagedProcess(cmd)
+	if err != nil {
 		_ = stdin.Close()
-		return nil, fmt.Errorf("start Codex (install CLI or pass --codex): %w", err)
+		_ = stdout.Close()
+		return nil, fmt.Errorf("start Codex (install Codex desktop or pass --codex): %w", err)
 	}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 32<<20)
@@ -92,8 +102,8 @@ func Launch(ctx context.Context, executable, cwd string) (*Client, error) {
 		return nil, errors.New("Codex process exited")
 	}
 	c.write = func(b []byte) error { _, e := stdin.Write(append(b, '\n')); return e }
-	c.shutdown = func() error { _ = stdin.Close(); return cmd.Process.Kill() }
-	go func() { _ = cmd.Wait(); _ = c.Close() }()
+	c.shutdown = func() error { _ = stdin.Close(); return process.Kill() }
+	go func() { _ = cmd.Wait(); _ = c.Close(); _ = process.Close() }()
 	go c.readLoop()
 	return c, nil
 }

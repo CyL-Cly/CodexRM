@@ -23,8 +23,15 @@ const paths = {
   stop: "M7 7h10v10H7z",
   download: "M12 3v12m-5-5 5 5 5-5M5 17v4h14v-4",
 };
-const icon = (name) =>
-  `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name] || paths.code}"/></svg>`;
+const iconCache = new Map();
+const icon = (name) => {
+  if (!iconCache.has(name))
+    iconCache.set(
+      name,
+      `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name] || paths.code}"/></svg>`,
+    );
+  return iconCache.get(name);
+};
 function hydrateIcons(root = document) {
   root
     .querySelectorAll("[data-icon]")
@@ -56,6 +63,12 @@ const state = {
   socket: null,
   generation: 0,
   online: false,
+  reconnecting: false,
+  pairingExpired: false,
+  backgroundSuspended: false,
+  visibilityTimer: null,
+  pingID: null,
+  nextPingID: 0,
   loaded: false,
   threads: [],
   cursor: null,
@@ -72,12 +85,14 @@ const state = {
   modelsLoading: false,
   modelListVersion: 0,
   sending: false,
+  messageQueues: new Map(),
   loading: false,
   readOnly: false,
   started: 0,
   historyCursor: null,
   settings: readStorage("codexrm.settings", {}),
   workspaceViews: readStorage("codexrm.workspaceViews", {}),
+  workspaceSectionCollapsed: readStorage("codexrm.workspaceSectionCollapsed", false) === true,
   drafts: readStorage("codexrm.drafts.v1", {}),
   workspaces: [],
   threadListVersion: 0,
@@ -191,7 +206,27 @@ async function loadWorkspaces() {
   saveWorkspaceView();
   renderWorkspaces();
 }
+function renderWorkspaceSection() {
+  const collapsed = state.workspaceSectionCollapsed;
+  const toggle = $("toggle-workspaces");
+  $("workspace-history").hidden = collapsed;
+  toggle.classList.toggle("collapsed", collapsed);
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.title = collapsed ? "展开工作区" : "收起工作区";
+  toggle.setAttribute("aria-label", toggle.title);
+}
+function toggleWorkspaceSection() {
+  state.workspaceSectionCollapsed = !state.workspaceSectionCollapsed;
+  try {
+    localStorage.setItem(
+      "codexrm.workspaceSectionCollapsed",
+      JSON.stringify(state.workspaceSectionCollapsed),
+    );
+  } catch {}
+  renderWorkspaceSection();
+}
 function renderWorkspaces() {
+  renderWorkspaceSection();
   renderThreads();
   renderWorkspacePath();
 }
@@ -305,6 +340,22 @@ function toast(message) {
     $("toast").hidden = true;
   }, 4500);
 }
+function connectionNotice(status = "") {
+  state.reconnecting = status === "reconnecting";
+  clearTimeout(state.connectionNoticeTimer);
+  const notice = $("connection-notice");
+  notice.dataset.status = status;
+  notice.hidden = !status;
+  $("connection-notice-text").textContent = state.reconnecting
+    ? "连接被断开，重连中"
+    : status === "success" ? "重连成功" : "";
+  if (status === "success" && !document.hidden) {
+    state.connectionNoticeTimer = setTimeout(() => {
+      notice.hidden = true;
+      notice.dataset.status = "";
+    }, 4500);
+  }
+}
 function showError(error) {
   toast(error?.message || String(error));
 }
@@ -327,11 +378,56 @@ async function api(path, body, token) {
   }
   return data;
 }
-function disconnectSocket() {
+let detectedClientProfile;
+function browserClientProfile() {
+  if (detectedClientProfile) return detectedClientProfile;
+  const nav = globalThis.navigator || {};
+  const ua = nav.userAgent || "";
+  const mobile = nav.userAgentData?.mobile || /Android|iPhone|iPad|Mobile/i.test(ua);
+  const platform = /Android/i.test(ua) ? "Android"
+    : /iPhone|iPad/i.test(ua) || (nav.platform === "MacIntel" && nav.maxTouchPoints > 1) ? "iOS"
+    : /Windows/i.test(ua) ? "Windows"
+    : /Macintosh|Mac OS X/i.test(ua) ? "macOS"
+    : /Linux/i.test(ua) ? "Linux"
+    : nav.userAgentData?.platform || nav.platform || "未知系统";
+  const browser = /Edg(?:e|A|iOS)?\//i.test(ua) ? "Edge"
+    : /Firefox|FxiOS/i.test(ua) ? "Firefox"
+    : /Chrome|CriOS/i.test(ua) ? "Chrome"
+    : /Safari/i.test(ua) ? "Safari" : "浏览器";
+  let clientName = `${platform} · ${browser}`;
+  let gl;
+  try {
+    const canvas = document.createElement("canvas");
+    gl = canvas.getContext("webgl2") || canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+    const info = gl?.getExtension("WEBGL_debug_renderer_info");
+    const renderer = info && gl.getParameter(info.UNMASKED_RENDERER_WEBGL);
+    if (typeof renderer === "string" && renderer.trim()) clientName = renderer.trim();
+  } catch {
+    // WebGL and renderer information may be unavailable in this browser.
+  } finally {
+    try { gl?.getExtension("WEBGL_lose_context")?.loseContext(); } catch {}
+  }
+  detectedClientProfile = { clientName, deviceType: mobile || platform === "iOS" ? "mobile" : "desktop" };
+  return detectedClientProfile;
+}
+const syncedClientProfiles = new Map();
+async function syncClientProfile(device) {
+  const profile = browserClientProfile();
+  const signature = JSON.stringify(profile);
+  if (syncedClientProfiles.get(device.token) === signature) return;
+  await api("/api/v1/client/profile", profile, device.token);
+  syncedClientProfiles.set(device.token, signature);
+}
+function disconnectSocket({ preservePairingExpired = false } = {}) {
   state.generation++;
   clearTimeout(state.snapshotTimer);
   clearTimeout(state.reconnectTimer);
+  clearTimeout(state.connectionTimer);
+  clearTimeout(state.pongTimer);
   clearInterval(state.pingTimer);
+  state.pingID = null;
+  if (!preservePairingExpired) state.pairingExpired = false;
+  connectionNotice();
   if (state.socket) {
     state.socket.onclose = null;
     state.socket.close();
@@ -344,6 +440,8 @@ function disconnectSocket() {
   state.pending.clear();
   state.online = false;
   state.loaded = false;
+  state.sending = false;
+  state.loading = false;
   state.requests.clear();
   state.responding.clear();
   renderApprovals();
@@ -382,11 +480,51 @@ function sendResponse(id, result, error) {
   );
   return true;
 }
-function connect() {
+function pingSocket() {
+  const socket = state.socket;
+  if (socket?.readyState !== WebSocket.OPEN || state.pingID !== null) return;
+  const generation = state.generation;
+  state.pingID = String(++state.nextPingID);
+  state.pongTimer = setTimeout(() => {
+    if (generation === state.generation) connect({ reconnect: true });
+  }, 5000);
+  socket.send(JSON.stringify({ type: "ping", pingId: state.pingID }));
+}
+function resumeConnection() {
+  if (document.hidden || !currentDevice() || state.pairingExpired) return;
+  if ($("connection-notice").dataset.status === "success") connectionNotice("success");
+  if (state.socket?.readyState === WebSocket.OPEN) {
+    pingSocket();
+  } else if (state.socket?.readyState !== WebSocket.CONNECTING) {
+    connect({ reconnect: true });
+  }
+}
+function handleVisibilityChange() {
+  if (document.visibilityState === "hidden") {
+    if (state.visibilityTimer !== null || state.backgroundSuspended) return;
+    state.visibilityTimer = setTimeout(() => {
+      state.visibilityTimer = null;
+      if (document.visibilityState !== "hidden") return;
+      state.backgroundSuspended = true;
+      disconnectSocket({ preservePairingExpired: true });
+      renderDevices();
+      renderConnection();
+    }, 5000);
+    return;
+  }
+  clearTimeout(state.visibilityTimer);
+  state.visibilityTimer = null;
+  state.backgroundSuspended = false;
+  resumeConnection();
+}
+function connect({ reconnect = false } = {}) {
+  if (state.backgroundSuspended && document.visibilityState === "hidden") return;
+  state.backgroundSuspended = false;
   disconnectSocket();
+  const device = currentDevice();
+  if (device && reconnect) connectionNotice("reconnecting");
   renderDevices();
   renderConnection();
-  const device = currentDevice();
   if (!device) return;
   const generation = state.generation;
   const url = new URL("/api/v1/client/ws", location.href);
@@ -396,14 +534,13 @@ function connect() {
     `codexrm.token.${device.token}`,
   ]);
   state.socket = socket;
+  state.connectionTimer = setTimeout(() => {
+    if (generation === state.generation) connect({ reconnect: true });
+  }, 10000);
   socket.onopen = () => {
     if (generation !== state.generation) return;
-    state.pingTimer = setInterval(() => {
-      if (socket.readyState === WebSocket.OPEN)
-        socket.send(
-          JSON.stringify({ type: "ping", pingId: String(Date.now()) }),
-        );
-    }, 25000);
+    state.pingTimer = setInterval(pingSocket, 25000);
+    void syncClientProfile(device).catch(() => {});
   };
   socket.onmessage = (event) => {
     if (generation !== state.generation) return;
@@ -414,8 +551,11 @@ function connect() {
       return;
     }
     if (envelope.type === "welcome" || envelope.type === "agent_status") {
+      clearTimeout(state.connectionTimer);
       const wasOnline = state.online;
       state.online = envelope.status === "connected";
+      if (state.online && state.reconnecting) connectionNotice("success");
+      else if (!state.online && wasOnline) connectionNotice("reconnecting");
       if (envelope.agent) {
         device.agent = envelope.agent;
         persist();
@@ -431,6 +571,11 @@ function connect() {
         state.requests.clear();
         renderApprovals();
         rejectPending("远程设备已离线");
+      }
+    } else if (envelope.type === "pong") {
+      if (envelope.pingId === state.pingID) {
+        clearTimeout(state.pongTimer);
+        state.pingID = null;
       }
     } else if (envelope.type === "server_message") {
       const msg = envelope.message;
@@ -460,6 +605,10 @@ function connect() {
   socket.onclose = async () => {
     if (generation !== state.generation) return;
     clearInterval(state.pingTimer);
+    clearTimeout(state.connectionTimer);
+    clearTimeout(state.pongTimer);
+    state.pingID = null;
+    connectionNotice("reconnecting");
     state.online = false;
     state.loaded = false;
     state.requests.clear();
@@ -467,17 +616,20 @@ function connect() {
     rejectPending("服务器连接中断");
     renderConnection();
     renderDevices();
+    state.reconnectTimer = setTimeout(() => connect({ reconnect: true }), 3000);
     try {
       await api("/api/v1/agents", null, device.token);
     } catch (error) {
+      if (generation !== state.generation) return;
       if (error.status === 401) {
-        $("connection-label").textContent = "配对已过期";
+        clearTimeout(state.reconnectTimer);
+        state.pairingExpired = true;
+        connectionNotice();
+        renderConnection();
         toast("此浏览器的配对已失效，请解除后重新配对");
         return;
       }
     }
-    if (generation === state.generation)
-      state.reconnectTimer = setTimeout(connect, 3000);
   };
   socket.onerror = () => {};
 }
@@ -494,6 +646,7 @@ async function bootstrap(generation) {
     const info = await rpc("codexrm/info");
     if (!active()) return;
     state.info = info;
+    state.messageQueues.clear();
     $("demo-badge").hidden = !info.mock;
     if (info.workspaces && state.settings.cwd && !workspaceView().selected) {
       try {
@@ -520,6 +673,8 @@ async function bootstrap(generation) {
     $("welcome-description").textContent = info.mock
       ? "已连接演示设备，可以发送任务体验完整流程。"
       : `已连接 ${info.name}，让 Codex 继续手边的工作。`;
+    state.loaded = true;
+    renderConnection();
     const results = await Promise.allSettled([
       loadThreads(false),
       loadModels(),
@@ -529,8 +684,6 @@ async function bootstrap(generation) {
       toast(`无法读取会话：${results[0].reason.message}`);
     if (results[1].status === "rejected")
       toast(`无法读取供应商模型：${results[1].reason.message}`);
-    state.loaded = true;
-    renderConnection();
     if (state.current) {
       const id = state.current.id;
       await openThread(id, true);
@@ -545,34 +698,69 @@ function renderConnection() {
   $("connection-button").classList.toggle("online", connected);
   $("connection-label").textContent = connected
     ? device?.agent.serverName || "已连接"
-    : device
-      ? "设备离线"
-      : "连接设备";
+    : state.pairingExpired
+      ? "配对已过期"
+      : state.reconnecting
+        ? "重连中…"
+        : device
+          ? "设备离线"
+          : "连接设备";
   $("sidebar-status").textContent = connected
     ? "设备已连接 · 任务在本地运行"
     : device
       ? "等待本地连接器上线"
       : "尚未连接设备";
-  $("send").disabled =
-    state.readOnly ||
-    state.loading ||
-    state.sending ||
-    (!isRunning() &&
-      (!state.online || !state.loaded || !$("prompt").value.trim()));
-  $("send").classList.toggle("running", isRunning());
-  $("send").innerHTML = icon(isRunning() ? "stop" : "arrow");
-  $("send").title = isRunning() ? "停止任务" : "发送消息";
-  $("send").setAttribute("aria-label", isRunning() ? "停止任务" : "发送消息");
+  renderComposerControls();
+  renderWorkspacePath();
+  renderMessageQueue();
+}
+function renderComposerControls() {
+  const running = isRunning();
+  const unavailable = state.readOnly || state.loading || state.sending || !state.online || !state.loaded;
+  const queue = state.messageQueues.get(state.current?.id);
+  const hasQueue = queue?.entries?.length > 0;
+  const hasText = !!$("prompt").value.trim();
+  const sendLabel = hasQueue ? "排队发送" : "发送消息";
+  $("send").disabled = unavailable || !hasText || (hasQueue && !state.info?.messageQueue);
+  $("send").hidden = running;
+  $("send").title = sendLabel;
+  $("send").setAttribute("aria-label", sendLabel);
+  $("stop").hidden = !running;
+  $("stop").disabled = unavailable;
+  $("running-actions").hidden = !running;
+  $("queue-send").disabled = unavailable || !hasText || !state.info?.messageQueue;
+  $("queue-send").title = state.info?.messageQueue ? "当前任务完成后发送（Enter）" : "请更新本地 Agent 以支持排队发送";
+  $("steer").disabled = unavailable || !hasText;
+  $("composer-hint").textContent = running ? "Enter 排队 · Ctrl / ⌘ Enter 插队 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行";
   $("thread-actions").hidden = !state.current;
-  $("activity").hidden = !isRunning();
+  $("activity").hidden = !running;
   $("activity-text").textContent = state.online
     ? "Codex 正在处理"
     : "连接已断开，恢复后同步任务";
   $("add-workspace").disabled = !state.online;
-  $("model").disabled = !state.online || state.loading || state.sending || isRunning() || state.readOnly;
+  $("model").disabled = !state.online || state.loading || state.sending || running || state.readOnly;
   $("effort").disabled = $("model").disabled;
   $("refresh-models").disabled = !state.online || state.modelsLoading;
-  renderWorkspacePath();
+}
+function selectDevice(device) {
+  if (device.agent.agentId !== state.selected) {
+    saveDraft();
+    state.selected = device.agent.agentId;
+    resetView();
+    persist();
+    connect();
+  }
+  closeSidebar();
+}
+function createDeviceButton(device) {
+  const selected = device.agent.agentId === state.selected;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `device ${selected ? "selected" : ""} ${selected && state.online ? "online" : ""}`;
+  button.setAttribute("aria-pressed", selected);
+  button.innerHTML = `<span class="device-icon">${icon("monitor")}</span><span><strong>${escapeHTML(device.agent.serverName)}</strong><small>${escapeHTML(device.agent.os || "computer")} · ${selected ? (state.online ? "在线" : "离线") : "已配对"}</small></span><i class="status-dot"></i>`;
+  button.onclick = () => selectDevice(device);
+  return button;
 }
 function renderDevices() {
   const root = $("devices");
@@ -581,26 +769,31 @@ function renderDevices() {
     const button = document.createElement("button");
     button.className = "empty-device";
     button.innerHTML = icon("plus") + "<span>连接第一台设备</span>";
-    button.onclick = openPair;
+    button.onclick = () => openPair();
     root.append(button);
     return;
   }
-  for (const d of state.devices) {
-    const button = document.createElement("button");
-    button.className = `device ${d.agent.agentId === state.selected ? "selected" : ""} ${d.agent.agentId === state.selected && state.online ? "online" : ""}`;
-    button.innerHTML = `<span class="device-icon">${icon("monitor")}</span><span><strong>${escapeHTML(d.agent.serverName)}</strong><small>${escapeHTML(d.agent.os || "computer")} · ${d.agent.agentId === state.selected ? (state.online ? "在线" : "离线") : "已配对"}</small></span><i class="status-dot"></i>`;
-    button.onclick = () => {
-      if (d.agent.agentId !== state.selected) {
-        saveDraft();
-        state.selected = d.agent.agentId;
-        resetView();
-        persist();
-        connect();
-      }
-      closeSidebar();
-    };
-    root.append(button);
+  for (const device of state.devices) root.append(createDeviceButton(device));
+}
+function openDevicePicker() {
+  const root = $("device-options");
+  root.replaceChildren();
+  if (!state.devices.length) {
+    const empty = document.createElement("p");
+    empty.className = "device-picker-empty";
+    empty.textContent = "尚未配对设备。连接新设备后，可在这里切换。";
+    root.append(empty);
+  } else {
+    for (const device of state.devices) {
+      const button = createDeviceButton(device);
+      button.onclick = () => {
+        $("device-dialog").close();
+        selectDevice(device);
+      };
+      root.append(button);
+    }
   }
+  $("device-dialog").showModal();
 }
 async function loadThreads(more = false) {
   const generation = state.generation;
@@ -766,6 +959,7 @@ function resetView() {
   clearTimeout(state.snapshotTimer);
   state.current = null;
   state.turns = [];
+  state.messageQueues.clear();
   state.requests.clear();
   state.info = null;
   state.workspaces = [];
@@ -880,14 +1074,14 @@ async function openThread(id, silent = false) {
     $("header-subtitle").textContent = title(thread);
     renderWorkspacePath();
     selectThreadModel(result);
-    if (result.reasoningEffort && [...$("effort").options].some((o) => o.value === result.reasoningEffort))
-      $("effort").value = result.reasoningEffort;
     setHome(false);
     upsertThread(thread);
     renderMessages();
     renderApprovals();
     restoreDraft();
     renderConnection();
+    if (state.info?.messageQueue)
+      await loadMessageQueue(id).catch((e) => toast(`排队列表同步失败：${e.message}`));
     scheduleSnapshot();
     if (!silent) closeSidebar();
     scrollBottom();
@@ -974,13 +1168,14 @@ async function loadModels(refresh = false) {
       : { providers: [{ id: "", name: "当前 Codex 配置", models: (await rpc("model/list", { limit: 100 })).data || [] }] };
     if (generation !== state.generation || version !== state.modelListVersion) return;
     const previous = $("model").value || workspaceModelPreference().model || "";
+    const previousEffort = $("effort").value;
     state.providers = result.providers || [];
     state.models = state.providers.flatMap((p) => (p.models || []).filter((m) => !m.hidden).map((m) => ({
       ...m, model: m.model || m.id, providerId: p.id, providerName: p.name,
       key: modelKey(p.id, m.model || m.id),
     })));
     renderModels(previous);
-    if (state.current) selectThreadModel({ thread: state.current, model: state.current.model || selectedModel()?.model });
+    if (state.current) selectThreadModel({ thread: state.current }, previous, previousEffort);
     else if ([...$("effort").options].some((o) => o.value === workspaceModelPreference().effort))
       $("effort").value = workspaceModelPreference().effort;
     const warnings = [...(result.warnings || []), ...state.providers.filter((p) => p.warning).map((p) => `${p.name}：${p.warning}`)];
@@ -1001,7 +1196,11 @@ function renderModels(preferred = $("model").value) {
     const models = state.models.filter((m) => m.providerId === p.id);
     group.label = `${p.name} (${models.length})`;
     group.title = p.warning || p.source || "";
-    for (const m of models) group.append(new Option(`${p.name} · ${m.displayName || m.model}`, m.key));
+    for (const m of models) {
+      const option = new Option(`${p.name} · ${m.displayName || m.model}`, m.key);
+      option.disabled = !!p.unavailable;
+      group.append(option);
+    }
     if (!models.length) {
       const empty = new Option(p.warning || "暂无可用模型", `unavailable:${p.id}`);
       empty.disabled = true;
@@ -1013,11 +1212,20 @@ function renderModels(preferred = $("model").value) {
   renderEfforts();
 }
 function threadProviderId(thread = state.current) {
-  return state.providers.find((p) => p.runtimeId && p.runtimeId === thread?.modelProvider)?.id || "";
+  const runtimeId = thread?.modelProvider;
+  return state.providers.find((p) => p.runtimeId && p.runtimeId === runtimeId)?.id ||
+    (runtimeId?.startsWith("ccswitch_") ? runtimeId : "");
 }
-function selectThreadModel(result) {
+function selectThreadModel(result, preferred = "", effort = result.reasoningEffort || "") {
   const providerId = threadProviderId(result.thread);
   const model = result.model || result.thread?.model;
+  if (providerId && !state.providers.some((p) => p.id === providerId)) {
+    state.providers.push({
+      id: providerId, runtimeId: result.thread.modelProvider,
+      name: "当前会话供应商（目录不可用）", unavailable: true,
+      warning: "未在 CCSwitch 中找到此供应商；选择其他供应商将创建新会话", models: [],
+    });
+  }
   if (model && !state.models.some((m) => m.key === modelKey(providerId, model))) {
     const provider = state.providers.find((p) => p.id === providerId);
     if (provider) {
@@ -1025,12 +1233,13 @@ function selectThreadModel(result) {
       renderModels();
     }
   }
-  const match = state.models.find((m) => m.providerId === providerId && m.model === model);
+  const match = state.models.find((m) => m.providerId === providerId && m.key === preferred) ||
+    state.models.find((m) => m.providerId === providerId && m.model === model);
   $("model").value = match?.key || "";
-  renderEfforts();
+  renderEfforts(effort);
 }
-function renderEfforts() {
-  const previous = $("effort").value;
+function renderEfforts(previous = $("effort").value) {
+  $("effort").value = "";
   $("effort").replaceChildren(new Option("默认思考", ""));
   const model =
     selectedModel() || state.models.find((m) => !m.providerId && m.isDefault);
@@ -1073,11 +1282,15 @@ function itemFor(turn, id, type) {
 }
 function upsertItem(turn, item) {
   turn.items ||= [];
-  if (item.type === "userMessage")
-    turn.items = turn.items.filter(
-      (i) => !String(i.id).startsWith("optimistic-user-"),
-    );
   const index = turn.items.findIndex((i) => i.id === item.id);
+  if (item.type === "userMessage" && index < 0) {
+    const text = (i) => (i.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    const optimistic = turn.items.findIndex((i) => String(i.id).startsWith("optimistic-user-") && text(i) === text(item));
+    if (optimistic >= 0) {
+      turn.items[optimistic] = item;
+      return;
+    }
+  }
   if (index < 0) turn.items.push(item);
   else turn.items[index] = { ...turn.items[index], ...item };
 }
@@ -1089,6 +1302,10 @@ function onEvent(msg) {
       state.requests.set(msg.id, msg);
       renderApprovals();
     }
+    return;
+  }
+  if (method === "codexrm/queue/updated") {
+    acceptMessageQueue(p);
     return;
   }
   if (
@@ -1163,26 +1380,32 @@ function onEvent(msg) {
   } else if (method === "item/agentMessage/delta") {
     const item = itemFor(turnFor(p.turnId), p.itemId, "agentMessage");
     item.text = (item.text || "") + (p.delta || "");
+    dirtyMessageItems.add(item.id);
   } else if (method === "item/commandExecution/outputDelta") {
     const item = itemFor(turnFor(p.turnId), p.itemId, "commandExecution");
     item.aggregatedOutput = (item.aggregatedOutput || "") + (p.delta || "");
+    dirtyMessageItems.add(item.id);
   } else if (method.startsWith("item/reasoning/") && method.endsWith("Delta")) {
     const item = itemFor(turnFor(p.turnId), p.itemId, "reasoning");
     item.reasoningText = (item.reasoningText || "") + (p.delta || "");
+    dirtyMessageItems.add(item.id);
   } else if (method === "turn/plan/updated") {
     const item = itemFor(turnFor(p.turnId), "plan-" + p.turnId, "plan");
     item.text = p.explanation || "";
     item.plan = p.plan || [];
+    dirtyMessageItems.add(item.id);
   } else if (method === "turn/diff/updated") {
     const item = itemFor(turnFor(p.turnId), "diff-" + p.turnId, "diff");
     item.diff = p.diff || "";
+    dirtyMessageItems.add(item.id);
   } else if (method === "error") {
     const t = turnFor(p.turnId || "error");
     t.error = p.error || { message: "Codex 发生错误" };
     if (!p.willRetry) t.status = "failed";
   }
   scheduleRender();
-  renderConnection();
+  if (["turn/started", "turn/completed", "error"].includes(method))
+    renderConnection();
 }
 let renderScheduled = false;
 function scheduleRender() {
@@ -1385,8 +1608,41 @@ function itemHTML(item) {
 function toolHTML(id, title, text, status) {
   return `<details class="tool-card" data-detail="${escapeHTML(id)}"><summary>${escapeHTML(title)}<span>${escapeHTML(status)}</span></summary><pre class="tool-output">${escapeHTML(text)}</pre></details>`;
 }
+const dirtyMessageItems = new Set();
+const messageRender = { layout: "", items: new Map() };
 function renderMessages() {
   const root = $("messages");
+  const items = state.turns.flatMap((turn) => turn.items || []);
+  const layout = JSON.stringify([
+    !!state.historyCursor,
+    state.readOnly,
+    state.turns.map((turn) => [
+      (turn.items || []).map((item) => item.id),
+      turn.error || null,
+      displayedTurnStatus(turn),
+    ]),
+  ]);
+  if (messageRender.layout === layout && root.childElementCount) {
+    let incremental = true;
+    for (const item of items) {
+      const cached = messageRender.items.get(item.id);
+      if (cached?.source === item && !dirtyMessageItems.has(item.id)) continue;
+      if (!cached?.node?.isConnected) {
+        incremental = false;
+        break;
+      }
+      const details = cached.node.querySelector("details");
+      const wasOpen = details?.open;
+      cached.node.innerHTML = itemHTML(item);
+      if (wasOpen) cached.node.querySelector("details").open = true;
+      cached.source = item;
+    }
+    if (incremental) {
+      dirtyMessageItems.clear();
+      return;
+    }
+  }
+
   const open = new Set(
     [...root.querySelectorAll("details[open]")].map((n) => n.dataset.detail),
   );
@@ -1396,8 +1652,12 @@ function renderMessages() {
   if (state.readOnly)
     html +=
       '<div class="turn-status">此会话由桌面客户端管理，自动同步已保存的消息。结束原会话后可重新打开继续。</div>';
+  const rendered = new Map();
   for (const turn of state.turns) {
-    for (const item of turn.items || []) html += itemHTML(item);
+    for (const item of turn.items || []) {
+      html += `<div class="message-item" data-item-id="${escapeHTML(item.id)}">${itemHTML(item)}</div>`;
+      rendered.set(item.id, { source: item, node: null });
+    }
     if (turn.error)
       html += `<div class="error-message">${escapeHTML(turn.error.message || JSON.stringify(turn.error))}</div>`;
     const status = displayedTurnStatus(turn);
@@ -1409,26 +1669,34 @@ function renderMessages() {
       html += '<div class="turn-status">等待原客户端的状态 · 自动同步中</div>';
   }
   root.innerHTML = html;
+  root.querySelectorAll("[data-item-id]").forEach((node) => {
+    const cached = rendered.get(node.dataset.itemId);
+    if (cached) cached.node = node;
+  });
   root.querySelectorAll("details").forEach((n) => {
     if (open.has(n.dataset.detail)) n.open = true;
   });
-  if ($("older-turns"))
-    $("older-turns").onclick = () => olderTurns().catch(showError);
-  root.querySelectorAll("[data-copy]").forEach(
-    (button) =>
-      (button.onclick = async () => {
-        const item = state.turns
-          .flatMap((t) => t.items || [])
-          .find((i) => i.id === button.dataset.copy);
-        try {
-          await navigator.clipboard.writeText(item?.text || "");
-          toast("回复已复制");
-        } catch {
-          toast("当前浏览器无法直接复制，请选择文本复制");
-        }
-      }),
-  );
+  messageRender.layout = layout;
+  messageRender.items = rendered;
+  dirtyMessageItems.clear();
 }
+$("messages").addEventListener("click", async (event) => {
+  if (event.target.closest("#older-turns")) {
+    olderTurns().catch(showError);
+    return;
+  }
+  const button = event.target.closest("[data-copy]");
+  if (!button) return;
+  const item = state.turns
+    .flatMap((turn) => turn.items || [])
+    .find((entry) => entry.id === button.dataset.copy);
+  try {
+    await navigator.clipboard.writeText(item?.text || "");
+    toast("回复已复制");
+  } catch {
+    toast("当前浏览器无法直接复制，请选择文本复制");
+  }
+});
 function isPermissionRequest(msg) {
   return ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"].includes(msg.method);
 }
@@ -1617,26 +1885,159 @@ function sandboxPolicy() {
   if (mode === "read-only") return { type: "readOnly", networkAccess: false };
   return { type: "dangerFullAccess" };
 }
-async function submit(event) {
+function turnParams(text) {
+  const model = selectedModel();
+  const effort = $("effort").value || model?.defaultReasoningEffort;
+  return {
+    threadId: state.current.id,
+    approvalPolicy: state.settings.approvalPolicy || "never",
+    sandboxPolicy: sandboxPolicy(),
+    input: [{ type: "text", text, text_elements: [] }],
+    ...(model ? { model: model.model } : {}),
+    ...(effort ? { effort } : {}),
+  };
+}
+function acceptMessageQueue(queue) {
+  if (!queue?.threadId) return;
+  const previous = state.messageQueues.get(queue.threadId);
+  if (previous && previous.version > queue.version) return;
+  state.messageQueues.set(queue.threadId, queue);
+  if (state.current?.id === queue.threadId) renderConnection();
+}
+async function loadMessageQueue(threadId) {
+  const generation = state.generation;
+  const result = await rpc("codexrm/queue/list", { threadId });
+  if (generation === state.generation) acceptMessageQueue(result);
+}
+function renderMessageQueue() {
+  const root = $("message-queue");
+  const queue = state.messageQueues.get(state.current?.id);
+  root.hidden = !queue?.entries?.length;
+  root.replaceChildren();
+  if (root.hidden) return;
+  const header = document.createElement("div");
+  header.className = "queue-header";
+  const label = document.createElement("span");
+  label.textContent = `${queue.paused ? "排队已暂停" : "待发送"} · ${queue.entries.length} 条`;
+  header.append(label);
+  const disabled = !state.online || !state.loaded || state.loading || state.readOnly || state.sending;
+  if (queue.paused) {
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.textContent = "继续排队";
+    resume.disabled = disabled;
+    resume.onclick = () => changeMessageQueue("resume");
+    header.append(resume);
+  }
+  root.append(header);
+  const list = document.createElement("div");
+  list.className = "queue-list";
+  for (const [index, entry] of queue.entries.entries()) {
+    const row = document.createElement("div");
+    row.className = "queue-entry";
+    const text = document.createElement("p");
+    text.textContent = `${index + 1}. ${(entry.input || []).filter((i) => i.type === "text").map((i) => i.text).join("\n")}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = queue.dispatching && index === 0 ? "发送中…" : "取消";
+    remove.disabled = disabled || (queue.dispatching && index === 0);
+    remove.setAttribute("aria-label", `取消第 ${index + 1} 条排队消息`);
+    remove.onclick = () => changeMessageQueue("remove", entry.id);
+    row.append(text, remove);
+    list.append(row);
+  }
+  root.append(list);
+  if (queue.error) {
+    const error = document.createElement("p");
+    error.className = "queue-error";
+    error.textContent = queue.error;
+    root.append(error);
+  }
+}
+async function changeMessageQueue(action, id) {
+  if (state.sending || state.loading || state.readOnly || !state.current) return;
+  const generation = state.generation;
+  const threadId = state.current.id;
+  state.sending = true;
+  renderConnection();
+  try {
+    const result = await rpc(`codexrm/queue/${action}`, { threadId, ...(id ? { id } : {}) });
+    if (generation === state.generation) acceptMessageQueue(result);
+  } catch (e) {
+    if (generation === state.generation) showError(e);
+  } finally {
+    if (generation === state.generation) {
+      state.sending = false;
+      renderConnection();
+    }
+  }
+}
+async function stopTurn() {
+  const turn = state.turns.find((t) => t.status === "inProgress");
+  if (!turn || state.sending || state.loading || state.readOnly) return;
+  const generation = state.generation;
+  state.sending = true;
+  renderConnection();
+  try {
+    await rpc("turn/interrupt", { threadId: state.current.id, turnId: turn.id });
+    if (generation === state.generation) toast("已请求停止任务，排队消息将保留");
+  } catch (e) {
+    if (generation === state.generation) showError(e);
+  } finally {
+    if (generation === state.generation) {
+      state.sending = false;
+      renderConnection();
+    }
+  }
+}
+async function sendFollowup(text, mode) {
+  const generation = state.generation;
+  const threadId = state.current.id;
+  const turn = state.turns.find((t) => t.status === "inProgress");
+  if (mode === "steer" && !turn) return toast("当前任务已结束，请发送新消息");
+  if (mode !== "steer" && !state.info?.messageQueue)
+    return toast("请更新本地 Agent 以支持排队发送");
+  const original = $("prompt").value;
+  const optimistic = mode === "steer" ? {
+    id: `optimistic-user-${Date.now()}-${++state.nextID}`,
+    type: "userMessage", content: [{ type: "text", text }],
+  } : null;
+  if (optimistic) turn.items.push(optimistic);
+  const params = turnParams(text);
+  state.sending = true;
+  $("prompt").value = "";
+  resizePrompt();
+  renderMessages();
+  scrollBottom();
+  try {
+    if (mode === "steer") {
+      await rpc("turn/steer", { threadId, expectedTurnId: turn.id, input: params.input });
+      if (generation === state.generation) toast("补充指令已发送到当前任务");
+    } else {
+      const result = await rpc("codexrm/queue/add", params);
+      if (generation === state.generation) acceptMessageQueue(result);
+    }
+  } catch (e) {
+    if (optimistic) turn.items = turn.items.filter((i) => i !== optimistic);
+    if (generation === state.generation && state.current?.id === threadId) {
+      $("prompt").value = original + ($("prompt").value ? `\n\n${$("prompt").value}` : "");
+      resizePrompt();
+      renderMessages();
+    }
+    if (generation === state.generation) showError(e);
+  } finally {
+    if (generation === state.generation) {
+      state.sending = false;
+      renderConnection();
+    }
+  }
+}
+async function submit(event, mode = "auto") {
   event?.preventDefault();
   if (currentDevice() && state.online && (state.loading || !state.loaded))
     return toast("正在同步工作区，请稍候再发送");
   if (state.readOnly) {
     toast("此会话由另一个 Codex 实例运行，请先结束原会话或新建会话");
-    return;
-  }
-  if (isRunning()) {
-    const turn = state.turns.find((t) => t.status === "inProgress");
-    if (!turn) return;
-    try {
-      await rpc("turn/interrupt", {
-        threadId: state.current.id,
-        turnId: turn.id,
-      });
-      toast("已请求停止任务");
-    } catch (e) {
-      showError(e);
-    }
     return;
   }
   const text = $("prompt").value.trim();
@@ -1649,6 +2050,8 @@ async function submit(event) {
     toast("设备离线，请先启动本地 Agent");
     return;
   }
+  if (mode === "steer" || mode === "queue" || isRunning() || state.messageQueues.get(state.current?.id)?.entries?.length)
+    return sendFollowup(text, mode);
   state.sending = true;
   renderConnection();
   const generation = state.generation;
@@ -1687,15 +2090,7 @@ async function submit(event) {
     $("prompt").value = "";
     resizePrompt();
     try {
-      const result = await rpc("turn/start", {
-        threadId,
-        approvalPolicy: state.settings.approvalPolicy || "never",
-        sandboxPolicy: sandboxPolicy(),
-        input: [{ type: "text", text, text_elements: [] }],
-        ...(selectedModel() ? { model: selectedModel().model } : {}),
-        ...(($("effort").value || selectedModel()?.defaultReasoningEffort)
-          ? { effort: $("effort").value || selectedModel().defaultReasoningEffort } : {}),
-      });
+      const result = await rpc("turn/start", turnParams(text));
       if (generation !== state.generation || state.current?.id !== threadId)
         return;
       if (selectedModel()) state.current.model = selectedModel().model;
@@ -1739,19 +2134,113 @@ function resizePrompt() {
   $("prompt").style.height = "auto";
   $("prompt").style.height = Math.min($("prompt").scrollHeight, 200) + "px";
   saveDraft();
-  renderConnection();
+  renderComposerControls();
 }
-function openPair() {
-  $("pair-code").value = "";
+function pairCodeFromLink() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const code = params.get("pair")?.trim() || "";
+  if (!code) return "";
+  params.delete("pair");
+  const hash = params.toString();
+  history.replaceState(
+    null,
+    "",
+    `${location.pathname}${location.search}${hash ? `#${hash}` : ""}`,
+  );
+  return code;
+}
+function openPair(code = "") {
+  $("pair-code").value = code;
   $("pair-error").textContent = "";
   $("agent-command").textContent =
     `codexrm-agent --server ${location.origin}\n  --cwd <本地项目路径>`;
   $("pair-dialog").showModal();
   setTimeout(() => $("pair-code").focus(), 50);
 }
+const mobileLayoutQuery =
+  "(max-width:760px), (max-height:500px) and (pointer:coarse)";
+function isMobileLayout() {
+  return matchMedia(mobileLayoutQuery).matches;
+}
+function openSidebar() {
+  if (!isMobileLayout()) return;
+  document.body.classList.add("sidebar-open");
+  $("sidebar-overlay").hidden = false;
+}
 function closeSidebar() {
   document.body.classList.remove("sidebar-open");
   $("sidebar-overlay").hidden = true;
+}
+let sidebarTouch = null;
+const sidebarGestureExcluded = [
+  "button",
+  "a",
+  "input",
+  "textarea",
+  "select",
+  "label",
+  "summary",
+  "dialog",
+  "[contenteditable]",
+  "[role='button']",
+  ".composer",
+  ".messages",
+  ".approval-area",
+  ".message-queue",
+  ".activity",
+].join(",");
+const sidebarCloseGestureExcluded =
+  "input, textarea, select, [contenteditable]";
+function sidebarGestureStart(event) {
+  sidebarTouch = null;
+  const opening = event.currentTarget === $("main");
+  const isOpen = document.body.classList.contains("sidebar-open");
+  if (
+    !isMobileLayout() ||
+    (opening ? isOpen : !isOpen) ||
+    document.querySelector("dialog[open]") ||
+    event.touches.length !== 1 ||
+    event.target.closest?.(
+      opening ? sidebarGestureExcluded : sidebarCloseGestureExcluded,
+    )
+  )
+    return;
+  const touch = event.touches[0];
+  sidebarTouch = {
+    id: touch.identifier,
+    x: touch.clientX,
+    y: touch.clientY,
+    opening,
+  };
+}
+function sidebarGestureMove(event) {
+  if (!sidebarTouch) return;
+  if (event.touches.length !== 1) {
+    sidebarTouch = null;
+    return;
+  }
+  const touch = event.touches[0];
+  if (
+    touch.identifier !== sidebarTouch.id ||
+    Math.abs(touch.clientY - sidebarTouch.y) >
+      Math.abs(touch.clientX - sidebarTouch.x)
+  )
+    sidebarTouch = null;
+}
+function sidebarGestureEnd(event) {
+  const start = sidebarTouch;
+  sidebarTouch = null;
+  if (!start) return;
+  const touch = Array.from(event.changedTouches).find(
+    (t) => t.identifier === start.id,
+  );
+  if (!touch) return;
+  const deltaX = touch.clientX - start.x;
+  const deltaY = touch.clientY - start.y;
+  const swiped = start.opening ? deltaX >= 56 : deltaX <= -56;
+  if (!swiped || Math.abs(deltaX) <= Math.abs(deltaY) * 1.2) return;
+  if (start.opening) openSidebar();
+  else closeSidebar();
 }
 function settings() {
   $("sandbox").value = state.settings.sandbox || "danger-full-access";
@@ -1761,8 +2250,26 @@ function settings() {
     ? `${d.agent.serverName} · ${d.agent.os} ${d.agent.arch}${state.info ? ` · ${state.info.transport} · v${state.info.version}` : ""}`
     : "尚未选择设备";
   $("disconnect").hidden = !d;
+  const desktopControl = Boolean(d && state.online && state.info?.desktopControl);
+  $("close-codex-desktop").hidden = !desktopControl;
+  $("close-codex-desktop-help").hidden = !desktopControl;
   $("settings-dialog").showModal();
 }
+async function closeCodexDesktop() {
+  if (!state.online) return toast("设备离线，无法关闭 Codex 桌面客户端");
+  if (!window.confirm("确定关闭 Codex 桌面客户端吗？未保存的桌面操作可能丢失。")) return;
+  const button = $("close-codex-desktop");
+  button.disabled = true;
+  try {
+    const result = await rpc("codexrm/desktop/close");
+    toast(result.message || "Codex 桌面客户端已关闭");
+  } catch (e) {
+    showError(e);
+  } finally {
+    button.disabled = false;
+  }
+}
+$("close-codex-desktop").onclick = closeCodexDesktop;
 $("pair-form").onsubmit = async (event) => {
   event.preventDefault();
   $("pair-submit").disabled = true;
@@ -1771,8 +2278,7 @@ $("pair-form").onsubmit = async (event) => {
   try {
     const result = await api("/api/v1/client/claim", {
       code: $("pair-code").value.trim(),
-      clientName: "CodexRM Web",
-      deviceType: "browser",
+      ...browserClientProfile(),
     });
     const old = state.devices.find(
       (d) => d.agent.agentId === result.agent.agentId,
@@ -1887,8 +2393,12 @@ document.querySelectorAll("dialog").forEach((d) =>
   }),
 );
 $("new-chat").onclick = newChat;
-$("add-device").onclick = openPair;
-$("connection-button").onclick = openPair;
+$("add-device").onclick = () => openPair();
+$("connection-button").onclick = openDevicePicker;
+$("device-pair").onclick = () => {
+  $("device-dialog").close();
+  openPair();
+};
 $("open-settings").onclick = settings;
 $("workspace-settings").onclick = openWorkspacePicker;
 $("add-workspace").onclick = openWorkspacePicker;
@@ -1926,6 +2436,7 @@ $("select-directory").onclick = async () => {
     }
   }
 };
+$("toggle-workspaces").onclick = toggleWorkspaceSection;
 $("refresh").onclick = async () => {
   try {
     await loadWorkspaces();
@@ -1947,31 +2458,32 @@ $("model").onchange = () => {
 $("effort").onchange = saveModelPreference;
 $("refresh-models").onclick = () => loadModels(true).catch(showError);
 $("composer").onsubmit = submit;
+$("queue-send").onclick = () => submit(null, "queue");
+$("steer").onclick = () => submit(null, "steer");
+$("stop").onclick = stopTurn;
 $("prompt").oninput = resizePrompt;
 $("prompt").onkeydown = (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
-    if (!isRunning()) submit();
+    return submit(null, isRunning() && (e.ctrlKey || e.metaKey) ? "steer" : "auto");
   }
 };
 $("toggle-sidebar").onclick = () => {
-  if (matchMedia("(max-width:760px)").matches) {
-    document.body.classList.toggle("sidebar-open");
-    $("sidebar-overlay").hidden =
-      !document.body.classList.contains("sidebar-open");
+  if (isMobileLayout()) {
+    if (document.body.classList.contains("sidebar-open")) closeSidebar();
+    else openSidebar();
   } else document.body.classList.toggle("sidebar-collapsed");
 };
 $("close-sidebar").onclick = closeSidebar;
 $("sidebar-overlay").onclick = closeSidebar;
-document.querySelectorAll("[data-prompt]").forEach(
-  (b) =>
-    (b.onclick = () => {
-      $("prompt").value = b.dataset.prompt;
-      resizePrompt();
-      $("prompt").focus();
-      if (!currentDevice()) openPair();
-    }),
-);
+for (const element of [$("main"), $("sidebar"), $("sidebar-overlay")]) {
+  element.addEventListener("touchstart", sidebarGestureStart, { passive: true });
+  element.addEventListener("touchmove", sidebarGestureMove, { passive: true });
+  element.addEventListener("touchend", sidebarGestureEnd, { passive: true });
+  element.addEventListener("touchcancel", () => (sidebarTouch = null), {
+    passive: true,
+  });
+}
 $("theme-toggle").onclick = () => {
   document.documentElement.dataset.theme =
     document.documentElement.dataset.theme === "dark" ? "light" : "dark";
@@ -1994,10 +2506,7 @@ document.addEventListener("keydown", (e) => {
     !document.querySelector("dialog[open]")
   ) {
     e.preventDefault();
-    if (matchMedia("(max-width:760px)").matches) {
-      document.body.classList.add("sidebar-open");
-      $("sidebar-overlay").hidden = false;
-    }
+    openSidebar();
     $("search").focus();
   }
 });
@@ -2011,11 +2520,16 @@ setInterval(() => {
   if (!state.online || !state.loaded || state.threadListLoading || document.hidden) return;
   loadThreads().catch((error) => toast(`会话列表同步失败：${error.message}`));
 }, 15000);
-window.addEventListener("online", () => {
-  if (!state.online) connect();
-});
+document.addEventListener("visibilitychange", handleVisibilityChange);
+window.addEventListener("pageshow", resumeConnection);
+window.addEventListener("online", resumeConnection);
 renderDevices();
 renderWorkspaces();
 renderThreads();
 renderConnection();
-if (currentDevice()) connect();
+const linkedPairCode = pairCodeFromLink();
+if (linkedPairCode) {
+  openPair(linkedPairCode);
+  $("pair-form").requestSubmit();
+} else if (currentDevice()) connect();
+if (document.visibilityState === "hidden") handleVisibilityChange();

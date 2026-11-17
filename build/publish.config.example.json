@@ -1,0 +1,16 @@
+{
+  "cloudreve": {
+    "base": "https://your-cloudreve.agentos-app.net",
+    "email": "your-email@example.com",
+    "password": "",
+    "dir": ""
+  },
+  "rm": {
+    "server": "https://your-rm.example.com",
+    "sshTarget": "your-ssh-alias",
+    "updateDir": "/opt/codexrm/data/updates",
+    "owner": "codexrm",
+    "installDir": "/opt/codexrm",
+    "service": "codexrm"
+  }
+}

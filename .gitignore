@@ -4,10 +4,14 @@
 .env.*
 !.env.example
 server.env
+publish.config.json
+publish.session.json
 *.pem
 *.key
 *.p12
 *.pfx
+*.7z
+*-private.zip
 
 # Build and test output
 bin/

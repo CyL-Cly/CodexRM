@@ -13,12 +13,18 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="CodexRM" />
     <title>CodexRM · 远程工作区</title>
-    <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/icons/icon-192.png" />
-    <link rel="manifest" href="/manifest.webmanifest" />
-    <link rel="stylesheet" href="/styles.css?v=0.6.0" />
-    <script src="/pwa.js?v=0.6.0" defer></script>
-    <script src="/app.js?v=0.6.0" type="module"></script>
+    <link rel="icon" href="/icons/icon.svg?v=20261116-9" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261116-9" />
+    <link rel="manifest" href="/manifest.webmanifest?v=20261116-9" />
+    <link rel="modulepreload" href="/app.js?v=20261116-9" />
+    <script>
+      try {
+        document.documentElement.dataset.theme = JSON.parse(localStorage.getItem("codexrm.theme")) || "dark";
+      } catch {}
+    </script>
+    <link rel="stylesheet" href="/styles.css?v=20261116-9" />
+    <script src="/pwa.js?v=20261116-9" defer></script>
+    <script src="/app.js?v=20261116-9" type="module"></script>
   </head>
   <body>
     <div id="app">
@@ -61,7 +67,17 @@
         </div>
         <div class="chat-section">
           <div class="section-label">
-            <span>工作区</span
+            <button
+              id="toggle-workspaces"
+              class="workspace-section-toggle"
+              type="button"
+              title="收起工作区"
+              aria-label="收起工作区"
+              aria-expanded="true"
+              aria-controls="workspace-history"
+            >
+              <span class="workspace-section-caret" data-icon="chevron"></span
+              ><span>工作区</span></button
             ><span class="section-actions"
               ><button
                 id="refresh"
@@ -120,7 +136,13 @@
           </div>
           <div class="header-actions">
             <span id="demo-badge" class="demo-badge" hidden>演示模式</span
-            ><button id="connection-button" class="connection-badge">
+            ><button
+              id="connection-button"
+              class="connection-badge"
+              title="选择设备"
+              aria-haspopup="dialog"
+              aria-controls="device-dialog"
+            >
               <i class="status-dot"></i
               ><span id="connection-label">连接设备</span
               ><span data-icon="chevron"></span></button
@@ -167,6 +189,7 @@
           </div>
           <div class="composer-zone">
             <div id="approval-area" class="approval-area"></div>
+            <div id="message-queue" class="message-queue" aria-label="排队消息" hidden></div>
             <div id="activity" class="activity" hidden>
               <span class="activity-dot"></span
               ><span id="activity-text">Codex 正在处理</span
@@ -180,6 +203,10 @@
                 aria-label="消息输入"
                 maxlength="200000"
               ></textarea>
+              <div id="running-actions" class="running-actions" hidden>
+                <button id="queue-send" type="button" title="当前任务完成后发送（Enter）">排队发送</button>
+                <button id="steer" type="button" title="向当前任务追加指令（Ctrl / ⌘ Enter）">插队发送</button>
+              </div>
               <div class="composer-toolbar">
                 <div class="composer-options">
                   <button
@@ -203,6 +230,7 @@
                     <option value="">默认思考</option>
                   </select>
                 </div>
+                <button id="stop" class="send-button running" type="button" title="停止任务并暂停排队" aria-label="停止任务并暂停排队" data-icon="stop" hidden></button>
                 <button
                   id="send"
                   class="send-button"
@@ -220,23 +248,6 @@
                 ><span id="cwd-label">本地工作目录</span></span
               ><span id="composer-hint">Enter 发送 · Shift Enter 换行</span>
             </div>
-            <div class="suggestions" id="suggestions">
-              <button data-prompt="帮我了解这个项目的结构、技术栈和主要入口。">
-                <span data-icon="code"></span><strong>了解项目</strong
-                ><small>从代码结构开始</small
-                ><span class="suggestion-arrow">↗</span></button
-              ><button
-                data-prompt="检查这个项目中潜在的错误，解释原因并给出修复建议。"
-              >
-                <span data-icon="bug"></span><strong>排查问题</strong
-                ><small>找到问题的根源</small
-                ><span class="suggestion-arrow">↗</span></button
-              ><button data-prompt="先阅读项目，和我一起规划下一个功能的实现。">
-                <span data-icon="spark"></span><strong>实现想法</strong
-                ><small>把下一步交给 Codex</small
-                ><span class="suggestion-arrow">↗</span>
-              </button>
-            </div>
             <p class="footnote">
               任务在你的电脑上运行<span>·</span>CodexRM 连接每一处灵感
             </p>
@@ -244,6 +255,32 @@
         </div>
       </main>
     </div>
+    <dialog
+      id="device-dialog"
+      class="dialog device-dialog"
+      aria-labelledby="device-dialog-title"
+    >
+      <div class="dialog-header">
+        <h2 id="device-dialog-title">选择设备</h2>
+        <button
+          type="button"
+          class="icon-button"
+          data-close="device-dialog"
+          aria-label="关闭设备选择"
+          data-icon="close"
+        ></button>
+      </div>
+      <p>选择要连接的已配对设备。</p>
+      <div
+        id="device-options"
+        class="device-options"
+        role="group"
+        aria-label="已配对设备"
+      ></div>
+      <button id="device-pair" class="secondary-button device-pair" type="button">
+        <span data-icon="plus"></span>连接新设备
+      </button>
+    </dialog>
     <dialog id="pair-dialog" class="dialog">
       <form id="pair-form">
         <div class="dialog-header">
@@ -257,7 +294,7 @@
           ></button>
         </div>
         <h2>连接你的电脑</h2>
-        <p>在电脑上运行本地连接器，将显示的配对码输入下方。</p>
+        <p>扫描连接器显示的二维码自动配对，或输入配对码。</p>
         <label for="pair-code">设备配对码</label
         ><input
           id="pair-code"
@@ -316,6 +353,12 @@
           默认完整访问、从不请求审批。设置应用于新会话和下一次发送。
         </p>
         <div id="device-detail" class="device-detail"></div>
+        <button class="danger-button" id="close-codex-desktop" type="button" hidden>
+          关闭 Codex 桌面客户端
+        </button>
+        <p class="field-help" id="close-codex-desktop-help" hidden>
+          解决桌面端与 RM 的冲突。仅关闭桌面进程，不停止 RM 连接器；未保存的桌面操作可能丢失。
+        </p>
         <button class="primary-button" type="submit">保存设置</button
         ><button class="danger-button" id="disconnect" type="button" hidden>
           解除当前设备配对
@@ -392,6 +435,10 @@
       </form>
       <button id="archive-thread" class="danger-button">归档当前会话</button>
     </dialog>
+    <div id="connection-notice" class="connection-notice" role="status" aria-live="polite" aria-atomic="true" hidden>
+      <span class="connection-notice-icon" aria-hidden="true"></span>
+      <span id="connection-notice-text"></span>
+    </div>
     <div id="toast" class="toast" role="status" hidden></div>
   </body>
 </html>

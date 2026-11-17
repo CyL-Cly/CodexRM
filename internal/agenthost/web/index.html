@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CodexRM · Agent 设置</title><link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script></head>
+<body><main>
+<header><div class="brand">C<span>RM</span></div><div><p class="eyebrow">CODEX REMOTE MANAGER</p><h1>Agent 设置</h1></div><span id="status" class="status" role="status">正在加载</span></header>
+<p class="intro">连接远程服务器，授权你的设备访问这台电脑。</p>
+<div id="notice" class="notice" role="status" hidden></div>
+<form id="settings-form"><section class="card"><div class="section-title"><span class="step">01</span><h2>服务器连接</h2></div>
+<label for="server">远程服务器</label><input id="server" name="server" type="url" placeholder="https://your-server.example" required autocomplete="url" spellcheck="false"><p class="hint">填写用于远程访问的 CodexRM 服务器地址。</p>
+<label for="key">连接授权密钥</label><div class="secret"><input id="key" name="key" type="password" autocomplete="new-password" placeholder="输入服务器的连接授权密钥"><button id="toggle-key" class="text-button" type="button" aria-label="显示连接授权密钥">显示</button></div><p id="key-hint" class="hint">由远程服务器管理员提供。</p>
+<details id="update-settings"><summary>更新服务器<span>高级设置</span></summary><div class="advanced"><label for="update-server">更新服务器</label><input id="update-server" name="update-server" type="url" value="https://codexrm.dagongren.tech/" required spellcheck="false"><p class="hint">默认 https://codexrm.dagongren.tech/，每天自动检查一次更新。</p></div></details>
+<p id="package-settings" class="hint" hidden>此版本由 Windows 管理更新。更换安装磁盘：Windows 设置 → 应用 → 已安装的应用 → CodexRM Agent → 移动。</p>
+<div class="form-footer"><span id="connection-error" class="hint"></span><button id="save" class="primary" type="submit">保存并连接</button></div></section></form>
+<section class="card"><div class="section-title"><span class="step">02</span><div><h2>生成配对码</h2><p class="hint">在远程网页输入配对码，或用另一台设备扫描二维码。</p></div><button id="pair" class="secondary" type="button">生成配对码</button></div>
+<div id="pair-result" class="pair-result" hidden><img id="qr" width="176" height="176" alt="扫描二维码配对"><div><p class="eyebrow">一次性配对码</p><p id="pair-code" class="pair-code"></p><p id="expires" class="hint"></p><div class="pair-actions"><button id="copy-code" class="secondary" type="button">复制配对码</button><a id="pair-link" target="_blank" rel="noreferrer">打开远程网页 ↗</a></div></div></div></section>
+<section class="card"><div class="section-title"><span class="step">03</span><div><h2>已配对设备管理</h2><p class="hint">移除授权后，该设备需重新配对才能访问。</p></div><button id="refresh" class="text-button" type="button">刷新列表</button></div><div id="devices" class="devices"><p class="empty">保存连接配置后，可查看已配对的设备。</p></div></section>
+<footer><span>CodexRM <span id="version"></span></span><span>设置页面仅在本机可用 · 关闭页面后 Agent 继续运行</span></footer>
+</main></body></html>

@@ -71,6 +71,12 @@ type PairClaimRequest struct {
 	DeviceType string `json:"deviceType,omitempty"`
 }
 
+// ClientProfileRequest updates the authenticated browser's device description.
+type ClientProfileRequest struct {
+	ClientName string `json:"clientName"`
+	DeviceType string `json:"deviceType"`
+}
+
 // PairClaimResponse grants a client session token.
 type PairClaimResponse struct {
 	ClientID      string    `json:"clientId"`
@@ -78,6 +84,13 @@ type PairClaimResponse struct {
 	EnvironmentID string    `json:"environmentId"`
 	Agent         AgentInfo `json:"agent"`
 	ExpiresAt     int64     `json:"expiresAt"`
+}
+
+type ClientInfo struct {
+	ClientID   string `json:"clientId"`
+	ClientName string `json:"clientName"`
+	DeviceType string `json:"deviceType"`
+	CreatedAt  string `json:"createdAt"`
 }
 
 // Envelope wraps a JSON-RPC payload between client and agent.

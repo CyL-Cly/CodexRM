@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,11 +24,15 @@ var (
 	ErrUnauthorized   = errors.New("unauthorized")
 )
 
+const enrollmentRecoveryWindow = 10 * time.Minute
+
 type AgentRecord struct {
 	protocol.AgentInfo
-	Token     string    `json:"token"`
-	ExpiresAt time.Time `json:"expiresAt"`
-	CreatedAt time.Time `json:"createdAt"`
+	Token                  string    `json:"token"`
+	PreviousToken          string    `json:"previousToken,omitempty"`
+	PreviousTokenExpiresAt time.Time `json:"previousTokenExpiresAt,omitempty"`
+	ExpiresAt              time.Time `json:"expiresAt"`
+	CreatedAt              time.Time `json:"createdAt"`
 }
 
 type ClientRecord struct {
@@ -95,6 +101,9 @@ func Open(path string) (*Store, error) {
 	for _, a := range s.agents {
 		a.Online = false
 	}
+	for _, c := range s.clients {
+		c.ExpiresAt = time.Time{}
+	}
 	canonical := map[string]*PairingRecord{}
 	for _, p := range s.pairings {
 		canonical[p.PairingCode] = p
@@ -103,8 +112,7 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) persistLocked() error {
-	shape := persistShape{Agents: s.agents, Clients: s.clients, Pairings: s.pairings}
+func (s *Store) persistShapeLocked(shape persistShape) error {
 	data, err := json.MarshalIndent(shape, "", "  ")
 	if err != nil {
 		return err
@@ -145,41 +153,49 @@ func (s *Store) EnrollAgent(req protocol.EnrollRequest, previousToken ...string)
 			break
 		}
 	}
-	if existing != nil && (len(previousToken) == 0 || previousToken[0] == "" || previousToken[0] != existing.Token) {
-		return nil, ErrUnauthorized
-	}
-	if existing == nil {
-		existing = &AgentRecord{
-			AgentInfo: protocol.AgentInfo{
-				AgentID:        "agt_" + uuid.NewString(),
-				InstallationID: req.InstallationID,
-				EnvironmentID:  "env_" + uuid.NewString(),
-			},
-			CreatedAt: now,
+	recovering := false
+	if existing != nil {
+		token := ""
+		if len(previousToken) > 0 {
+			token = previousToken[0]
+		}
+		switch {
+		case token != "" && token == existing.Token:
+		case token != "" && token == existing.PreviousToken && now.Before(existing.PreviousTokenExpiresAt):
+			recovering = true
+		default:
+			return nil, ErrUnauthorized
 		}
 	}
-	if existing.EnvironmentID == "" {
-		existing.EnvironmentID = "env_" + uuid.NewString()
+	updated := &AgentRecord{CreatedAt: now}
+	if existing != nil {
+		*updated = *existing
 	}
-	if existing.AgentID == "" {
-		existing.AgentID = "agt_" + uuid.NewString()
+	if updated.EnvironmentID == "" {
+		updated.EnvironmentID = "env_" + uuid.NewString()
 	}
-	existing.ServerName = req.Name
-	existing.OS = req.OS
-	existing.Arch = req.Arch
-	existing.AppVersion = req.AppVersion
-	existing.InstallationID = req.InstallationID
-	existing.Token = randomToken()
-	existing.ExpiresAt = now.Add(30 * 24 * time.Hour)
-	if existing.CreatedAt.IsZero() {
-		existing.CreatedAt = now
+	if updated.AgentID == "" {
+		updated.AgentID = "agt_" + uuid.NewString()
 	}
-	existing.Online = false
-	s.agents[existing.AgentID] = existing
-	if err := s.persistLocked(); err != nil {
+	updated.ServerName = req.Name
+	updated.OS = req.OS
+	updated.Arch = req.Arch
+	updated.AppVersion = req.AppVersion
+	updated.InstallationID = req.InstallationID
+	if existing != nil && !recovering {
+		updated.PreviousToken = existing.Token
+		updated.PreviousTokenExpiresAt = now.Add(enrollmentRecoveryWindow)
+	}
+	updated.Token = randomToken()
+	updated.ExpiresAt = now.Add(30 * 24 * time.Hour)
+	updated.Online = false
+	agents := maps.Clone(s.agents)
+	agents[updated.AgentID] = updated
+	if err := s.persistShapeLocked(persistShape{Agents: agents, Clients: s.clients, Pairings: s.pairings}); err != nil {
 		return nil, err
 	}
-	cp := *existing
+	s.agents = agents
+	cp := *updated
 	return &cp, nil
 }
 
@@ -245,15 +261,17 @@ func (s *Store) StartPairing(agentID string, manual bool) (*PairingRecord, error
 	if manual {
 		rec.ManualPairingCode = manualCode()
 	}
-	s.pairings[rec.PairingCode] = rec
-	for code, old := range s.pairings {
+	pairings := maps.Clone(s.pairings)
+	pairings[rec.PairingCode] = rec
+	for code, old := range pairings {
 		if now.After(old.ExpiresAt) {
-			delete(s.pairings, code)
+			delete(pairings, code)
 		}
 	}
-	if err := s.persistLocked(); err != nil {
+	if err := s.persistShapeLocked(persistShape{Agents: s.agents, Clients: s.clients, Pairings: pairings}); err != nil {
 		return nil, err
 	}
+	s.pairings = pairings
 	cp := *rec
 	return &cp, nil
 }
@@ -276,7 +294,8 @@ func (s *Store) ClaimPairing(code, clientName, deviceType string) (*ClientRecord
 	if !ok {
 		return nil, nil, ErrNotFound
 	}
-	rec.Claimed = true
+	claimed := *rec
+	claimed.Claimed = true
 	client := &ClientRecord{
 		ClientID:      "cli_" + uuid.NewString(),
 		Token:         randomToken(),
@@ -284,13 +303,16 @@ func (s *Store) ClaimPairing(code, clientName, deviceType string) (*ClientRecord
 		AgentID:       rec.AgentID,
 		ClientName:    clientName,
 		DeviceType:    deviceType,
-		ExpiresAt:     now.Add(30 * 24 * time.Hour),
 		CreatedAt:     now,
 	}
-	s.clients[client.ClientID] = client
-	if err := s.persistLocked(); err != nil {
+	pairings := maps.Clone(s.pairings)
+	pairings[claimed.PairingCode] = &claimed
+	clients := maps.Clone(s.clients)
+	clients[client.ClientID] = client
+	if err := s.persistShapeLocked(persistShape{Agents: s.agents, Clients: clients, Pairings: pairings}); err != nil {
 		return nil, nil, err
 	}
+	s.pairings, s.clients = pairings, clients
 	ccp := *client
 	acp := *a
 	return &ccp, &acp, nil
@@ -301,7 +323,7 @@ func (s *Store) AuthenticateClient(token string) (*ClientRecord, error) {
 	defer s.mu.RUnlock()
 	for _, c := range s.clients {
 		if c.Token == token {
-			if time.Now().After(c.ExpiresAt) {
+			if !c.ExpiresAt.IsZero() && time.Now().After(c.ExpiresAt) {
 				return nil, ErrExpired
 			}
 			cp := *c
@@ -309,6 +331,33 @@ func (s *Store) AuthenticateClient(token string) (*ClientRecord, error) {
 		}
 	}
 	return nil, ErrUnauthorized
+}
+
+// UpdateClientProfile can only change the client identified by its own token.
+func (s *Store) UpdateClientProfile(token, name, deviceType string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, c := range s.clients {
+		if c.Token != token {
+			continue
+		}
+		if !c.ExpiresAt.IsZero() && time.Now().After(c.ExpiresAt) {
+			return ErrExpired
+		}
+		if c.ClientName == name && c.DeviceType == deviceType {
+			return nil
+		}
+		updated := *c
+		updated.ClientName, updated.DeviceType = name, deviceType
+		clients := maps.Clone(s.clients)
+		clients[id] = &updated
+		if err := s.persistShapeLocked(persistShape{Agents: s.agents, Clients: clients, Pairings: s.pairings}); err != nil {
+			return err
+		}
+		s.clients = clients
+		return nil
+	}
+	return ErrUnauthorized
 }
 
 func (s *Store) PairingStatus(code string) (bool, error) {
@@ -340,9 +389,45 @@ func (s *Store) RevokeClient(token string) error {
 	defer s.mu.Unlock()
 	for id, c := range s.clients {
 		if c.Token == token {
-			delete(s.clients, id)
-			return s.persistLocked()
+			clients := maps.Clone(s.clients)
+			delete(clients, id)
+			if err := s.persistShapeLocked(persistShape{Agents: s.agents, Clients: clients, Pairings: s.pairings}); err != nil {
+				return err
+			}
+			s.clients = clients
+			return nil
 		}
 	}
 	return ErrUnauthorized
+}
+
+func (s *Store) ListClients(agentID string) []ClientRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]ClientRecord, 0)
+	for _, c := range s.clients {
+		if c.AgentID == agentID {
+			cp := *c
+			cp.Token = ""
+			out = append(out, cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+func (s *Store) DeleteClient(agentID, clientID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.clients[clientID]
+	if !ok || c.AgentID != agentID {
+		return ErrNotFound
+	}
+	clients := maps.Clone(s.clients)
+	delete(clients, clientID)
+	if err := s.persistShapeLocked(persistShape{Agents: s.agents, Clients: clients, Pairings: s.pairings}); err != nil {
+		return err
+	}
+	s.clients = clients
+	return nil
 }

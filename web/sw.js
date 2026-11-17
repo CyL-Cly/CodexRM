@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "0.6.0";
+const VERSION = "20261116-9";
 const CACHE_PREFIX = "codexrm";
 const SHELL_CACHE = `${CACHE_PREFIX}-shell-${VERSION}`;
 const PAGE_CACHE = `${CACHE_PREFIX}-pages-${VERSION}`;
@@ -11,11 +11,11 @@ const SHELL_URLS = [
   `/app.js?v=${VERSION}`,
   `/styles.css?v=${VERSION}`,
   `/pwa.js?v=${VERSION}`,
-  "/manifest.webmanifest",
-  "/icons/icon.svg",
-  "/icons/icon-192.png",
-  "/icons/icon-512.png",
-  "/icons/maskable-512.png",
+  `/manifest.webmanifest?v=${VERSION}`,
+  `/icons/icon.svg?v=${VERSION}`,
+  `/icons/icon-192.png?v=${VERSION}`,
+  `/icons/icon-512.png?v=${VERSION}`,
+  `/icons/maskable-512.png?v=${VERSION}`,
 ];
 const VERSIONED_PATHS = new Set(["/app.js", "/styles.css", "/pwa.js"]);
 const STATIC_PATHS = new Set([
@@ -99,13 +99,9 @@ async function fetchWithTimeout(request, milliseconds) {
 
 async function networkFirstPage(request) {
   const pages = await caches.open(PAGE_CACHE);
+  let response;
   try {
-    const response = await fetchWithTimeout(request, 3000);
-    if (cacheable(response) && response.headers.get("Content-Type")?.includes("text/html")) {
-      await pages.put(request, response.clone());
-      await trimCache(PAGE_CACHE, 10);
-    }
-    return response;
+    response = await fetchWithTimeout(request, 3000);
   } catch (error) {
     const cached = (await pages.match(request)) || (await pages.match("/"));
     if (cached) return cached;
@@ -113,6 +109,21 @@ async function networkFirstPage(request) {
     const fallback = await shell.match("/");
     if (fallback) return fallback;
     throw error;
+  }
+  if (response.headers.get("Content-Type")?.includes("text/html")) {
+    await cacheResponse(PAGE_CACHE, request, response, 10);
+  }
+  return response;
+}
+
+async function cacheResponse(name, request, response, maximum) {
+  if (!cacheable(response)) return;
+  try {
+    const cache = await caches.open(name);
+    await cache.put(request, response.clone());
+    await trimCache(name, maximum);
+  } catch {
+    // Storage quota failures must not replace a valid network response.
   }
 }
 
@@ -122,21 +133,13 @@ async function cacheFirstAsset(request) {
   if (cached) return cached;
 
   const response = await fetch(request);
-  if (cacheable(response)) {
-    const runtime = await caches.open(RUNTIME_CACHE);
-    await runtime.put(request, response.clone());
-    await trimCache(RUNTIME_CACHE, 40);
-  }
+  await cacheResponse(RUNTIME_CACHE, request, response, 40);
   return response;
 }
 
 async function updateRuntimeCache(request) {
   const response = await fetch(request);
-  if (cacheable(response)) {
-    const runtime = await caches.open(RUNTIME_CACHE);
-    await runtime.put(request, response.clone());
-    await trimCache(RUNTIME_CACHE, 40);
-  }
+  await cacheResponse(RUNTIME_CACHE, request, response, 40);
   return response;
 }
 

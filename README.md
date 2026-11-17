@@ -27,42 +27,52 @@
 ```powershell
 git clone https://github.com/codexrm/codexrm.git
 cd codexrm
-.\scripts\build.ps1
+.\build.bat
 ```
 
-Windows 输出为 `bin/codexrm-server.exe`、`bin/codexrm-agent.exe`。Linux amd64 构建使用 `.\scripts\build.ps1 -Linux`，输出带 `-linux-amd64` 后缀。页面已内嵌至服务端二进制，不依赖额外的静态文件目录。
+Windows 上可双击根目录的 `build.bat`，依次选择 Windows / Linux 和 Agent / Server，也可选择同时构建两者。程序输出到 `build/bin`：Windows 文件为 `codexrm-server.exe`、`codexrm-agent.exe`，Linux amd64 文件带 `-linux-amd64` 后缀。
+
+也可直接运行 `.\build\scripts\build.ps1`，默认构建 Windows Agent 和 Server；加 `-Linux` 构建 Linux 版本，加 `-Target Agent` 或 `-Target Server` 单独构建。页面已内嵌至服务端二进制，不依赖额外的静态文件目录。
 
 启动本地连接器：
 
 ```powershell
-$env:CODEXRM_ENROLL_KEY = '<服务器注册密钥>'
-.\scripts\connect.ps1 -Server "https://your-server.example" -Workspace "D:\projects\my-project"
+.\build\bin\codexrm-agent.exe
 ```
 
-首次注册后，连接配置和凭据保存在被 Git 忽略的 `.state/` 中。连接器会显示一次性配对码，在网页中点击“连接设备”输入即可。再次生成配对码：
+Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 RM URL 时，每次启动都会自动打开本机设置页面；也可右键托盘图标选择 **设置**。填写远程服务器和连接授权密钥后保存，Agent 自动连接。设置页可生成配对码、显示二维码、查看和移除已配对设备；更新服务器默认折叠，默认为 `https://codexrm.dagongren.tech/`。
 
 ```powershell
-.\scripts\connect.ps1 -Server "https://your-server.example" -Pair
+.\build\bin\codexrm-agent.exe --settings
+.\build\bin\codexrm-agent.exe --restart
 ```
 
-同一服务器与同一 Windows 用户默认复用 Agent 身份。不要同时启动多个使用同一数据目录的连接器；多实例可用 `--data` 指定不同目录。
+设置页首次打开时随机监听一个 `127.0.0.1` 端口，之后持续监听至 Agent 退出；再次打开复用同一端口。连接设置和日志在 `.state/` 中，设备身份继续按当前用户和服务器复用。相同配置路径的重复启动会打开已有实例的设置页；`--restart` 等待旧实例退出后重启。
+
+已配对设备使用该浏览器检测到的完整 WebGL GPU 型号作为名称；检测不可用时回退为系统和浏览器名称。旧配对在浏览器重新连接后自动更新名称，无需重新配对。
 
 ## 其他 Windows 电脑安装
 
-使用安装包中的 `install.cmd`，自动安装到当前用户的 `%LOCALAPPDATA%\CodexRM`，创建启动和生成配对码的桌面快捷方式，随后显示配对码。目标电脑只需已经安装并登录或配置好 Codex 客户端；连接脚本自动查找客户端自带的 CLI，不需要另外安装 CLI、Go 或 npm。
+需要在 Windows“已安装的应用”中使用 **移动** 更换安装磁盘时，使用原生 **MSIX 版 CodexRM Agent**，参见 [MSIX 安装与跨盘移动](docs/windows-msix.md)。可运行 `.\build\scripts\package-msix.ps1` 构建；MSIX 由 Windows 管理安装、移动、更新和卸载。
+
+首次安装只需下载 `CodexRM-Setup.exe` 并双击。选择安装目录后，Go 安装器下载并校验客户端；安装过程无需设置 RM URL 或密钥。首次启动自动打开本机设置页。离线 ZIP 完整解压后双击同名安装器，会直接使用包内文件安装。
+
+默认安装到 `%LOCALAPPDATA%\CodexRM`，仅创建一个桌面快捷方式 **CodexRM 重启服务**，直接指向 `bin\codexrm-agent.exe --restart`。登录自启动直接运行 exe；从 Windows“已安装的应用”中可卸载。目标电脑需要已安装并登录或配置好 Codex 客户端，不需要 PowerShell、Go 或 npm。
 
 ```powershell
-# 生成通用安装包；安装时通过 CODEXRM_ENROLL_KEY 提供注册密钥
-.\scripts\package-client.ps1 -Server "https://your-server.example"
-# 给自己的其他电脑使用，包含当前服务的注册配置；不要公开分发此包
-.\scripts\package-client.ps1 -IncludeEnrollmentKey
+# 生成通用安装包，不包含远程连接地址或密钥
+.\build\scripts\package-client.ps1
+# 生成独立的在线安装器；省略 -Manifest 时使用发布配置中的 RM 更新源
+.\build\scripts\package-setup.ps1 -Manifest "https://your-server.example/update.json"
 ```
 
-安装包输出到 `dist`，完整解压后双击 `install.cmd`。也可用 `install.cmd -Workspace "D:\projects\my-project"` 指定初始工作区。详见 [Windows 安装说明](docs/windows-install.md)。
+安装包输出到 `build/dist`。安装器支持 `--install-dir`、`--workspace`、`--non-interactive` 等参数。详见 [Windows 安装说明](docs/windows-install.md)。
+
+已安装的 Windows 客户端每 24 小时检查更新服务器的 `update.json`，校验新包后自动替换、重启；失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。开发者可运行 `build\release.cmd` 构建并发布。详见 [自动更新与发布](docs/updates.md)。
 
 ## 多工作区
 
-一个 Agent 可以同时管理多个文件夹，`--cwd` / `-Workspace` 只指定初始默认目录，无需为每个项目启动连接器。
+一个 Agent 可以同时管理多个文件夹，Agent 的 `--cwd` / 安装器的 `--workspace` 只指定初始默认目录，无需为每个项目启动连接器。
 
 1. 点击侧栏“工作区”旁的 **+**，或输入框下方的文件夹按钮。
 2. 在已连接的电脑上浏览磁盘、主目录及子文件夹，也可以输入绝对路径后点击“前往”。点击“添加此文件夹”将其保存为工作区。
@@ -74,6 +84,8 @@ $env:CODEXRM_ENROLL_KEY = '<服务器注册密钥>'
 权限默认采用“完整访问 + 从不请求审批”，设置会在新建会话及下一次发送时传入 Codex。若曾手动保存其他权限设置，仍使用该设置。多个审批可以分别处理或批量允许/拒绝；其他待处理问题的输入会保留，响应经连接器确认后才移除。
 
 桌面客户端占用的会话以只读快照展示，每 3 秒同步已保存消息。独立 app-server 可能将未加载的进行中轮次标为 `interrupted`；此时会结合原始生命周期记录判断，只有明确的停止事件才显示“任务已停止”。无法确认的状态显示为等待原客户端更新。
+
+任务运行中可以继续输入消息，点击“排队发送”或按 Enter，当前任务成功完成后按顺序逐条发送；点击“插队发送”或按 Ctrl / ⌘ Enter，把补充指令追加到当前任务。Shift Enter 换行，停止按钮单独保留。排队列表支持取消消息；任务停止、失败或消息发送失败时会暂停排队，点击“继续排队”后恢复。队列由本地 Agent 在内存中管理，切换会话、刷新或关闭网页不会中断排队；Agent 或 Codex app-server 重启后队列会清空。只读会话无法排队或插队，排队需要更新本地 Agent。
 
 ## 供应商与模型
 
@@ -87,39 +99,44 @@ Agent 默认只读本机 `~/.cc-switch/cc-switch.db` 中的 Codex 供应商，�
 
 ## 构建与测试
 
-需要 Go 1.22+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建。真实模式使用已安装、已完成登录或 API 配置的 Codex 客户端自带 CLI；直接运行 Agent 时也支持用 `--codex` 指定 CLI 路径。
+需要 Go 1.22+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建。Server 直接从磁盘 `web/` 目录提供页面，不使用 Go embed；更新页面只需替换该目录，无需重新编译或重启 Server。真实模式默认从 Codex 桌面版安装位置查找自带的 CLI，无需另外安装 CLI 或加入 PATH。Windows 上会检查正在运行的桌面版、Store 安装信息及各本地磁盘的常见安装目录，桌面版关闭时也可查找。直接运行 Agent 时，找不到桌面版 CLI 才使用 PATH；也支持用 `--codex` 指定 CLI 路径。
 
 ```powershell
-.\scripts\build.ps1
-.\scripts\build.ps1 -Linux
+.\build\scripts\build.ps1
+.\build\scripts\build.ps1 -Linux
 go test ./...
 go test -race ./...
 node --test web/app.test.mjs web/sw.test.mjs
 node --check web/app.js
 node --check web/pwa.js
 node --check web/sw.js
+node --check internal/agenthost/web/app.js
+# 原生安装和单实例测试包含在 go test ./... 中，使用隔离目录和启动项
 ```
 
-构建产物输出到被 Git 忽略的 `bin/`。`codex/` 上游参考源码、`ChatGPT*` 设计参考和私人部署记录不参与构建，也不包含在公开仓库中。
+构建产物输出到被 Git 忽略的 `build/bin/`。`codex/` 上游参考源码、`ChatGPT*` 设计参考和私人部署记录不参与构建，也不包含在公开仓库中。
 
 ## 本地演示
 
 ```powershell
-# 终端 1：服务端，默认使用内嵌页面
-.\bin\codexrm-server.exe --addr 127.0.0.1:8080 --data .state/demo-server
+# 终端 1：服务端，从当前仓库的 web/ 目录读取页面
+.\build\bin\codexrm-server.exe --addr 127.0.0.1:8080 --data .state/demo-server --web web
 
-# 终端 2：模拟设备，终端会打印配对码
-.\bin\codexrm-agent.exe --server http://127.0.0.1:8080 --mock --data .state/demo-agent
+# 终端 2：模拟设备，在系统托盘运行
+.\build\bin\codexrm-agent.exe --server http://127.0.0.1:8080 --mock --data .state/demo-agent
+
+# 生成配对码
+.\build\bin\codexrm-agent.exe --server http://127.0.0.1:8080 --mock --data .state/demo-agent --pair
 ```
 
-访问 http://127.0.0.1:8080 并输入配对码。模拟模式支持流式回复、历史、重命名、归档、停止；发送含“审批”的任务可测试审批回传。模拟会话只保存在内存中，不调用模型或执行命令。也可运行 `scripts/dev-mock.ps1` 一键启动。
+访问 http://127.0.0.1:8080 并输入配对码。模拟模式支持流式回复、历史、重命名、归档、停止；发送含“审批”的任务可测试审批回传。模拟会话只保存在内存中，不调用模型或执行命令。也可运行 `build/scripts/dev-mock.ps1` 一键启动。
 
 ## 连接真实 Codex
 
 默认由 Agent 启动 `codex app-server --listen stdio://`，继承当前用户的 Codex 登录与配置：
 
 ```powershell
-.\bin\codexrm-agent.exe --server https://your-server.example --cwd D:\projects\my-project
+.\build\bin\codexrm-agent.exe --server https://your-server.example --cwd D:\projects\my-project
 ```
 
 支持 `--codex <可执行文件路径>`。Agent 运行独立 app-server，可列出、恢复同一 Codex 用户目录中可见的历史会话。另一个实例仍持有写入锁的会话以只读历史展示，结束原会话后可重新打开继续。
@@ -128,7 +145,7 @@ node --check web/sw.js
 
 ```powershell
 codex app-server --listen ws://127.0.0.1:4500
-.\bin\codexrm-agent.exe --server https://your-server.example --appserver ws://127.0.0.1:4500
+.\build\bin\codexrm-agent.exe --server https://your-server.example --appserver ws://127.0.0.1:4500
 ```
 
 若该 WebSocket 要求 Bearer token，设置 `CODEXRM_APPSERVER_TOKEN` 或传入 `--appserver-token`。浏览器刷新会保留配对；重新进入会话时从 Codex 同步历史。连接中断时不重放用户任务，避免重复执行。
@@ -138,7 +155,7 @@ codex app-server --listen ws://127.0.0.1:4500
 ```bash
 # 在 Linux 上构建，或上传 Windows 交叉编译的 Linux 二进制
 go build -trimpath -ldflags '-s -w' -o codexrm-server ./cmd/codexrm-server
-sudo bash scripts/install-server.sh ./codexrm-server ./deploy/codexrm.service
+sudo bash build/scripts/install-server.sh ./codexrm-server ./deploy/codexrm.service ./web
 sudo systemctl status codexrm
 sudo journalctl -u codexrm -n 50 --no-pager
 ```
@@ -147,12 +164,12 @@ sudo journalctl -u codexrm -n 50 --no-pager
 
 ```powershell
 $env:CODEXRM_ENROLL_KEY = '<服务器注册密钥>'
-.\bin\codexrm-agent.exe --server https://your-server.example --cwd D:\projects\my-project
+.\build\bin\codexrm-agent.exe --server https://your-server.example --cwd D:\projects\my-project
 ```
 
-将 `deploy/nginx-location.conf` 中的代理规则合入已有 TLS 站点。服务进程使用专用 `codexrm` 用户，状态目录为 `/opt/codexrm/data`。如需直接监听公网端口，自行设置 `--addr :18080`；已部署实例通过 HTTPS 域名访问。
+将 `deploy/nginx-location.conf` 中的代理规则合入已有 TLS 站点。服务进程使用专用 `codexrm` 用户，状态目录为 `/opt/codexrm/data`，页面目录为 `/opt/codexrm/web`。后续更新页面只需将本地 `web/` 同步到该目录并刷新浏览器，不需要重新上传二进制或重启服务。前端引用统一携带 `?v=YYYYMMDD` 日期版本，发布页面时应同步更新 `index.html`、`manifest.webmanifest`、`sw.js` 中的版本号。如需直接监听公网端口，自行设置 `--addr :18080`；已部署实例通过 HTTPS 域名访问。
 
-注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取专属 token。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查、设备间路由隔离和凭据到期。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
+注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取永久有效的专属 token。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查和设备间路由隔离。可在 Windows 设置菜单的“管理已授权设备”中删除授权，删除后立即失效并需要重新配对。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
 
 ## 结构与接口
 
@@ -161,22 +178,27 @@ cmd/codexrm-server/   HTTP / WebSocket 服务入口
 cmd/codexrm-agent/    本地连接器入口
 internal/agent/      出站重连、RPC 并发与审批回传
 internal/appserver/  Codex stdio / WS 客户端与模拟服务
-internal/server/     配对、鉴权、中继与内嵌 UI
+internal/server/     配对、鉴权、中继与磁盘静态 UI
 internal/store/      JSON 状态原子持久化
 internal/protocol/   中继消息结构
 web/                 响应式前端
 deploy/              systemd 与 Nginx 示例
-scripts/             构建、连接与安装脚本
+build/scripts/       开发构建、发布与服务器安装脚本
 ```
 
 | 接口 | 用途 |
 | --- | --- |
 | `GET /api/v1/health` | 健康检查 |
+| `GET /update.json` | Windows 客户端自动更新清单 |
+| `GET /updates/{文件名}.zip` | Windows 客户端更新包 |
 | `POST /api/v1/agent/enroll` | 注册/续期，远程注册需 `X-Enrollment-Key` |
 | `POST /api/v1/agent/pair` | Agent 生成配对码 |
 | `GET /api/v1/agent/pair/status` | 查询配对状态，需 Agent token |
+| `GET /api/v1/agent/clients` | 列出已授权浏览器，需 Agent token |
+| `DELETE /api/v1/agent/clients/{clientId}` | 删除浏览器授权，需 Agent token |
 | `GET /api/v1/agent/ws` | Agent WebSocket |
 | `POST /api/v1/client/claim` | 浏览器认领配对码 |
+| `POST /api/v1/client/profile` | 浏览器凭自身 token 更新设备名称和类型 |
 | `POST /api/v1/client/revoke` | 撤销当前浏览器 token 并断开连接 |
 | `GET /api/v1/client/ws` | 浏览器 WebSocket |
 | `GET /api/v1/agents` | 返回浏览器已授权的设备 |

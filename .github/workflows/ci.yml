@@ -10,6 +10,32 @@ permissions:
   contents: read
 
 jobs:
+  windows-install:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Test atomic RM manifest publication without network access
+        shell: powershell
+        run: .\build\scripts\test-publish-manifest.ps1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test native installation, settings, restart, replacement and rollback
+        run: go test -race ./internal/installation ./internal/desktop ./internal/agenthost ./cmd/codexrm-setup ./internal/updater ./internal/server
+
+      - name: Test release and Server and frontend deployment without network access
+        shell: powershell
+        run: |
+          .\build\scripts\test-release.ps1
+          .\build\scripts\test-deploy-server.ps1
+          .\build\scripts\test-deploy-web.ps1
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -48,6 +74,7 @@ jobs:
           node --check web/app.js
           node --check web/pwa.js
           node --check web/sw.js
+          node --check internal/agenthost/web/app.js
 
       - name: Test browser logic
         run: node --test web/app.test.mjs web/sw.test.mjs

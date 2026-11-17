@@ -6,7 +6,6 @@ import (
 	"errors"
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/codexrm/codexrm/internal/store"
-	webui "github.com/codexrm/codexrm/web"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"io"
@@ -21,7 +20,7 @@ import (
 	"time"
 )
 
-type Config struct{ Addr, DataDir, WebDir, AdminToken string }
+type Config struct{ Addr, DataDir, WebDir, AdminToken, UpdateDir string }
 type peer struct {
 	id, agentID, clientID string
 	role                  protocol.Role
@@ -42,9 +41,17 @@ type Server struct {
 	clients map[string]*peer
 	byAgent map[string]map[string]*peer
 	seq     atomic.Uint64
+
+	beforeClientUpgrade func() // coordinates authorization/revocation interleavings in tests
 }
 
 func New(cfg Config) (*Server, error) {
+	if cfg.WebDir == "" {
+		cfg.WebDir = "web"
+	}
+	if cfg.UpdateDir == "" {
+		cfg.UpdateDir = filepath.Join(cfg.DataDir, "updates")
+	}
 	st, err := store.Open(filepath.Join(cfg.DataDir, "state.json"))
 	if err != nil {
 		return nil, err
@@ -81,23 +88,26 @@ func staticResponseHeaders(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	enrollLimiter := newIPRateLimiter(30, 10)
+	claimLimiter := newIPRateLimiter(10, 5)
+	mux.HandleFunc("GET /update.json", s.updateManifest)
+	mux.HandleFunc("GET /updates/{file}", s.updatePackage)
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "service": "codexrm", "version": protocol.Version})
 	})
-	mux.HandleFunc("POST /api/v1/agent/enroll", s.enroll)
+	mux.HandleFunc("POST /api/v1/agent/enroll", rateLimit(enrollLimiter, s.enroll))
 	mux.HandleFunc("POST /api/v1/agent/pair", s.pair)
 	mux.HandleFunc("GET /api/v1/agent/pair/status", s.pairStatus)
+	mux.HandleFunc("GET /api/v1/agent/clients", s.listClients)
+	mux.HandleFunc("DELETE /api/v1/agent/clients/{clientID}", s.deleteClient)
 	mux.HandleFunc("GET /api/v1/agent/ws", s.agentWS)
-	mux.HandleFunc("POST /api/v1/client/claim", s.claim)
+	mux.HandleFunc("POST /api/v1/client/claim", rateLimit(claimLimiter, s.claim))
+	mux.HandleFunc("POST /api/v1/client/profile", s.clientProfile)
 	mux.HandleFunc("POST /api/v1/client/revoke", s.revoke)
 	mux.HandleFunc("GET /api/v1/client/ws", s.clientWS)
 	mux.HandleFunc("GET /api/v1/agents", s.list)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) { fail(w, 404, "API not found") })
-	var fs http.Handler = http.FileServer(http.FS(webui.Files))
-	if s.cfg.WebDir != "" {
-		fs = http.FileServer(http.Dir(s.cfg.WebDir))
-	}
-	mux.Handle("/", fs)
+	mux.Handle("/", http.FileServer(http.Dir(s.cfg.WebDir)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
@@ -232,7 +242,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		fail(w, status, err.Error())
 		return
 	}
-	writeJSON(w, 200, protocol.PairClaimResponse{ClientID: c.ClientID, Token: c.Token, EnvironmentID: c.EnvironmentID, Agent: a.AgentInfo, ExpiresAt: c.ExpiresAt.Unix()})
+	writeJSON(w, 200, protocol.PairClaimResponse{ClientID: c.ClientID, Token: c.Token, EnvironmentID: c.EnvironmentID, Agent: a.AgentInfo, ExpiresAt: 0})
 }
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
@@ -252,6 +262,32 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"data": []protocol.AgentInfo{a.AgentInfo}})
 }
+func (s *Server) clientProfile(w http.ResponseWriter, r *http.Request) {
+	token := bearer(r)
+	if _, err := s.store.AuthenticateClient(token); err != nil {
+		fail(w, 401, "unauthorized")
+		return
+	}
+	var req protocol.ClientProfileRequest
+	if readJSON(w, r, &req) != nil {
+		fail(w, 400, "invalid client profile JSON")
+		return
+	}
+	req.ClientName, req.DeviceType = strings.TrimSpace(req.ClientName), strings.TrimSpace(req.DeviceType)
+	if req.ClientName == "" || len(req.ClientName) > 1024 || (req.DeviceType != "desktop" && req.DeviceType != "mobile" && req.DeviceType != "browser") {
+		fail(w, 400, "clientName and a valid deviceType are required")
+		return
+	}
+	if err := s.store.UpdateClientProfile(token, req.ClientName, req.DeviceType); err != nil {
+		if errors.Is(err, store.ErrUnauthorized) || errors.Is(err, store.ErrExpired) {
+			fail(w, 401, "unauthorized")
+		} else {
+			fail(w, 500, err.Error())
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	c, err := s.store.AuthenticateClient(bearer(r))
 	if err != nil {
@@ -270,23 +306,57 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
-func (s *Server) agentWS(w http.ResponseWriter, r *http.Request) {
+func (s *Server) listClients(w http.ResponseWriter, r *http.Request) {
 	a, err := s.store.AuthenticateAgent(bearer(r))
 	if err != nil {
 		fail(w, 401, "unauthorized")
 		return
 	}
-	s.upgrade(w, r, protocol.RoleAgent, a.AgentID, "", a.ExpiresAt)
+	writeJSON(w, 200, map[string]any{"data": s.store.ListClients(a.AgentID)})
 }
-func (s *Server) clientWS(w http.ResponseWriter, r *http.Request) {
-	c, err := s.store.AuthenticateClient(bearer(r))
+
+func (s *Server) deleteClient(w http.ResponseWriter, r *http.Request) {
+	a, err := s.store.AuthenticateAgent(bearer(r))
 	if err != nil {
 		fail(w, 401, "unauthorized")
 		return
 	}
-	s.upgrade(w, r, protocol.RoleClient, c.AgentID, c.ClientID, c.ExpiresAt)
+	clientID := r.PathValue("clientID")
+	if err = s.store.DeleteClient(a.AgentID, clientID); err != nil {
+		fail(w, 404, "client not found")
+		return
+	}
+	s.mu.RLock()
+	p := s.clients[clientID]
+	s.mu.RUnlock()
+	if p != nil {
+		p.close()
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
-func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.Role, agentID, clientID string, expires time.Time) {
+
+func (s *Server) agentWS(w http.ResponseWriter, r *http.Request) {
+	token := bearer(r)
+	a, err := s.store.AuthenticateAgent(token)
+	if err != nil {
+		fail(w, 401, "unauthorized")
+		return
+	}
+	s.upgrade(w, r, protocol.RoleAgent, a.AgentID, "", a.ExpiresAt, token)
+}
+func (s *Server) clientWS(w http.ResponseWriter, r *http.Request) {
+	token := bearer(r)
+	c, err := s.store.AuthenticateClient(token)
+	if err != nil {
+		fail(w, 401, "unauthorized")
+		return
+	}
+	if s.beforeClientUpgrade != nil {
+		s.beforeClientUpgrade()
+	}
+	s.upgrade(w, r, protocol.RoleClient, c.AgentID, c.ClientID, c.ExpiresAt, token)
+}
+func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.Role, agentID, clientID string, expires time.Time, token string) {
 	up := websocket.Upgrader{CheckOrigin: sameOrigin, Subprotocols: []string{"codexrm"}}
 	conn, err := up.Upgrade(w, r, nil)
 	if err != nil {
@@ -294,6 +364,21 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.R
 	}
 	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, conn: conn, send: make(chan protocol.Envelope, 256), closed: make(chan struct{}), expires: expires}
 	s.mu.Lock()
+	if role == protocol.RoleAgent {
+		a, authErr := s.store.AuthenticateAgent(token)
+		if authErr != nil || a.AgentID != agentID {
+			s.mu.Unlock()
+			p.close()
+			return
+		}
+	} else {
+		c, authErr := s.store.AuthenticateClient(token)
+		if authErr != nil || c.AgentID != agentID || c.ClientID != clientID {
+			s.mu.Unlock()
+			p.close()
+			return
+		}
+	}
 	if role == protocol.RoleAgent {
 		if old := s.agents[agentID]; old != nil {
 			old.close()
@@ -347,7 +432,7 @@ func (s *Server) writePump(p *peer) {
 				return
 			}
 		case <-ticker.C:
-			if time.Now().After(p.expires) {
+			if !p.expires.IsZero() && time.Now().After(p.expires) {
 				return
 			}
 			if p.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)) != nil {
@@ -386,7 +471,7 @@ func (s *Server) readPump(p *peer) {
 		if p.conn.ReadJSON(&env) != nil {
 			return
 		}
-		if time.Now().After(p.expires) {
+		if !p.expires.IsZero() && time.Now().After(p.expires) {
 			return
 		}
 		_ = p.conn.SetReadDeadline(time.Now().Add(65 * time.Second))
