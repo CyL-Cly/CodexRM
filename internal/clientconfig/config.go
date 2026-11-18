@@ -35,24 +35,9 @@ func Load(path string) (Connection, error) {
 		return c, err
 	}
 	err = json.Unmarshal(bytes.TrimPrefix(b, []byte{0xef, 0xbb, 0xbf}), &c)
-	if c.UpdateServer == "" {
-		if c.UpdateManifestURL != "" {
-			_ = c.SetManifestURL(c.UpdateManifestURL)
-		} else {
-			c.UpdateServer = DefaultUpdateServer
-		}
-	}
+	c.UpdateServer = DefaultUpdateServer
+	c.UpdateManifestURL = ""
 	return c, err
-}
-
-func (c *Connection) SetManifestURL(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Fragment != "" {
-		return errors.New("更新清单必须是 HTTP(S) 地址")
-	}
-	c.UpdateServer = u.ResolveReference(&url.URL{Path: "."}).String()
-	c.UpdateManifestURL = raw
-	return nil
 }
 
 func ServerURL(raw string) (string, error) {
@@ -73,22 +58,16 @@ func (c *Connection) Normalize() error {
 	} else {
 		c.Server = ""
 	}
-	if c.UpdateServer == "" {
-		c.UpdateServer = DefaultUpdateServer
-	}
-	if c.UpdateServer, err = ServerURL(c.UpdateServer); err != nil {
-		return fmt.Errorf("更新服务器：%w", err)
-	}
-	c.UpdateServer += "/"
+	// Older installations may retain custom feeds. They must not override the
+	// built-in update service, even when settings are loaded without saving.
+	c.UpdateServer = DefaultUpdateServer
+	c.UpdateManifestURL = ""
 	c.EnrollmentKey = strings.TrimSpace(c.EnrollmentKey)
 	return nil
 }
 
 func (c Connection) ManifestURL() string {
-	if c.UpdateManifestURL != "" {
-		return c.UpdateManifestURL
-	}
-	return strings.TrimRight(c.UpdateServer, "/") + "/update.json"
+	return DefaultUpdateServer + "update.json"
 }
 
 func Save(path string, c Connection) error {

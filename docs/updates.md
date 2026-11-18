@@ -1,26 +1,34 @@
-# Windows 客户端更新与发布
+# 客户端更新与发布
 
-客户端通过设置页中独立配置的更新服务器查询 `update.json`，默认 `https://codexrm.dagongren.tech/`。清单中的 `downloadUrl` 指向 ZIP 更新包。更换远程 RM URL 不改变更新源。Cloudreve 登录凭据及发布配置仅保存在被 Git 忽略的 `build/publish.config.json`，不会进入安装包。
+客户端固定通过 `https://codexrm.dagongren.tech/update.json` 查询更新，设置页不再显示或允许修改更新服务器。旧配置中的更新服务器及清单覆盖地址会被忽略。清单中的 `downloadUrl` 指向 ZIP 更新包。更换远程 RM URL 不改变更新源。Cloudreve 登录凭据及发布配置仅保存在被 Git 忽略的 `build/publish.config.json`，不会进入安装包。
 
 ## 原生客户端检查更新
 
-安装后的 Agent 直接检查、下载、替换和重启，不调用 PowerShell。设置入口位于系统托盘；也可重新运行在线安装器更新。更新只替换受管理的 Agent exe，保留连接设置、工作区、设备身份、配对关系和自启动设置。
+安装后的 Agent 直接检查、下载、替换和重启，不调用 PowerShell。设置入口位于系统托盘；设置页的“检查更新”会立即查询固定更新源，发现新版本后自动下载。存在进行中的对话、正在发送的请求或排队消息时，更新保持挂起，全部结束后自动安装。等待审批或用户输入、浏览器关闭以及中继断线均不会把进行中的对话视为空闲。设置页会显示待安装状态。也可重新运行在线安装器更新。更新只替换受管理的 Agent exe，保留连接设置、工作区、设备身份、配对关系和自启动设置。
 
 ```cmd
 bin\codexrm-agent.exe --check-update --update-dir "D:\Apps\CodexRM"
 ```
 
-`--check-update` 只查询清单，输出 JSON，不受每日自动检查间隔限制。内部的 `--install-update` 供临时副本在 Agent 停止后替换 exe；普通用户可直接重新运行在线安装器。
+`--check-update` 只查询清单，输出 JSON，不受自动检查间隔限制。内部的 `--install-update` 供临时副本在 Agent 停止后替换 exe；普通用户可直接重新运行在线安装器。
 
-通过 `--update-manifest` 可临时指定清单。在线安装器的 `--manifest` 会保存为 `.state/connection.json` 的 `updateManifestUrl`；更改设置页的更新服务器会替换旧的清单覆盖地址。
+旧的 `--update-manifest` 参数仅为兼容启动脚本而接受，不再改变 Agent 的更新源。在线安装器的 `--manifest` 仅影响本次安装包下载，不会保存为后续更新源。
 
-## 每日自动更新
+## 自动更新
 
-已安装客户端默认启用自动更新。首次启动检查，以后每 24 小时检查；时间保存在安装目录的 `.state/update-state.json`，重启不重置间隔，更改更新服务器或清单地址后重新检查。配对命令和模拟模式不自动更新。
+已安装客户端默认启用自动更新。每次启动立即检查，即使上次检查距今不足 20 小时；持续运行期间每 20 小时检查一次。检查时间保存在安装目录的 `.state/update-state.json`，保存连接设置或重连不会重启检查循环。配对命令和模拟模式不自动更新。MSIX 版继续由 Windows 管理更新，不运行 EXE 更新器。
 
-发现更大的 `versionCode` 时，后台下载 ZIP，校验大小、SHA-256 及包内二进制版本，关闭 Codex app-server，由独立更新进程等待旧 Agent 退出、备份替换文件并隐藏启动新 Agent。新版本必须在 60 秒内启动 Agent 管理循环；替换或启动失败会回滚文件并尝试启动原版本。服务器暂时不可达或尚未配置 Codex 时，托盘和设置页继续可用。自动更新会中断当时正在执行的任务。日志写入 `.state/update.log`。
+发现更大的 `versionCode` 时，后台下载 ZIP，校验大小、SHA-256 及包内二进制版本，等待所有对话和排队消息结束后关闭 Codex app-server，由独立更新进程等待旧 Agent 退出、备份替换文件并隐藏启动新 Agent。已暂停的排队消息需恢复执行或移除后才会安装更新，防止重启丢失消息。开始安装与新请求接收共用互斥保护，防止空闲检查后插入新任务。更新辅助进程启动失败时保留待安装包，一分钟后重试。新版本必须在 60 秒内启动 Agent 管理循环；替换或启动失败会回滚文件并尝试启动原版本。服务器暂时不可达或尚未配置 Codex 时，托盘和设置页继续可用。日志写入 `.state/update.log`。
 
 ## 一键发布到 Cloudreve
+
+全平台发布使用 `build\release-all.cmd`，先构建 Android 正式 APK，再发布 Windows Agent、部署 Linux RM 和 Web、发布 Android 更新，最后上传 Linux amd64 Agent 独立包。Linux 下载链接写入 `build/dist/linux-agent-download.json`，不覆盖 Windows 或 Android 的更新清单。Windows MSIX 不在此流程内。
+
+```cmd
+build\release-all.cmd nopause -ReleaseNotes "修复连接问题"
+```
+
+各渠道分步发布；如果中途失败，按脚本提示使用相应平台的 `-PublishOnly` 继续，不要直接重跑全平台入口递增版本。只补发当前版本的 Linux Agent 时，使用 `build\release-all.cmd nopause -LinuxOnly`。
 
 发布流程参考 SmsForwarder 的 `build.bat`：版本号递增 → 构建 → 打包 → 上传网盘 → 更新清单。初次配置：
 
@@ -51,7 +59,7 @@ build\release.cmd nopause -DeployServer -TestLocalUpdate
 
 `-DeployServer` 额外构建 `build/bin/codexrm-server-linux-amd64`，通过 SSH 上传到 `rm.installDir/bin` 的唯一临时文件，保留原二进制为 `codexrm-server.previous`，原子替换后重启 `rm.service`，并通过公网 `{RM URL}/api/v1/health` 验证服务。随后自动打包并部署本地 `web/` 的页面、脚本、样式和图标到 `rm.installDir/web`，保留 `web.previous-{唯一标识}` 备份，逐个下载公网文件并核对 SHA-256。前端测试文件不发布。SSH 账户需有写入安装目录及执行 `systemctl restart/is-active` 的权限；服务替换或重启失败时会报错，并提示旧二进制备份位置。
 
-`-TestLocalUpdate` 从 `%LOCALAPPDATA%\CodexRM\installation.json` 找到本机安装目录，通过临时 Agent 副本执行原生更新，再启动 exe；对尚未迁移的旧安装保留脚本调用兼容。不覆盖已保存的清单地址。自定义安装位置用 `-LocalInstallDir` 指定。发布前检查 Agent 和连接配置，更新后核对实际版本及连接配置未变。连接器正在运行时需先从托盘退出；已是当前版本时仅检查清单。
+`-TestLocalUpdate` 从 `%LOCALAPPDATA%\CodexRM\installation.json` 找到本机安装目录，通过临时 Agent 副本执行原生更新，再启动 exe；对尚未迁移的旧安装保留脚本调用兼容。Agent 使用内置固定更新源。自定义安装位置用 `-LocalInstallDir` 指定。发布前检查 Agent 和连接配置，更新后核对实际版本及连接配置未变。连接器正在运行时需先从托盘退出；已是当前版本时仅检查清单。
 
 构建或打包失败会还原版本文件；发布失败保留版本及已生成的安装包，修复网络或配置后重试：
 
@@ -59,7 +67,7 @@ build\release.cmd nopause -DeployServer -TestLocalUpdate
 build\release.cmd nopause -PublishOnly
 ```
 
-`-PublishOnly` 不再递增版本，也不重新打包客户端，可在网盘上传或 RM 发布失败后重试；需要重试可选步骤时追加 `-DeployServer` 和/或 `-TestLocalUpdate`，会复用已构建的 Server 和客户端产物，同时同步当前本地 `web/`。客户端使用独立配置的更新源。
+`-PublishOnly` 不再递增版本，也不重新打包客户端，可在网盘上传或 RM 发布失败后重试；需要重试可选步骤时追加 `-DeployServer` 和/或 `-TestLocalUpdate`，会复用已构建的 Server 和客户端产物，同时同步当前本地 `web/`。客户端使用内置固定更新源。
 
 ## 清单和安装包格式
 
@@ -83,3 +91,22 @@ build\release.cmd nopause -PublishOnly
 ## 自托管更新源
 
 服务端通过公开路由 `GET /update.json` 提供清单，默认从 `<服务端数据目录>/updates/update.json` 读取，可通过 `codexrm-server --updates /path/to/releases` 修改，响应使用 `Cache-Control: no-store`。清单下载地址默认指向 Cloudreve，也支持其他 HTTP(S) 直链。`GET /updates/{文件名}.zip` 保留用于直接托管 ZIP；使用 Cloudreve 时无需向 RM 上传 ZIP。
+
+## Android 手动检查更新
+
+Android 在“侧栏 → 我的远程工作区 → 检查更新”中手动查询 `https://codexrm.dagongren.tech/android-update.json`。该清单与 Windows 版本号和 ZIP 完全独立，不跟随当前配对服务器变化，只有用户点击“立即更新”后才下载和安装。客户端下载 APK 到应用私有缓存，校验清单大小、SHA-256、APK 包名和版本后通过 `PackageInstaller` 覆盖安装。Android 12+ 在已允许“安装未知应用”、声明 `UPDATE_PACKAGES_WITHOUT_USER_ACTION` 且应用更新自身时，使用 `USER_ACTION_NOT_REQUIRED` 免除系统安装确认；系统不允许免确认的设备仍会显示确认界面。
+
+服务端从同一更新目录读取 `android-update.json` 并通过 `GET /android-update.json` 发布，APK 可通过 `GET /updates/{文件名}.apk` 直接托管，也可使用 Cloudreve 直链。签名 APK 使用独立脚本打包：
+
+```powershell
+build\scripts\package-android.ps1 -ApkPath android\app\build\outputs\apk\release\app-release.apk -ReleaseNotes "更新说明"
+```
+
+脚本读取 `android/app/build.gradle.kts` 的 `versionCode` 和 `versionName`，在 `build/dist/` 生成 APK 副本及 `android-update.json`。使用现有 `codexrm-publish` 上传 APK 后，以独立名称发布清单：
+
+```powershell
+$publish = Get-Content build/publish.config.json -Raw | ConvertFrom-Json
+build\scripts\publish-manifest.ps1 -Manifest build\dist\android-update.json -Name android-update.json -RM $publish.rm
+```
+
+发布工具保留上一份 `android-update.json.previous`，不会覆盖 Windows 的 `update.json`。每次发布必须递增 Android `versionCode`，且新 APK 与已安装版本签名一致；Debug 签名只能用于测试。

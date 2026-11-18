@@ -9,6 +9,7 @@ internal data class Device(
     val agentId: String,
     var serverName: String,
     var os: String = "",
+    var appVersion: String = "",
     var online: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject()
@@ -18,6 +19,7 @@ internal data class Device(
         .put("agentId", agentId)
         .put("serverName", serverName)
         .put("os", os)
+        .put("appVersion", appVersion)
 
     companion object {
         fun fromJson(value: JSONObject): Device = Device(
@@ -27,6 +29,7 @@ internal data class Device(
             agentId = value.string("agentId"),
             serverName = value.string("serverName").ifEmpty { "CodexRM" },
             os = value.string("os"),
+            appVersion = value.string("appVersion"),
         )
 
         fun fromClaim(serverUrl: String, value: JSONObject): Device {
@@ -38,6 +41,7 @@ internal data class Device(
                 agentId = agent.string("agentId"),
                 serverName = agent.string("serverName").ifEmpty { "CodexRM" },
                 os = agent.string("os"),
+                appVersion = agent.string("appVersion"),
                 online = agent.optBoolean("online"),
             ).also {
                 require(it.clientId.isNotEmpty() && it.token.isNotEmpty() && it.agentId.isNotEmpty()) {
@@ -65,6 +69,7 @@ internal data class ModelOption(
     val label: String,
     val defaultEffort: String,
     val efforts: List<String>,
+    val displayName: String = model,
 )
 
 internal enum class MessageKind { USER, ASSISTANT, TOOL, ERROR, STATUS }
@@ -75,14 +80,18 @@ internal data class ChatMessage(
     var title: String,
     var body: String,
     var status: String = "",
+    var images: List<MessageImage> = emptyList(),
+    var files: List<ArtifactCard> = emptyList(),
 ) {
     @Volatile var rendered: CharSequence? = null
     @Volatile var dirty = true
-    fun change(title: String = this.title, body: String = this.body, status: String = this.status) {
-        if (this.title == title && this.body == body && this.status == status) return
+    fun change(title: String = this.title, body: String = this.body, status: String = this.status, images: List<MessageImage> = this.images, files: List<ArtifactCard> = this.files) {
+        if (this.title == title && this.body == body && this.status == status && this.images == images && this.files == files) return
         this.title = title
         this.body = body
         this.status = status
+        this.images = images
+        this.files = files
         rendered = null
         dirty = true
     }

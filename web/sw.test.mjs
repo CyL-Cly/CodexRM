@@ -113,15 +113,16 @@ function createHarness() {
   };
 }
 
-const VERSION = "20261116-9";
+const VERSION = "20261118-2";
 const SHELL = `codexrm-shell-${VERSION}`;
 const PAGES = `codexrm-pages-${VERSION}`;
 const RUNTIME = `codexrm-runtime-${VERSION}`;
 
 test("HTML, manifest and service worker share the date asset version", () => {
   const html = readFileSync(new URL("index.html", import.meta.url), "utf8");
-  for (const path of ["/styles.css", "/pwa.js", "/app.js", "/manifest.webmanifest", "/icons/icon.svg", "/icons/icon-192.png"])
+  for (const path of ["/styles.css", "/dsh-theme.css", "/theme.js", "/pwa.js", "/app.js", "/manifest.webmanifest", "/icons/icon.svg", "/icons/icon-192.png"])
     assert.ok(html.includes(`${path}?v=${VERSION}`), `${path} is missing ?v=${VERSION}`);
+  assert.doesNotMatch(html, /<script(?:\s[^>]*)?>\s*try\s*\{[\s\S]*?codexrm\.theme/, "theme initialization must not be inline");
   const manifest = JSON.parse(readFileSync(new URL("manifest.webmanifest", import.meta.url), "utf8"));
   for (const icon of manifest.icons)
     assert.ok(icon.src.endsWith(`?v=${VERSION}`), `${icon.src} is missing the date version`);
@@ -148,7 +149,7 @@ test("install precaches the shell and activation removes only old CodexRM caches
   harness.cache("codexrm-shell-0.5.1");
   harness.cache("unrelated-application");
   await harness.lifecycle("install");
-  assert.equal((await harness.cache(SHELL).keys()).length, 9);
+  assert.equal((await harness.cache(SHELL).keys()).length, 11);
   assert.equal(harness.worker.skipped, true);
   await harness.lifecycle("activate");
   assert.deepEqual([...harness.stores.keys()].sort(), [SHELL, "unrelated-application"].sort());
@@ -163,6 +164,12 @@ test("versioned assets use cache-first without another network request", async (
   assert.equal(result.controlled, true);
   assert.equal(await result.response.text(), `network:${ORIGIN}/app.js?v=${VERSION}`);
   assert.equal(harness.networkCalls.length, 0);
+  for (const path of ["/dsh-theme.css", "/theme.js"]) {
+    const theme = await harness.dispatchFetch(`${path}?v=${VERSION}`);
+    assert.equal(theme.controlled, true);
+    assert.equal(await theme.response.text(), `network:${ORIGIN}${path}?v=${VERSION}`);
+    assert.equal(harness.networkCalls.length, 0);
+  }
 });
 
 test("API, authenticated, non-GET and cross-origin requests bypass service-worker caches", async () => {

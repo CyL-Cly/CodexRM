@@ -36,14 +36,18 @@ type AgentRecord struct {
 }
 
 type ClientRecord struct {
-	ClientID      string    `json:"clientId"`
-	Token         string    `json:"token"`
-	EnvironmentID string    `json:"environmentId"`
-	AgentID       string    `json:"agentId"`
-	ClientName    string    `json:"clientName"`
-	DeviceType    string    `json:"deviceType"`
-	ExpiresAt     time.Time `json:"expiresAt"`
-	CreatedAt     time.Time `json:"createdAt"`
+	ClientID        string    `json:"clientId"`
+	Token           string    `json:"token"`
+	EnvironmentID   string    `json:"environmentId"`
+	AgentID         string    `json:"agentId"`
+	ClientName      string    `json:"clientName"`
+	DeviceType      string    `json:"deviceType"`
+	ExpiresAt       time.Time `json:"expiresAt"`
+	CreatedAt       time.Time `json:"createdAt"`
+	LastConnectedAt time.Time `json:"lastConnectedAt,omitempty"`
+	LastIP          string    `json:"lastIP,omitempty"`
+	// RetentionStartedAt gives records without historical activity a migration grace period.
+	RetentionStartedAt time.Time `json:"retentionStartedAt,omitempty"`
 }
 
 type PairingRecord struct {
@@ -101,14 +105,24 @@ func Open(path string) (*Store, error) {
 	for _, a := range s.agents {
 		a.Online = false
 	}
+	migrated := false
 	for _, c := range s.clients {
 		c.ExpiresAt = time.Time{}
+		if c.LastConnectedAt.IsZero() && c.RetentionStartedAt.IsZero() {
+			c.RetentionStartedAt = time.Now().UTC()
+			migrated = true
+		}
 	}
 	canonical := map[string]*PairingRecord{}
 	for _, p := range s.pairings {
 		canonical[p.PairingCode] = p
 	}
 	s.pairings = canonical
+	if migrated {
+		if err := s.persistShapeLocked(persistShape{Agents: s.agents, Clients: s.clients, Pairings: s.pairings}); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -167,6 +181,13 @@ func (s *Store) EnrollAgent(req protocol.EnrollRequest, previousToken ...string)
 			return nil, ErrUnauthorized
 		}
 	}
+	// Recovery is idempotent: every process holding the previous token receives
+	// the same current credential. Rotating here would strand a process that
+	// successfully enrolled concurrently but has not saved its response yet.
+	if recovering {
+		cp := *existing
+		return &cp, nil
+	}
 	updated := &AgentRecord{CreatedAt: now}
 	if existing != nil {
 		*updated = *existing
@@ -220,6 +241,46 @@ func (s *Store) SetAgentOnline(agentID string, online bool) {
 	if a, ok := s.agents[agentID]; ok {
 		a.Online = online
 	}
+}
+
+func normalizeAppVersion(version string) (string, bool) {
+	version = strings.TrimSpace(version)
+	if version == "" || len(version) > 64 {
+		return "", false
+	}
+	for _, r := range version {
+		if r < 0x20 || r == 0x7f {
+			return "", false
+		}
+	}
+	return version, true
+}
+
+// SetAgentAppVersion records the build reported by a connected agent.
+// An empty or invalid value leaves the registered version unchanged.
+func (s *Store) SetAgentAppVersion(agentID, version string) error {
+	version, ok := normalizeAppVersion(version)
+	if !ok {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, found := s.agents[agentID]
+	if !found {
+		return ErrNotFound
+	}
+	if existing.AppVersion == version {
+		return nil
+	}
+	updated := *existing
+	updated.AppVersion = version
+	agents := maps.Clone(s.agents)
+	agents[agentID] = &updated
+	if err := s.persistShapeLocked(persistShape{Agents: agents, Clients: s.clients, Pairings: s.pairings}); err != nil {
+		return err
+	}
+	s.agents = agents
+	return nil
 }
 
 func (s *Store) GetAgent(agentID string) (*AgentRecord, error) {
@@ -276,7 +337,7 @@ func (s *Store) StartPairing(agentID string, manual bool) (*PairingRecord, error
 	return &cp, nil
 }
 
-func (s *Store) ClaimPairing(code, clientName, deviceType string) (*ClientRecord, *AgentRecord, error) {
+func (s *Store) ClaimPairing(code, clientName, deviceType string, ip ...string) (*ClientRecord, *AgentRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -297,13 +358,17 @@ func (s *Store) ClaimPairing(code, clientName, deviceType string) (*ClientRecord
 	claimed := *rec
 	claimed.Claimed = true
 	client := &ClientRecord{
-		ClientID:      "cli_" + uuid.NewString(),
-		Token:         randomToken(),
-		EnvironmentID: rec.EnvironmentID,
-		AgentID:       rec.AgentID,
-		ClientName:    clientName,
-		DeviceType:    deviceType,
-		CreatedAt:     now,
+		ClientID:        "cli_" + uuid.NewString(),
+		Token:           randomToken(),
+		EnvironmentID:   rec.EnvironmentID,
+		AgentID:         rec.AgentID,
+		ClientName:      clientName,
+		DeviceType:      deviceType,
+		CreatedAt:       now,
+		LastConnectedAt: now,
+	}
+	if len(ip) > 0 {
+		client.LastIP = ip[0]
 	}
 	pairings := maps.Clone(s.pairings)
 	pairings[claimed.PairingCode] = &claimed
@@ -323,6 +388,9 @@ func (s *Store) AuthenticateClient(token string) (*ClientRecord, error) {
 	defer s.mu.RUnlock()
 	for _, c := range s.clients {
 		if c.Token == token {
+			if clientInactive(c, time.Now()) {
+				return nil, ErrExpired
+			}
 			if !c.ExpiresAt.IsZero() && time.Now().After(c.ExpiresAt) {
 				return nil, ErrExpired
 			}
@@ -340,6 +408,9 @@ func (s *Store) UpdateClientProfile(token, name, deviceType string) error {
 	for id, c := range s.clients {
 		if c.Token != token {
 			continue
+		}
+		if clientInactive(c, time.Now()) {
+			return ErrExpired
 		}
 		if !c.ExpiresAt.IsZero() && time.Now().After(c.ExpiresAt) {
 			return ErrExpired

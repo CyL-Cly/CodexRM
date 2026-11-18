@@ -36,6 +36,10 @@ internal class DeviceStore(context: Context) {
         get() = uiPrefs.getBoolean("dark_theme", true)
         set(value) = uiPrefs.edit().putBoolean("dark_theme", value).apply()
 
+    var legacySystemWarningShown: Boolean
+        get() = uiPrefs.getBoolean("legacy_system_warning_shown", false)
+        set(value) = uiPrefs.edit().putBoolean("legacy_system_warning_shown", value).apply()
+
     fun selectedWorkspace(agentId: String): String = uiPrefs.getString("workspace.$agentId", "") ?: ""
     fun selectWorkspace(agentId: String, path: String) = uiPrefs.edit().putString("workspace.$agentId", path).apply()
 
@@ -81,14 +85,24 @@ internal class DeviceStore(context: Context) {
         securePrefs.edit().putString("devices", Crypto.encrypt(array.toString())).apply()
     }
 
-    fun draft(agentId: String, threadId: String): String =
-        uiPrefs.getString("draft.$agentId.$threadId", "") ?: ""
+    fun draft(agentId: String, threadId: String, workspaceKey: String? = null): String {
+        val legacyKey = "draft.$agentId.$threadId"
+        if (threadId.isNotEmpty() || workspaceKey == null) return uiPrefs.getString(legacyKey, "") ?: ""
+        // New-session drafts belong to a cwd just like their attachments. Read the
+        // former unscoped value once so an upgrade does not discard an existing draft.
+        val scopedKey = "draft.$agentId..workspace.$workspaceKey"
+        return uiPrefs.getString(scopedKey, null) ?: uiPrefs.getString(legacyKey, "") ?: ""
+    }
 
-    fun saveDraft(agentId: String, threadId: String, text: String) {
+    fun saveDraft(agentId: String, threadId: String, text: String, workspaceKey: String? = null) {
         if (agentId.isEmpty()) return
         val editor = uiPrefs.edit()
-        val key = "draft.$agentId.$threadId"
+        val legacyKey = "draft.$agentId.$threadId"
+        val key = if (threadId.isEmpty() && workspaceKey != null) {
+            "draft.$agentId..workspace.$workspaceKey"
+        } else legacyKey
         if (text.isEmpty()) editor.remove(key) else editor.putString(key, text)
+        if (key != legacyKey) editor.remove(legacyKey)
         editor.apply()
     }
 

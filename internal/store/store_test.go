@@ -167,14 +167,17 @@ func TestEnrollmentRecoveryTokenIsLimitedAndPersistent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("repeated recovery with a still-unsaved token failed: %v", err)
 	}
+	if third.Token != second.Token || fourth.Token != second.Token {
+		t.Fatal("recovery must be idempotent for concurrent or unsaved clients")
+	}
 	if fourth.PreviousToken != first.Token || !fourth.PreviousTokenExpiresAt.Equal(second.PreviousTokenExpiresAt) {
 		t.Fatalf("recovery replaced or extended the original grace window: first=%v fourth=%v", second.PreviousTokenExpiresAt, fourth.PreviousTokenExpiresAt)
 	}
+	if _, err = st.AuthenticateAgent(second.Token); err != nil {
+		t.Fatalf("previously issued current token was stranded by recovery: %v", err)
+	}
 	if _, err = st.AuthenticateAgent(fourth.Token); err != nil {
 		t.Fatalf("current recovered token rejected: %v", err)
-	}
-	if third.Token == fourth.Token {
-		t.Fatal("test requires distinct rotated tokens")
 	}
 
 	data, err := os.ReadFile(path)
@@ -227,5 +230,47 @@ func TestCurrentTokenRenewalReplacesRecoveryToken(t *testing.T) {
 	}
 	if _, err = st.EnrollAgent(req, first.Token); !errors.Is(err, store.ErrUnauthorized) {
 		t.Fatalf("superseded recovery token accepted: %v", err)
+	}
+}
+
+func TestConnectedAgentRefreshesPersistedAppVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := st.EnrollAgent(protocol.EnrollRequest{Name: "host", AppVersion: "0.2.0", InstallationID: "version"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.SetAgentOnline(agent.AgentID, true)
+	for _, version := range []string{"", "   ", "bad\nversion", strings.Repeat("v", 65)} {
+		if err = st.SetAgentAppVersion(agent.AgentID, version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	loaded, err := st.GetAgent(agent.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Online || loaded.AppVersion != "0.2.0" {
+		t.Fatalf("invalid version changed agent: online=%v version=%q", loaded.Online, loaded.AppVersion)
+	}
+	if err = st.SetAgentAppVersion(agent.AgentID, " 0.6.15 "); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.SetAgentAppVersion("missing", "1.2.3"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing agent: %v", err)
+	}
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = st.GetAgent(agent.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Online || loaded.AppVersion != "0.6.15" {
+		t.Fatalf("persisted agent online=%v version=%q", loaded.Online, loaded.AppVersion)
 	}
 }

@@ -32,6 +32,7 @@ type mockConn struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan json.RawMessage
 	ctx       context.Context
+	loaded    map[string]bool
 }
 
 func StartMock(addr string) (*MockServer, error) {
@@ -90,7 +91,7 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer conn.Close()
-	c := &mockConn{hub: h, conn: conn, pending: map[string]chan json.RawMessage{}, ctx: ctx}
+	c := &mockConn{hub: h, conn: conn, pending: map[string]chan json.RawMessage{}, ctx: ctx, loaded: map[string]bool{}}
 	h.mu.Lock()
 	h.connections[c] = true
 	h.mu.Unlock()
@@ -143,6 +144,22 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 			}
 			h.mu.Unlock()
 			c.reply(id, map[string]any{"data": data, "nextCursor": nil})
+		case "thread/loaded/list":
+			data := []string{}
+			for threadID := range c.loaded {
+				data = append(data, threadID)
+			}
+			c.reply(id, map[string]any{"data": data, "nextCursor": nil})
+		case "thread/unsubscribe":
+			status := "notLoaded"
+			if c.loaded[tid] {
+				delete(c.loaded, tid)
+				status = "unsubscribed"
+			}
+			c.reply(id, map[string]any{"status": status})
+			if status == "unsubscribed" {
+				c.event("thread/closed", map[string]any{"threadId": tid})
+			}
 		case "thread/start":
 			cwd, _ := p["cwd"].(string)
 			if cwd == "" {
@@ -158,6 +175,7 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 			h.threads = append([]map[string]any{t}, h.threads...)
 			copy := clone(t)
 			h.mu.Unlock()
+			c.loaded[t["id"].(string)] = true
 			c.reply(id, map[string]any{"thread": copy, "model": model, "modelProvider": provider, "cwd": cwd})
 			c.event("thread/started", map[string]any{"thread": copy})
 		case "thread/resume", "thread/read":
@@ -172,6 +190,9 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 				c.rpcError(id, "thread not found")
 			} else {
 				thread := copy.(map[string]any)
+				if msg.Method == "thread/resume" {
+					c.loaded[tid] = true
+				}
 				if msg.Method == "thread/read" && p["includeTurns"] == false {
 					delete(thread, "turns")
 				}
@@ -219,6 +240,10 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 			}
 			c.reply(id, map[string]any{})
 		case "turn/start", "turn/steer":
+			if !c.loaded[tid] {
+				c.rpcError(id, "thread is not loaded; resume it first")
+				continue
+			}
 			if msg.Method == "turn/steer" {
 				h.mu.Lock()
 				t := h.threadLocked(tid)
@@ -268,12 +293,22 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 				for _, item := range input {
 					if v, ok := item.(map[string]any); ok {
 						if s, ok := v["text"].(string); ok {
-							text += s
+							for _, line := range strings.Split(s, "\n") {
+								const marker = "[CodexRM attachment] "
+								var file struct{ Name string }
+								if strings.HasPrefix(line, marker) && json.Unmarshal([]byte(strings.TrimPrefix(line, marker)), &file) == nil && file.Name != "" {
+									line = "[附件：" + file.Name + "]"
+								}
+								if text != "" {
+									text += "\n"
+								}
+								text += line
+							}
 						}
 					}
 				}
 			}
-			turn := map[string]any{"id": fmt.Sprintf("turn_%d", h.next.Add(1)), "status": "inProgress", "items": []any{map[string]any{"id": fmt.Sprintf("user_%d", h.next.Add(1)), "type": "userMessage", "content": []any{map[string]any{"type": "text", "text": text}}}}}
+			turn := map[string]any{"id": fmt.Sprintf("turn_%d", h.next.Add(1)), "status": "inProgress", "items": []any{map[string]any{"id": fmt.Sprintf("user_%d", h.next.Add(1)), "type": "userMessage", "content": p["input"]}}}
 			t["turns"] = append(t["turns"].([]any), turn)
 			t["status"] = map[string]any{"type": "active"}
 			t["updatedAt"] = time.Now().Unix()
@@ -351,6 +386,32 @@ func (c *mockConn) runTurn(ctx context.Context, tid string, turn map[string]any,
 			}
 		}
 		reply = "审批结果：**" + strings.Join(decisions, ", ") + "**。演示流程已完成，没有执行真实命令。"
+	}
+	if strings.Contains(text, "提问") || strings.Contains(text, "question") {
+		key := fmt.Sprintf("mock-question-%d", h.next.Add(1))
+		ch := make(chan json.RawMessage, 1)
+		c.pendingMu.Lock()
+		c.pending[string(mustMockJSON(key))] = ch
+		c.pendingMu.Unlock()
+		defer func() { c.pendingMu.Lock(); delete(c.pending, string(mustMockJSON(key))); c.pendingMu.Unlock() }()
+		_ = c.write(map[string]any{"id": key, "method": "item/tool/requestUserInput", "params": map[string]any{
+			"threadId": tid, "turnId": turnID, "itemId": key, "isBlocking": true,
+			"questions": []any{
+				map[string]any{"id": "approach", "header": "实现方式", "question": "你希望如何完成这项任务？", "isOther": true,
+					"options": []any{
+						map[string]any{"label": "直接实现（推荐）", "description": "完成代码修改并验证结果。"},
+						map[string]any{"label": "先看方案", "description": "先解释实施方案，再开始修改。"},
+					}},
+				map[string]any{"id": "details", "header": "补充说明", "question": "还有哪些需要注意的要求？", "options": nil},
+			},
+		}})
+		select {
+		case <-ctx.Done():
+			return
+		case result := <-ch:
+			reply = "已收到你的回答：\n\n```json\n" + string(result) + "\n```"
+			c.event("serverRequest/resolved", map[string]any{"threadId": tid, "requestId": key})
+		}
 	}
 	itemID := fmt.Sprintf("item_%d", h.next.Add(1))
 	item := map[string]any{"id": itemID, "type": "agentMessage", "text": ""}

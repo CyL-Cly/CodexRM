@@ -33,7 +33,7 @@ if ($Interactive) {
 }
 
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-    throw 'Go was not found. Install Go 1.22+ and add it to PATH before building.'
+    throw 'Go was not found. Install Go 1.24+ and add it to PATH before building.'
 }
 $previousOS = $env:GOOS
 $previousArch = $env:GOARCH

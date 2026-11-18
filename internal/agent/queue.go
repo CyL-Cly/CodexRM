@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codexrm/codexrm/internal/appserver"
@@ -21,6 +21,14 @@ type queuedMessage struct {
 }
 
 type messageQueue struct {
+	// Serialize resume/start/unsubscribe without blocking notification delivery.
+	RPCMu         sync.Mutex
+	Loaded        bool
+	Detached      bool
+	Ephemeral     bool
+	ResumeParams  map[string]any
+	Unloaded      chan struct{}
+	Polling       bool
 	Known         bool
 	Entries       []*queuedMessage
 	ActiveTurn    string
@@ -53,12 +61,14 @@ func (a *Agent) queueViewLocked(threadID string) map[string]any {
 }
 
 func (a *Agent) publishQueue(view map[string]any) {
-	a.mu.Lock()
-	relay := a.relay
-	a.mu.Unlock()
-	if relay != nil {
-		_ = a.write(relay, protocol.Envelope{Type: protocol.TypeServerMessage, Message: mustJSON(map[string]any{"method": "codexrm/queue/updated", "params": view})})
-	}
+	a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, Message: mustJSON(map[string]any{"method": "codexrm/queue/updated", "params": view})})
+}
+
+func (a *Agent) publishThreadState(state, threadID string) {
+	a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, Message: mustJSON(map[string]any{
+		"method": "codexrm/thread/" + state,
+		"params": map[string]any{"threadId": threadID},
+	})})
 }
 
 func (a *Agent) ensureQueue(ctx context.Context, app *appserver.Client, threadID string) error {
@@ -132,13 +142,19 @@ func (a *Agent) queueRPC(ctx context.Context, app *appserver.Client, owner, meth
 	case "codexrm/queue/add":
 		input, _ := params["input"].([]any)
 		text := ""
+		hasMedia := false
 		for _, item := range input {
-			if item, ok := item.(map[string]any); ok && item["type"] == "text" {
-				value, _ := item["text"].(string)
-				text += value
+			if item, ok := item.(map[string]any); ok {
+				if item["type"] == "text" {
+					value, _ := item["text"].(string)
+					text += value
+				}
+				if item["type"] == "localImage" || item["type"] == "image" {
+					hasMedia = true
+				}
 			}
 		}
-		if strings.TrimSpace(text) == "" || len(q.Entries) >= 50 {
+		if (strings.TrimSpace(text) == "" && !hasMedia) || len(q.Entries) >= 50 {
 			a.queueMu.Unlock()
 			return nil, fmt.Errorf("排队消息不能为空，每个会话最多排队 50 条")
 		}
@@ -186,7 +202,16 @@ func (a *Agent) queueNotification(ctx context.Context, app *appserver.Client, ra
 	if ctx.Err() != nil || json.Unmarshal(raw, &event) != nil || event.Params.ThreadID == "" {
 		return
 	}
-	if event.Method != "turn/started" && event.Method != "turn/completed" && event.Method != "thread/archived" {
+	if event.Method == "thread/closed" {
+		a.queueMu.Lock()
+		if q := a.queues[event.Params.ThreadID]; q != nil && q.Unloaded != nil {
+			close(q.Unloaded)
+			q.Unloaded = nil
+		}
+		a.queueMu.Unlock()
+		return
+	}
+	if event.Method != "turn/started" && event.Method != "turn/completed" && event.Method != "thread/archived" && event.Method != "serverRequest/resolved" {
 		return
 	}
 	threadID := event.Params.ThreadID
@@ -220,14 +245,80 @@ func (a *Agent) queueNotification(ctx context.Context, app *appserver.Client, ra
 		}
 		a.publishQueue(view)
 		a.drainQueue(ctx, app, threadID)
+		a.releaseIdleThread(ctx, app, threadID)
 	}()
+}
+
+const detachedQueuePollInterval = time.Second
+
+func (a *Agent) startDetachedQueuePoll(ctx context.Context, app *appserver.Client, threadID string) {
+	a.queueMu.Lock()
+	q := a.queueLocked(threadID)
+	if q.Polling || !q.Detached || q.Paused || q.Starting || q.ActiveTurn == "" || len(q.Entries) == 0 {
+		a.queueMu.Unlock()
+		return
+	}
+	q.Polling = true
+	a.queueMu.Unlock()
+	go a.pollDetachedQueue(ctx, app, threadID, q)
+}
+
+// A detached thread receives no turn/completed notification from a desktop
+// writer. Poll its durable status so queued work resumes when that writer idles.
+func (a *Agent) pollDetachedQueue(ctx context.Context, app *appserver.Client, threadID string, q *messageQueue) {
+	defer func() {
+		a.queueMu.Lock()
+		q.Polling = false
+		a.queueMu.Unlock()
+	}()
+	for {
+		timer := time.NewTimer(detachedQueuePollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		a.queueMu.Lock()
+		blocked := !q.Detached || q.Paused || q.Starting || q.ActiveTurn == "" || len(q.Entries) == 0
+		a.queueMu.Unlock()
+		if blocked || ctx.Err() != nil {
+			return
+		}
+		callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		raw, err := app.Call(callCtx, "thread/read", map[string]any{"threadId": threadID, "includeTurns": false})
+		cancel()
+		if err != nil {
+			continue
+		}
+		var snapshot struct {
+			Thread struct{ Status struct{ Type string } } `json:"thread"`
+		}
+		if json.Unmarshal(raw, &snapshot) != nil || snapshot.Thread.Status.Type != "idle" {
+			continue
+		}
+		a.queueMu.Lock()
+		if q.Detached && !q.Paused && !q.Starting && len(q.Entries) > 0 {
+			q.ActiveTurn = ""
+			q.Known = true
+			a.queueMu.Unlock()
+			a.drainQueue(ctx, app, threadID)
+			return
+		}
+		a.queueMu.Unlock()
+		return
+	}
 }
 
 func (a *Agent) drainQueue(ctx context.Context, app *appserver.Client, threadID string) {
 	a.queueMu.Lock()
 	q := a.queueLocked(threadID)
-	if ctx.Err() != nil || q.Paused || q.Starting || q.ActiveTurn != "" || len(q.Entries) == 0 {
+	if ctx.Err() != nil || a.updating || q.Paused || q.Starting || q.ActiveTurn != "" || len(q.Entries) == 0 {
+		poll := ctx.Err() == nil && !a.updating && q.Detached && !q.Paused && !q.Starting && q.ActiveTurn != "" && len(q.Entries) > 0
 		a.queueMu.Unlock()
+		if poll {
+			a.startDetachedQueuePoll(ctx, app, threadID)
+		}
 		return
 	}
 	entry := q.Entries[0]
@@ -237,12 +328,9 @@ func (a *Agent) drainQueue(ctx context.Context, app *appserver.Client, threadID 
 	a.queueMu.Unlock()
 	a.publishQueue(view)
 
-	a.mu.Lock()
-	a.owners[threadID] = entry.Owner
-	a.mu.Unlock()
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	raw, err := app.Call(callCtx, "turn/start", entry.Params)
+	raw, err := a.callThread(callCtx, app, entry.Owner, "turn/start", entry.Params)
 	var result struct {
 		Turn struct{ ID string } `json:"turn"`
 	}
@@ -250,12 +338,6 @@ func (a *Agent) drainQueue(ctx context.Context, app *appserver.Client, threadID 
 		err = json.Unmarshal(raw, &result)
 		if err == nil && result.Turn.ID == "" {
 			err = fmt.Errorf("Codex 未返回任务编号，请同步历史后再继续排队")
-		}
-	}
-	if err == nil {
-		if saveErr := a.rememberThreadModel("turn/start", entry.Params, raw); saveErr != nil {
-			// The turn has already started; a metadata failure must not replay it.
-			log.Printf("unable to save queued thread model: %v", saveErr)
 		}
 	}
 	a.queueMu.Lock()
@@ -280,4 +362,5 @@ func (a *Agent) drainQueue(ctx context.Context, app *appserver.Client, threadID 
 	if err == nil {
 		a.drainQueue(ctx, app, threadID)
 	}
+	a.releaseIdleThread(ctx, app, threadID)
 }

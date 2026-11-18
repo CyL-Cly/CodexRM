@@ -7,24 +7,21 @@
       content="width=device-width,initial-scale=1,viewport-fit=cover"
     />
     <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#151515" />
+    <meta name="theme-color" content="#151517" />
     <meta name="application-name" content="CodexRM" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="CodexRM" />
     <title>CodexRM · 远程工作区</title>
-    <link rel="icon" href="/icons/icon.svg?v=20261116-9" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261116-9" />
-    <link rel="manifest" href="/manifest.webmanifest?v=20261116-9" />
-    <link rel="modulepreload" href="/app.js?v=20261116-9" />
-    <script>
-      try {
-        document.documentElement.dataset.theme = JSON.parse(localStorage.getItem("codexrm.theme")) || "dark";
-      } catch {}
-    </script>
-    <link rel="stylesheet" href="/styles.css?v=20261116-9" />
-    <script src="/pwa.js?v=20261116-9" defer></script>
-    <script src="/app.js?v=20261116-9" type="module"></script>
+    <link rel="icon" href="/icons/icon.svg?v=20261118-2" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261118-2" />
+    <link rel="manifest" href="/manifest.webmanifest?v=20261118-2" />
+    <link rel="modulepreload" href="/app.js?v=20261118-2" />
+    <script src="/theme.js?v=20261118-2"></script>
+    <link rel="stylesheet" href="/dsh-theme.css?v=20261118-2" />
+    <link rel="stylesheet" href="/styles.css?v=20261118-2" />
+    <script src="/pwa.js?v=20261118-2" defer></script>
+    <script src="/app.js?v=20261118-2" type="module"></script>
   </head>
   <body>
     <div id="app">
@@ -38,10 +35,10 @@
             aria-label="关闭侧栏"
             data-icon="close"
           ></button
-          ><span class="brand-tag">REMOTE</span>
+          ><span class="brand-tag">工作台</span>
         </div>
         <button id="new-chat" class="new-chat">
-          <span data-icon="edit"></span>新会话<span class="key-hint"
+          <span data-icon="plus"></span>新对话<span class="key-hint"
             >Ctrl K</span
           >
         </button>
@@ -114,6 +111,19 @@
             ><span data-icon="settings"></span>
           </button>
         </div>
+        <div
+          id="sidebar-resize"
+          class="sidebar-resize"
+          role="separator"
+          tabindex="0"
+          aria-label="调整侧栏宽度"
+          aria-orientation="vertical"
+          aria-controls="sidebar"
+          aria-valuemin="220"
+          aria-valuemax="520"
+          aria-valuenow="260"
+          title="拖动调整宽度 · 双击恢复默认"
+        ></div>
       </aside>
       <button
         id="sidebar-overlay"
@@ -130,9 +140,25 @@
               aria-label="切换侧栏"
               data-icon="panel"
             ></button
-            ><span id="header-title">Codex Remote</span
-            ><span class="slash">/</span
-            ><span id="header-subtitle">新会话</span>
+            ><span id="header-title">CodexRM</span
+            ><span id="header-divider" class="slash">/</span
+            ><button
+              id="header-subtitle"
+              class="thread-title"
+              type="button"
+              title="点击重命名会话"
+              disabled
+            >新会话</button
+            ><form id="title-rename-form" class="title-rename-form" hidden>
+              <input
+                id="title-rename-input"
+                aria-label="重命名会话"
+                title="Enter 保存 · Esc 取消"
+                maxlength="150"
+                autocomplete="off"
+                required
+              />
+            </form>
           </div>
           <div class="header-actions">
             <span id="demo-badge" class="demo-badge" hidden>演示模式</span
@@ -172,9 +198,8 @@
         <div class="workspace">
           <div id="scroll-area" class="scroll-area">
             <section id="welcome" class="welcome">
-              <div class="welcome-mark" data-icon="terminal"></div>
-              <div class="eyebrow">你的工作区，随处可达</div>
-              <h1>随时可以开始。</h1>
+              <div class="welcome-headline"><span class="welcome-mark" data-icon="terminal"></span>
+              <h1>探索未至之境</h1><span class="hero-badge">CodexRM</span></div>
               <p id="welcome-description">
                 连接你的电脑，让 Codex 继续手边的工作。
               </p>
@@ -196,10 +221,12 @@
               ><span id="elapsed"></span>
             </div>
             <form id="composer" class="composer">
+              <div id="attachments" class="attachments" aria-label="待发送附件" aria-live="polite" hidden></div>
+              <input id="file-input" type="file" multiple hidden />
               <textarea
                 id="prompt"
                 rows="1"
-                placeholder="安排一个任务，或问问 Codex…"
+                placeholder="发送消息，或粘贴图片…"
                 aria-label="消息输入"
                 maxlength="200000"
               ></textarea>
@@ -208,27 +235,15 @@
                 <button id="steer" type="button" title="向当前任务追加指令（Ctrl / ⌘ Enter）">插队发送</button>
               </div>
               <div class="composer-toolbar">
+                <button id="attach-files" class="icon-button attach-button" type="button" aria-label="添加文件或图片" title="添加文件或图片" data-icon="attach" disabled></button>
                 <div class="composer-options">
-                  <button
-                    id="workspace-settings"
-                    class="icon-button"
-                    type="button"
-                    aria-label="添加工作区文件夹"
-                    title="添加工作区文件夹"
-                    data-icon="folder"
-                  ></button
-                  ><select
-                    id="workspace-select"
-                    aria-label="当前工作区"
-                    title="切换工作区并新建会话"
-                  >
-                    <option value="">选择工作区</option></select
-                  ><select id="model" aria-label="供应商与模型" title="选择供应商与模型">
+                  <button id="model-trigger" class="model-trigger" type="button" aria-label="选择供应商与模型" aria-haspopup="dialog" aria-controls="model-menu" aria-expanded="false" disabled><span data-icon="spark"></span><span id="model-label">选择模型</span><span id="model-effort-label"></span><span data-icon="chevron"></span></button>
+                  <select id="model" aria-label="供应商与模型" title="选择供应商与模型" hidden>
                     <option value="">默认模型</option></select
-                  ><button id="refresh-models" class="icon-button" type="button" aria-label="刷新供应商模型" title="刷新所有供应商的模型" data-icon="refresh" disabled></button
-                  ><select id="effort" aria-label="思考强度">
+                  ><select id="effort" aria-label="思考强度" hidden>
                     <option value="">默认思考</option>
                   </select>
+                  <button id="permission-trigger" class="permission-trigger" type="button" title="访问权限与审批设置"><span data-icon="lock"></span><span id="permission-label">完整访问</span><span data-icon="chevron"></span></button>
                 </div>
                 <button id="stop" class="send-button running" type="button" title="停止任务并暂停排队" aria-label="停止任务并暂停排队" data-icon="stop" hidden></button>
                 <button
@@ -243,17 +258,35 @@
               </div>
             </form>
             <div class="composer-meta">
-              <span class="workspace-path"
+              <label class="workspace-path"
                 ><span data-icon="folder"></span
-                ><span id="cwd-label">本地工作目录</span></span
+                ><select
+                  id="workspace-select"
+                  aria-label="当前工作区"
+                  title="切换工作区并新建会话"
+                  disabled
+                >
+                  <option value="">选择工作区文件夹</option></select
+                ><span data-icon="chevron"></span></label
               ><span id="composer-hint">Enter 发送 · Shift Enter 换行</span>
             </div>
-            <p class="footnote">
-              任务在你的电脑上运行<span>·</span>CodexRM 连接每一处灵感
-            </p>
+            <p class="footnote">任务在你的电脑上运行</p>
           </div>
         </div>
       </main>
+    </div>
+    <div id="model-menu" class="model-menu" role="dialog" aria-label="模型与思考设置" popover="auto" hidden>
+      <div class="model-menu-header"><button id="model-menu-back" class="icon-button" type="button" aria-label="返回模型设置" data-icon="chevron" hidden></button><strong id="model-menu-title">模型设置</strong><button id="close-model-menu" class="icon-button" type="button" aria-label="关闭模型设置" data-icon="close"></button></div>
+      <div id="model-menu-root">
+        <button id="choose-model" class="model-setting-row" type="button"><span>模型</span><span id="model-menu-current"></span><span data-icon="chevron"></span></button>
+        <button id="choose-effort" class="model-setting-row" type="button"><span>思考强度</span><span id="model-menu-effort"></span><span data-icon="chevron"></span></button>
+        <button id="refresh-models" class="model-setting-row" type="button" aria-label="刷新供应商模型" title="刷新所有供应商的模型" disabled><span data-icon="refresh"></span><span>刷新模型列表</span></button>
+      </div>
+      <div id="model-menu-models" hidden>
+        <label class="model-search"><span data-icon="search"></span><input id="model-search" type="search" placeholder="搜索模型或供应商" aria-label="搜索模型或供应商" autocomplete="off" /></label>
+        <div id="model-choices" class="model-choices" role="radiogroup" aria-label="供应商与模型列表"></div>
+      </div>
+      <div id="effort-choices" class="model-choices" role="radiogroup" aria-label="思考强度列表" hidden></div>
     </div>
     <dialog
       id="device-dialog"
@@ -353,6 +386,12 @@
           默认完整访问、从不请求审批。设置应用于新会话和下一次发送。
         </p>
         <div id="device-detail" class="device-detail"></div>
+        <button class="secondary-button agent-update-button" id="update-agent" type="button" hidden>
+          检查并更新电脑 Agent
+        </button>
+        <p class="field-help" id="update-agent-help" hidden>
+          更新包将在电脑端校验；进行中的任务和排队消息结束后自动安装并重启 Agent。
+        </p>
         <button class="danger-button" id="close-codex-desktop" type="button" hidden>
           关闭 Codex 桌面客户端
         </button>
@@ -413,6 +452,24 @@
       <p class="directory-note">
         添加后可在同一台设备上切换多个工作区。移出列表只删除记录，保留文件和会话。
       </p>
+    </dialog>
+    <div id="thread-menu" class="thread-menu" role="menu" aria-label="对话操作" tabindex="-1" hidden>
+      <button id="delete-thread" class="thread-menu-delete" type="button" role="menuitem">
+        <span data-icon="trash"></span>删除对话
+      </button>
+    </div>
+    <dialog id="delete-thread-dialog" class="dialog" aria-labelledby="delete-thread-title" aria-describedby="delete-thread-description">
+      <div class="dialog-header">
+        <h2 id="delete-thread-title">删除对话？</h2>
+        <button type="button" class="icon-button" data-close="delete-thread-dialog" aria-label="取消删除" data-icon="close"></button>
+      </div>
+      <p id="delete-thread-name" class="delete-thread-name"></p>
+      <p id="delete-thread-description">对话将从列表移除，历史记录仍保留在电脑的本地归档中。</p>
+      <p id="delete-thread-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button id="cancel-delete-thread" type="button" class="secondary-button" data-close="delete-thread-dialog" autofocus>取消</button>
+        <button id="confirm-delete-thread" type="button" class="danger-button">删除对话</button>
+      </div>
     </dialog>
     <dialog id="thread-dialog" class="dialog">
       <div class="dialog-header">

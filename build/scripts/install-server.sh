@@ -10,6 +10,7 @@ test -f "$binary"
 test -f "$unit"
 test -f "$web/index.html"
 getent passwd codexrm >/dev/null || useradd --system --home-dir "$root" --shell /usr/sbin/nologin codexrm
+getent group codexrm >/dev/null || groupadd --system codexrm
 install -d -m 0755 "$root" "$root/bin"
 install -d -o codexrm -g codexrm -m 0700 "$root/data"
 install -d -o codexrm -g codexrm -m 0700 "$root/data/updates"
@@ -36,9 +37,13 @@ systemctl daemon-reload
 systemctl enable codexrm.service
 systemctl restart codexrm.service
 for attempt in {1..20}; do
-    if curl -fsS http://127.0.0.1:18080/api/v1/health; then
-        printf '\nCodexRM ready on 127.0.0.1:18080\n'
-        exit 0
+    if health_response=$(curl -fsS --connect-timeout 2 --max-time 5 -w $'\n%{http_code}' http://127.0.0.1:18080/api/v1/health); then
+        health_status=${health_response##*$'\n'}
+        health_body=${health_response%$'\n'*}
+        if [[ "$health_status" == 2?? ]] && printf '%s' "$health_body" | grep -Eq '^[[:space:]]*\{[[:space:]]*"ok"[[:space:]]*:[[:space:]]*true[[:space:]]*,[[:space:]]*"service"[[:space:]]*:[[:space:]]*"codexrm"([[:space:]]*,[[:space:]]*"version"[[:space:]]*:[[:space:]]*"[^"]*")?[[:space:]]*\}[[:space:]]*$'; then
+            printf '\nCodexRM ready on 127.0.0.1:18080\n'
+            exit 0
+        fi
     fi
     sleep 0.25
 done

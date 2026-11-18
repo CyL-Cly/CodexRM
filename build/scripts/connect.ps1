@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Server,
     [string]$Workspace,
     [string]$CodexPath,
@@ -12,8 +12,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $binary = Join-Path $root 'bin/codexrm-agent.exe'
 if (-not (Test-Path -LiteralPath $binary)) { throw 'Run scripts/build.ps1 first.' }
 if ($Restart -and $Pair) { throw 'Restart and Pair cannot be used together.' }
+. (Join-Path $PSScriptRoot 'client-install.ps1')
 if (-not $Pair) {
-    . (Join-Path $PSScriptRoot 'client-install.ps1')
     if (-not $Restart -and @(Get-CodexRMConnectorProcess $binary).Count) {
         Write-Host 'The CodexRM connector is already running. Open CodexRM 设置和生成配对码 to generate a new pairing code.'
         return

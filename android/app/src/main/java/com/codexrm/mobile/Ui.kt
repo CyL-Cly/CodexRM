@@ -1,5 +1,6 @@
 package com.codexrm.mobile
 
+import android.annotation.TargetApi
 import android.app.Activity
 import android.content.Context
 import android.content.res.ColorStateList
@@ -12,6 +13,7 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.Button
 import android.widget.EditText
@@ -48,17 +50,70 @@ internal object Ui {
             DIM = 0xff96969c.toInt(); BORDER = 0xffe5e5e8.toInt(); ACCENT = 0xff244c37.toInt()
             ACCENT_TEXT = Color.WHITE; GREEN = 0xff36815a.toInt(); DANGER = 0xffbd443d.toInt()
         }
-        activity.window.statusBarColor = BACKGROUND
-        activity.window.navigationBarColor = BACKGROUND
+        configureSystemBars(activity, dark)
+    }
+
+    fun configureSystemBars(activity: Activity, dark: Boolean, background: Int = BACKGROUND) {
+        if (Build.VERSION.SDK_INT >= 30) configureSystemBars30(activity, dark, background)
+        else configureSystemBarsLegacy(activity, dark, background)
+    }
+
+    @TargetApi(30)
+    private fun configureSystemBars30(activity: Activity, dark: Boolean, background: Int) {
+        activity.window.setDecorFitsSystemWindows(false)
+        activity.window.statusBarColor = Color.TRANSPARENT
+        activity.window.navigationBarColor = Color.TRANSPARENT
+        activity.window.isNavigationBarContrastEnforced = false
+        activity.window.decorView.setBackgroundColor(background)
         activity.window.decorView.post {
-            if (Build.VERSION.SDK_INT >= 30) {
-                val mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-                val appearance = if (dark) 0 else mask
-                activity.window.insetsController?.setSystemBarsAppearance(appearance, mask)
-            } else {
-                @Suppress("DEPRECATION")
-                activity.window.decorView.systemUiVisibility = if (dark) 0 else View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-            }
+            val mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+            val appearance = if (dark) 0 else mask
+            activity.window.insetsController?.setSystemBarsAppearance(appearance, mask)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun configureSystemBarsLegacy(activity: Activity, dark: Boolean, background: Int) {
+        activity.window.statusBarColor = Color.TRANSPARENT
+        activity.window.navigationBarColor = Color.TRANSPARENT
+        activity.window.decorView.setBackgroundColor(background)
+        var visibility = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
+            View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+        if (!dark) {
+            visibility = visibility or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+        }
+        activity.window.decorView.systemUiVisibility = visibility
+    }
+
+    fun applyWindowInsets(view: View) {
+        val left = view.paddingLeft
+        val top = view.paddingTop
+        val right = view.paddingRight
+        val bottom = view.paddingBottom
+        if (Build.VERSION.SDK_INT >= 30) applyWindowInsets30(view, left, top, right, bottom)
+        else applyWindowInsetsLegacy(view, left, top, right, bottom)
+        view.post { view.requestApplyInsets() }
+    }
+
+    @TargetApi(30)
+    private fun applyWindowInsets30(view: View, left: Int, top: Int, right: Int, bottom: Int) {
+        view.setOnApplyWindowInsetsListener { target, insets ->
+            val safe = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout() or WindowInsets.Type.ime())
+            target.setPadding(left + safe.left, top + safe.top, right + safe.right, bottom + safe.bottom)
+            insets
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applyWindowInsetsLegacy(view: View, left: Int, top: Int, right: Int, bottom: Int) {
+        view.setOnApplyWindowInsetsListener { target, insets ->
+            val cutout = insets.displayCutout
+            val safeLeft = maxOf(insets.systemWindowInsetLeft, cutout?.safeInsetLeft ?: 0)
+            val safeTop = maxOf(insets.systemWindowInsetTop, cutout?.safeInsetTop ?: 0)
+            val safeRight = maxOf(insets.systemWindowInsetRight, cutout?.safeInsetRight ?: 0)
+            val safeBottom = maxOf(insets.systemWindowInsetBottom, cutout?.safeInsetBottom ?: 0)
+            target.setPadding(left + safeLeft, top + safeTop, right + safeRight, bottom + safeBottom)
+            insets
         }
     }
 

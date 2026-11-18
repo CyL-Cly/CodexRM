@@ -14,6 +14,12 @@
 
 功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
 
+网页采用 DeepSeek Harness 的主题、侧栏、居中新对话页、圆角输入区、消息气泡和模型菜单布局，适配 CodexRM 的设备、工作区和 Codex 通信。模型菜单提供按供应商分组、搜索及思考强度选择。新对话沿用当前浏览器内这台设备最近选择或成功发送使用的供应商、模型和思考强度，跨工作区、刷新后保留；仅查看旧对话不会覆盖最近选择。无记录或模型已不可用时，选择可用的默认模型。复用主题和布局样式的 MIT 许可见 `web/dsh-LICENSE.txt`。
+
+输入框旁的附件按钮可以发送文件和图片，也可以在网页输入框或页面空白处粘贴图片、拖入文件；搜索、其他输入框和弹窗保留自己的粘贴行为。支持多选、上传进度、重试、移除、仅发送附件及运行中的排队/插队发送。每个文件最大 20 MB，每条消息最多 10 个附件、合计 50 MB。PNG、JPEG、GIF、WebP 作为图像输入交给 Codex；其他文件提供电脑中的实际路径供 Codex 读取。已上传的附件草稿按设备、工作区和会话保留，网页中的历史附件支持图片预览和原文件下载。
+
+附件分块经已配对的连接传到 Agent 数据目录的 `attachments/`，中继不保存文件；已发送的文件保留在电脑上供后续会话使用，手动移除后对应历史附件将无法下载。启用此功能需要同步更新网页、Agent 和 Server；旧 Agent 的附件入口会提示更新。
+
 ## PWA 与加载缓存
 
 页面提供 Web App Manifest、桌面/移动端安装图标和 Service Worker，可通过浏览器“安装应用”使用独立窗口。首次在线访问后会预缓存应用壳，离线仍可打开界面和恢复本地草稿；远程设备连接、发送任务和同步会话仍需网络。
@@ -22,7 +28,7 @@
 
 ## 快速开始
 
-需要 Go 1.22+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建；运行前端测试需要 Node.js 22+。
+需要 Go 1.24+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建；运行前端测试需要 Node.js 22+。
 
 ```powershell
 git clone https://github.com/codexrm/codexrm.git
@@ -40,7 +46,7 @@ Windows 上可双击根目录的 `build.bat`，依次选择 Windows / Linux 和 
 .\build\bin\codexrm-agent.exe
 ```
 
-Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 RM URL 时，每次启动都会自动打开本机设置页面；也可右键托盘图标选择 **设置**。填写远程服务器和连接授权密钥后保存，Agent 自动连接。设置页可生成配对码、显示二维码、查看和移除已配对设备；更新服务器默认折叠，默认为 `https://codexrm.dagongren.tech/`。
+Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 RM URL 时，每次启动都会自动打开本机设置页面；也可右键托盘图标选择 **设置**。填写远程服务器和连接授权密钥后保存，Agent 自动连接。设置页可生成配对码、显示二维码、查看和移除已配对设备；更新服务器固定为 `https://codexrm.dagongren.tech/`，不在设置中显示。
 
 ```powershell
 .\build\bin\codexrm-agent.exe --settings
@@ -68,7 +74,7 @@ Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 
 
 安装包输出到 `build/dist`。安装器支持 `--install-dir`、`--workspace`、`--non-interactive` 等参数。详见 [Windows 安装说明](docs/windows-install.md)。
 
-已安装的 Windows 客户端每 24 小时检查更新服务器的 `update.json`，校验新包后自动替换、重启；失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。开发者可运行 `build\release.cmd` 构建并发布。详见 [自动更新与发布](docs/updates.md)。
+已安装的 Windows EXE 客户端每次启动立即检查更新，之后每 20 小时检查固定更新服务器的 `update.json`，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。详见 [自动更新与发布](docs/updates.md)。
 
 ## 多工作区
 
@@ -81,7 +87,11 @@ Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 
 
 固定的工作区存放在 Agent 数据目录的 `workspaces.json`，同一设备的配对浏览器共享该列表；当前选择及文件夹折叠状态按设备保存在浏览器中，刷新及切换设备后恢复。目录浏览读取的是 Agent 所在电脑，网页服务器不需要访问项目文件。
 
+桌面端可拖动侧栏右边缘调整宽度，刷新后保留；双击边缘恢复默认宽度，聚焦边缘后也可用左右方向键调整。右键对话或点击其旁的“…”打开删除菜单，确认后从列表移除，历史仍保留在电脑的 Codex 归档中。删除正在运行的对话前需先停止任务。
+
 权限默认采用“完整访问 + 从不请求审批”，设置会在新建会话及下一次发送时传入 Codex。若曾手动保存其他权限设置，仍使用该设置。多个审批可以分别处理或批量允许/拒绝；其他待处理问题的输入会保留，响应经连接器确认后才移除。
+
+CodexRM 创建或恢复会话时会启用 Codex CLI 普通模式的提问功能，无需切换到计划模式。收到问题后可查看选项说明、选择答案或填写自定义回答，再点击“提交回答”；也可以点击“跳过”。普通模式的非阻塞问题会保留至回答或被 Codex 取消，已完成一轮不会直接清除问题；刷新或重连后会重新同步未处理的问题。此配置只应用于远程会话，不修改本机全局 Codex 配置。
 
 桌面客户端占用的会话以只读快照展示，每 3 秒同步已保存消息。独立 app-server 可能将未加载的进行中轮次标为 `interrupted`；此时会结合原始生命周期记录判断，只有明确的停止事件才显示“任务已停止”。无法确认的状态显示为等待原客户端更新。
 
@@ -99,7 +109,7 @@ Agent 默认只读本机 `~/.cc-switch/cc-switch.db` 中的 Codex 供应商，�
 
 ## 构建与测试
 
-需要 Go 1.22+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建。Server 直接从磁盘 `web/` 目录提供页面，不使用 Go embed；更新页面只需替换该目录，无需重新编译或重启 Server。真实模式默认从 Codex 桌面版安装位置查找自带的 CLI，无需另外安装 CLI 或加入 PATH。Windows 上会检查正在运行的桌面版、Store 安装信息及各本地磁盘的常见安装目录，桌面版关闭时也可查找。直接运行 Agent 时，找不到桌面版 CLI 才使用 PATH；也支持用 `--codex` 指定 CLI 路径。
+需要 Go 1.24+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建。Server 直接从磁盘 `web/` 目录提供页面，不使用 Go embed；更新页面只需替换该目录，无需重新编译或重启 Server。真实模式默认从 Codex 桌面版安装位置查找自带的 CLI，无需另外安装 CLI 或加入 PATH。Windows 上会检查正在运行的桌面版、Store 安装信息及各本地磁盘的常见安装目录，桌面版关闭时也可查找。直接运行 Agent 时，找不到桌面版 CLI 才使用 PATH；也支持用 `--codex` 指定 CLI 路径。
 
 ```powershell
 .\build\scripts\build.ps1
@@ -169,7 +179,7 @@ $env:CODEXRM_ENROLL_KEY = '<服务器注册密钥>'
 
 将 `deploy/nginx-location.conf` 中的代理规则合入已有 TLS 站点。服务进程使用专用 `codexrm` 用户，状态目录为 `/opt/codexrm/data`，页面目录为 `/opt/codexrm/web`。后续更新页面只需将本地 `web/` 同步到该目录并刷新浏览器，不需要重新上传二进制或重启服务。前端引用统一携带 `?v=YYYYMMDD` 日期版本，发布页面时应同步更新 `index.html`、`manifest.webmanifest`、`sw.js` 中的版本号。如需直接监听公网端口，自行设置 `--addr :18080`；已部署实例通过 HTTPS 域名访问。
 
-注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取永久有效的专属 token。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查和设备间路由隔离。可在 Windows 设置菜单的“管理已授权设备”中删除授权，删除后立即失效并需要重新配对。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
+注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取专属 token。服务器记录配对设备的最近连接时间及 IP，Agent 设置页可查看；在线心跳持续更新时间。服务器启动时及每分钟清理超过 7 天未连接的设备授权，持续在线的设备保留；升级前缺少连接记录的设备给予一次性的 7 天宽限，重启不会延长。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查和设备间路由隔离。可在 Agent 设置的“已配对设备管理”中删除授权，删除后立即失效并需要重新配对。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
 
 ## 结构与接口
 
@@ -190,7 +200,9 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | --- | --- |
 | `GET /api/v1/health` | 健康检查 |
 | `GET /update.json` | Windows 客户端自动更新清单 |
+| `GET /android-update.json` | Android 客户端手动更新清单 |
 | `GET /updates/{文件名}.zip` | Windows 客户端更新包 |
+| `GET /updates/{文件名}.apk` | Android 客户端更新包 |
 | `POST /api/v1/agent/enroll` | 注册/续期，远程注册需 `X-Enrollment-Key` |
 | `POST /api/v1/agent/pair` | Agent 生成配对码 |
 | `GET /api/v1/agent/pair/status` | 查询配对状态，需 Agent token |

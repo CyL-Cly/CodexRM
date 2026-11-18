@@ -22,6 +22,9 @@ const paths = {
   lock: "M6 10h12v11H6zM8 10V6a4 4 0 0 1 8 0v4",
   stop: "M7 7h10v10H7z",
   download: "M12 3v12m-5-5 5 5 5-5M5 17v4h14v-4",
+  attach: "m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7l9-9",
+  file: "M5 3h9l5 5v13H5zM14 3v6h5M8 13h8m-8 4h6",
+  trash: "M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7",
 };
 const iconCache = new Map();
 const icon = (name) => {
@@ -85,18 +88,29 @@ const state = {
   modelsLoading: false,
   modelListVersion: 0,
   sending: false,
+  creating: null,
   messageQueues: new Map(),
   loading: false,
   readOnly: false,
+  detached: false,
   started: 0,
   historyCursor: null,
+  historyVersion: 0,
+  olderTurnsRequest: null,
+  openThreadRequest: null,
+  bootstrapPromise: null,
+  bootstrapGeneration: -1,
   settings: readStorage("codexrm.settings", {}),
   workspaceViews: readStorage("codexrm.workspaceViews", {}),
   workspaceSectionCollapsed: readStorage("codexrm.workspaceSectionCollapsed", false) === true,
   drafts: readStorage("codexrm.drafts.v1", {}),
+  attachmentDrafts: readStorage("codexrm.attachments.v1", {}),
+  attachmentCache: new Map(),
   workspaces: [],
   threadListVersion: 0,
   threadListLoading: false,
+  archivingThreads: new Set(),
+  archivedThreads: new Set(),
   snapshotTimer: null,
   snapshotOlder: false,
   directory: null,
@@ -136,10 +150,8 @@ function draftKey() {
     ? `${state.selected}:thread:${state.current.id}`
     : `${state.selected}:workspace:${pathKey(selectedCwd())}`;
 }
-function saveDraft() {
-  const key = draftKey();
+function writeDraft(key, value) {
   if (!key) return;
-  const value = $("prompt").value;
   delete state.drafts[key];
   if (value) state.drafts[key] = value;
   const keys = Object.keys(state.drafts);
@@ -148,10 +160,295 @@ function saveDraft() {
     localStorage.setItem("codexrm.drafts.v1", JSON.stringify(state.drafts));
   } catch {}
 }
+function saveDraft() {
+  writeDraft(draftKey(), $("prompt").value);
+}
 function restoreDraft() {
   $("prompt").value = state.drafts[draftKey()] || "";
+  renderAttachments();
   resizePrompt();
 }
+
+const attachmentMarker = "[CodexRM attachment] ";
+const visionMimeTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+function currentAttachments() {
+  return state.attachmentDrafts[draftKey()] || [];
+}
+function persistAttachments() {
+  const drafts = {};
+  for (const [key, files] of Object.entries(state.attachmentDrafts)) {
+    const ready = files.filter((f) => f.path && !f.uploading && !f.error && !f.cancelled)
+      .map(({ id, name, path, size, mimeType }) => ({ id, name, path, size, mimeType }));
+    if (ready.length) drafts[key] = ready;
+  }
+  try { localStorage.setItem("codexrm.attachments.v1", JSON.stringify(drafts)); } catch {}
+}
+function fileSize(size) {
+  return size >= 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.ceil(size / 1024))} KB`;
+}
+function renderAttachments() {
+  const root = $("attachments");
+  const files = currentAttachments();
+  root.hidden = !files.length;
+  root.replaceChildren();
+  for (const file of files) {
+    const card = document.createElement("div");
+    card.className = `attachment-card${file.error ? " attachment-error" : ""}`;
+    const preview = state.attachmentCache.get(`${state.selected}:${file.id}`)?.url;
+    const image = visionMimeTypes.has(file.mimeType);
+    card.innerHTML = `${image && file.id ? `<img data-attachment-image="${escapeHTML(file.id)}" ${preview ? `src="${escapeHTML(preview)}"` : ""} alt="" />` : `<span class="attachment-icon">${icon("file")}</span>`}<span class="attachment-info"><strong>${escapeHTML(file.name)}</strong><small>${escapeHTML(file.error || (file.uploading ? `上传中 ${file.progress || 0}%` : fileSize(file.size)))}</small></span>`;
+    if (file.error && file.file) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.textContent = "重试";
+      retry.disabled = !state.online || state.sending;
+      retry.onclick = () => uploadAttachment(file, draftKey());
+      card.append(retry);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-button";
+    remove.innerHTML = icon("close");
+    remove.setAttribute("aria-label", `移除 ${file.name}`);
+    remove.disabled = state.sending;
+    remove.onclick = () => {
+      file.cancelled = true;
+      state.attachmentDrafts[draftKey()] = files.filter((f) => f !== file);
+      persistAttachments();
+      renderAttachments();
+      renderComposerControls();
+    };
+    card.append(remove);
+    root.append(card);
+  }
+  hydrateAttachmentImages();
+}
+function attachmentBlockedReason() {
+  if (!state.online) return "设备离线，请先启动本地 Agent";
+  if (!state.loaded || state.loading) return "正在同步工作区，请稍候再添加附件";
+  if (state.readOnly) return "此会话由另一个 Codex 实例运行，不能添加附件";
+  if (state.sending) return "请等待当前消息发送完成再添加附件";
+  if (!state.info?.attachments) return "请更新本地 Agent 以支持文件和图片";
+  return "";
+}
+async function addAttachments(inputFiles) {
+  const blocked = attachmentBlockedReason();
+  if (blocked) return toast(blocked);
+  const key = draftKey();
+  const generation = state.generation;
+  const files = (state.attachmentDrafts[key] ||= []);
+  const pending = [];
+  for (const file of inputFiles) {
+    if (files.length >= 10) { toast("每条消息最多添加 10 个附件"); break; }
+    if (file.size > state.info.attachments.maxSize) { toast(`${file.name} 超过单个附件 20 MB 的限制`); continue; }
+    if (files.reduce((sum, f) => sum + f.size, 0) + file.size > 50 * 1024 * 1024) { toast("每条消息的附件总大小不能超过 50 MB"); continue; }
+    const staged = { name: file.name, size: file.size, mimeType: file.type, file, uploading: true, progress: 0 };
+    files.push(staged);
+    pending.push(staged);
+  }
+  renderAttachments();
+  renderComposerControls();
+  // Serialize uploads so a selection of many files does not flood the relay.
+  for (const file of pending) if (!file.cancelled) {
+    if (generation !== state.generation) {
+      file.uploading = false;
+      file.error = "连接已切换，请重试上传";
+      continue;
+    }
+    await uploadAttachment(file, key);
+  }
+  if (key === draftKey()) { renderAttachments(); renderComposerControls(); }
+}
+function pasteAttachments(event) {
+  if (event.defaultPrevented || !event.clipboardData || attachmentBlockedReason()) return;
+  const composer = $("composer");
+  const modal = document.querySelector("dialog[open], [aria-modal='true']");
+  if (composer.closest("[hidden], [inert]") || (modal && !modal.contains(composer)) || !$("model-menu").hidden) return;
+  const origin = event.composedPath?.().find((node) => node?.closest) || event.target;
+  if (origin !== $("prompt") && origin?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false'])")) return;
+  const files = [...(event.clipboardData.items || [])]
+    .filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter(Boolean);
+  if (!files.length) files.push(...(event.clipboardData.files || []));
+  if (!files.length) return;
+  event.preventDefault();
+  return addAttachments(files).catch(showError);
+}
+async function uploadAttachment(file, key) {
+  const generation = state.generation;
+  const device = state.selected;
+  let id;
+  file.uploading = true;
+  file.error = "";
+  const active = () => generation === state.generation && device === state.selected && !file.cancelled;
+  const render = () => {
+    if (key === draftKey()) { renderAttachments(); renderComposerControls(); }
+  };
+  render();
+  try {
+    const begun = await rpc("codexrm/attachment/begin", { name: file.name, size: file.size });
+    id = begun.id;
+    if (!active()) throw new Error("上传已中断，请重试");
+    const chunkSize = Math.min(begun.chunkSize || 262144, 262144);
+    for (let offset = 0; offset < file.size;) {
+      const bytes = new Uint8Array(await file.file.slice(offset, offset + chunkSize).arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+      if (!active()) throw new Error("上传已中断，请重试");
+      const result = await rpc("codexrm/attachment/chunk", { id, offset, data: btoa(binary) });
+      if (!active()) throw new Error("上传已中断，请重试");
+      if (result.offset !== offset + bytes.length) throw new Error("附件上传位置不匹配，请重试");
+      offset = result.offset;
+      file.progress = Math.round(offset / file.size * 100);
+      render();
+    }
+    if (!active()) throw new Error("上传已中断，请重试");
+    const result = await rpc("codexrm/attachment/finish", { id });
+    if (!active()) throw new Error("上传已中断，请重试");
+    Object.assign(file, result);
+    if (visionMimeTypes.has(file.mimeType)) cacheAttachment(`${device}:${file.id}`, { url: URL.createObjectURL(file.file), size: file.size });
+    delete file.file;
+  } catch (error) {
+    file.error = error.message;
+    if (id && generation === state.generation && state.online) rpc("codexrm/attachment/abort", { id }).catch(() => {});
+  } finally {
+    file.uploading = false;
+    persistAttachments();
+    render();
+  }
+}
+function cacheAttachment(key, value) {
+  const old = state.attachmentCache.get(key);
+  if (old?.url && old.url !== value.url) URL.revokeObjectURL(old.url);
+  state.attachmentCache.delete(key);
+  state.attachmentCache.set(key, value);
+  let bytes = [...state.attachmentCache.values()].reduce((sum, entry) => sum + (entry.blob?.size || entry.size || 0), 0);
+  while (state.attachmentCache.size > 40 || bytes > 64 * 1024 * 1024) {
+    const oldest = state.attachmentCache.keys().next().value;
+    const entry = state.attachmentCache.get(oldest);
+    if (entry.url) URL.revokeObjectURL(entry.url);
+    bytes -= entry.blob?.size || entry.size || 0;
+    state.attachmentCache.delete(oldest);
+  }
+}
+function messageInput(text, files = []) {
+  const input = text ? [{ type: "text", text, text_elements: [] }] : [];
+  for (const file of files) {
+    const { id, name, path, size, mimeType } = file;
+    input.push({ type: "text", text: attachmentMarker + JSON.stringify({ id, name, path, size, mimeType }), text_elements: [] });
+    if (visionMimeTypes.has(mimeType)) input.push({ type: "localImage", path });
+  }
+  return input;
+}
+function clearSentDraft(key, files) {
+  writeDraft(key, "");
+  state.attachmentDrafts[key] = (state.attachmentDrafts[key] || []).filter((f) => !files.includes(f));
+  const current = key === draftKey();
+  if (current) $("prompt").value = "";
+  persistAttachments();
+  if (current) { renderAttachments(); resizePrompt(); }
+}
+function restoreSentDraft(key, original, files) {
+  const current = key === draftKey();
+  const newer = current ? $("prompt").value : state.drafts[key] || "";
+  const text = original + (newer ? `\n\n${newer}` : "");
+  writeDraft(key, text);
+  const staged = state.attachmentDrafts[key] || [];
+  state.attachmentDrafts[key] = [...files, ...staged.filter((f) => !files.some((sent) => sent.id === f.id))];
+  if (current) $("prompt").value = text;
+  persistAttachments();
+  if (current) { renderAttachments(); resizePrompt(); }
+}
+function restoreCreatingDraft(operation) {
+  if (!operation || operation.restored) return;
+  operation.restored = true;
+  restoreSentDraft(operation.originalKey, operation.original, operation.files);
+}
+function cancelThreadCreation() {
+  const operation = state.creating;
+  if (!operation) return;
+  operation.cancelled = true;
+  state.creating = null;
+  restoreCreatingDraft(operation);
+  state.sending = false;
+}
+function userContent(content = []) {
+  const files = [];
+  const text = [];
+  for (const c of content) {
+    if (c.type === "text") {
+      for (const line of (c.text || "").split("\n")) {
+        if (line.startsWith(attachmentMarker)) {
+          try {
+            const file = JSON.parse(line.slice(attachmentMarker.length));
+            if (typeof file.id === "string" && typeof file.name === "string" && typeof file.path === "string") { files.push(file); continue; }
+          } catch {}
+        }
+        text.push(line);
+      }
+    }
+  }
+  for (const c of content) {
+    if ((c.type === "localImage" || c.type === "image") && !files.some((f) => f.path === c.path)) text.push("[图片]");
+  }
+  return { text: text.join("\n").trim(), files };
+}
+function attachmentHTML(file) {
+  const cached = state.attachmentCache.get(`${state.selected}:${file.id}`);
+  const image = visionMimeTypes.has(file.mimeType);
+  return `<button type="button" class="message-attachment${image ? " image-attachment" : ""}" data-attachment="${escapeHTML(file.id)}" title="下载 ${escapeHTML(file.name)}">${image ? `<img data-attachment-image="${escapeHTML(file.id)}" ${cached?.url ? `src="${escapeHTML(cached.url)}"` : ""} alt="${escapeHTML(file.name)}" loading="lazy" />` : icon("file")}<span><strong>${escapeHTML(file.name)}</strong><small>${fileSize(file.size)} · 下载</small></span></button>`;
+}
+async function readAttachment(id) {
+  const generation = state.generation;
+  const key = `${state.selected}:${id}`;
+  const cached = state.attachmentCache.get(key);
+  if (cached?.blob) return cached;
+  if (cached?.pending) return cached.pending;
+  const pending = (async () => {
+    const chunks = [];
+    let offset = 0;
+    let file;
+    do {
+      const result = await rpc("codexrm/attachment/read", { id, offset });
+      if (generation !== state.generation) throw new Error("连接已切换，请重试");
+      file = result.file;
+      if (file.size > 20 * 1024 * 1024 || result.offset > file.size || result.offset < offset || (result.offset === offset && offset < file.size)) throw new Error("附件内容不完整");
+      const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
+      if (result.offset !== offset + bytes.length) throw new Error("附件内容不完整");
+      chunks.push(bytes);
+      offset = result.offset;
+    } while (offset < file.size);
+    const blob = new Blob(chunks, { type: file.mimeType });
+    const entry = { blob, file, url: URL.createObjectURL(blob) };
+    cacheAttachment(key, entry);
+    return entry;
+  })();
+  cacheAttachment(key, { ...cached, pending });
+  try { return await pending; }
+  catch (error) {
+    if (state.attachmentCache.get(key)?.pending === pending) {
+      if (cached?.url) cacheAttachment(key, cached);
+      else state.attachmentCache.delete(key);
+    }
+    throw error;
+  }
+}
+function hydrateAttachmentImages() {
+  if (!state.online || !state.info?.attachments || typeof IntersectionObserver === "undefined") return;
+  attachmentImageObserver ||= new IntersectionObserver((entries) => {
+    for (const entry of entries) if (entry.isIntersecting) {
+      const img = entry.target;
+      attachmentImageObserver.unobserve(img);
+      const generation = state.generation;
+      readAttachment(img.dataset.attachmentImage).then((file) => {
+        if (img.isConnected && generation === state.generation) img.src = file.url;
+      }).catch(() => { img.alt = "图片暂时无法加载，点击重试下载"; });
+    }
+  });
+  attachmentImageObserver.disconnect();
+  for (const root of [$("messages"), $("attachments")])
+    root.querySelectorAll("img[data-attachment-image]:not([src])").forEach((img) => attachmentImageObserver.observe(img));
+}
+let attachmentImageObserver;
 function saveWorkspaceView() {
   try {
     localStorage.setItem(
@@ -170,15 +467,13 @@ function folderName(path = "") {
 }
 function renderWorkspacePath() {
   const path = state.current?.cwd || selectedCwd();
-  $("cwd-label").textContent = path || "选择工作区文件夹";
-  $("cwd-label").title = path;
   const select = $("workspace-select");
   select.replaceChildren();
   const list = workspaceGroups().filter((w) => w.path);
   if (path && !list.some((w) => pathKey(w.path) === pathKey(path)))
     list.push({ name: folderName(path), path });
-  if (!list.length) select.append(new Option("选择工作区", ""));
-  for (const w of list) select.append(new Option(w.name, w.path));
+  if (!list.length) select.append(new Option("选择工作区文件夹", ""));
+  for (const w of list) select.append(new Option(w.path, w.path));
   select.value =
     list.find((w) => pathKey(w.path) === pathKey(path))?.path || "";
   select.title = path ? `${path} · 切换后新建会话` : "选择工作区";
@@ -419,8 +714,16 @@ async function syncClientProfile(device) {
   syncedClientProfiles.set(device.token, signature);
 }
 function disconnectSocket({ preservePairingExpired = false } = {}) {
+  closeThreadMenu();
+  $("delete-thread-dialog").close();
+  state.archivingThreads.clear();
+  cancelThreadCreation();
   state.generation++;
   clearTimeout(state.snapshotTimer);
+  state.detached = false;
+  state.historyVersion++;
+  state.olderTurnsRequest = null;
+  state.openThreadRequest = null;
   clearTimeout(state.reconnectTimer);
   clearTimeout(state.connectionTimer);
   clearTimeout(state.pongTimer);
@@ -446,7 +749,7 @@ function disconnectSocket({ preservePairingExpired = false } = {}) {
   state.responding.clear();
   renderApprovals();
 }
-function rpc(method, params = {}) {
+function rpc(method, params = {}, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     if (!state.online || state.socket?.readyState !== WebSocket.OPEN) {
       reject(new Error("设备未连接，请确认本地 Agent 正在运行"));
@@ -456,7 +759,7 @@ function rpc(method, params = {}) {
     const timer = setTimeout(() => {
       state.pending.delete(id);
       reject(new Error("请求超时，请检查本地 Codex 是否正常运行"));
-    }, 120000);
+    }, timeoutMs);
     state.pending.set(id, { resolve, reject, timer });
     state.socket.send(
       JSON.stringify({
@@ -495,6 +798,7 @@ function resumeConnection() {
   if ($("connection-notice").dataset.status === "success") connectionNotice("success");
   if (state.socket?.readyState === WebSocket.OPEN) {
     pingSocket();
+    if (!state.loaded) void bootstrap(state.generation);
   } else if (state.socket?.readyState !== WebSocket.CONNECTING) {
     connect({ reconnect: true });
   }
@@ -641,55 +945,77 @@ function rejectPending(message) {
   state.pending.clear();
 }
 async function bootstrap(generation) {
+  if (state.bootstrapPromise) {
+    if (state.bootstrapGeneration === generation) return state.bootstrapPromise;
+    return;
+  }
   const active = () => generation === state.generation;
-  try {
-    const info = await rpc("codexrm/info");
-    if (!active()) return;
-    state.info = info;
-    state.messageQueues.clear();
-    $("demo-badge").hidden = !info.mock;
-    if (info.workspaces && state.settings.cwd && !workspaceView().selected) {
-      try {
-        await rpc("codexrm/workspace/add", { path: state.settings.cwd });
-        if (!active()) return;
-        workspaceView().selected = state.settings.cwd;
-        saveWorkspaceView();
-      } catch (e) {
-        if (active()) toast(`原工作目录无法添加：${e.message}`);
-      }
+  state.loaded = false;
+  renderConnection();
+  const run = (async () => {
+    try {
+      const info = await rpc("codexrm/info");
       if (!active()) return;
-      delete state.settings.cwd;
-      try {
-        localStorage.setItem(
-          "codexrm.settings",
-          JSON.stringify(state.settings),
-        );
-      } catch {}
+      state.info = info;
+      state.messageQueues.clear();
+      $("demo-badge").hidden = !info.mock;
+      if (info.workspaces && state.settings.cwd && !workspaceView().selected) {
+        try {
+          await rpc("codexrm/workspace/add", { path: state.settings.cwd });
+          if (!active()) return;
+          workspaceView().selected = state.settings.cwd;
+          saveWorkspaceView();
+        } catch (e) {
+          if (active()) toast(`原工作目录无法添加：${e.message}`);
+        }
+        if (!active()) return;
+        delete state.settings.cwd;
+        try {
+          localStorage.setItem(
+            "codexrm.settings",
+            JSON.stringify(state.settings),
+          );
+        } catch {}
+      }
+      await loadWorkspaces();
+      if (!active()) return;
+      renderWorkspacePath();
+      restoreDraft();
+      $("welcome-description").textContent = info.mock
+        ? "已连接演示设备，可以发送任务体验完整流程。"
+        : `已连接 ${info.name}，让 Codex 继续手边的工作。`;
+      state.loaded = true;
+      renderConnection();
+      const results = await Promise.allSettled([
+        loadThreads(false),
+        loadModels(),
+      ]);
+      if (!active()) return;
+      if (results[0].status === "rejected")
+        toast(`无法读取会话：${results[0].reason.message}`);
+      if (results[1].status === "rejected")
+        toast(`无法读取供应商模型：${results[1].reason.message}`);
+      if (state.current) {
+        const id = state.current.id;
+        await openThread(id, true);
+      }
+    } catch (error) {
+      if (active()) {
+        state.loaded = false;
+        showError(error);
+      }
     }
-    await loadWorkspaces();
-    if (!active()) return;
-    renderWorkspacePath();
-    restoreDraft();
-    $("welcome-description").textContent = info.mock
-      ? "已连接演示设备，可以发送任务体验完整流程。"
-      : `已连接 ${info.name}，让 Codex 继续手边的工作。`;
-    state.loaded = true;
-    renderConnection();
-    const results = await Promise.allSettled([
-      loadThreads(false),
-      loadModels(),
-    ]);
-    if (!active()) return;
-    if (results[0].status === "rejected")
-      toast(`无法读取会话：${results[0].reason.message}`);
-    if (results[1].status === "rejected")
-      toast(`无法读取供应商模型：${results[1].reason.message}`);
-    if (state.current) {
-      const id = state.current.id;
-      await openThread(id, true);
+  })();
+  state.bootstrapPromise = run;
+  state.bootstrapGeneration = generation;
+  try {
+    await run;
+  } finally {
+    if (state.bootstrapPromise === run) {
+      state.bootstrapPromise = null;
+      state.bootstrapGeneration = -1;
+      if (active()) renderConnection();
     }
-  } catch (error) {
-    if (active()) showError(error);
   }
 }
 function renderConnection() {
@@ -717,9 +1043,13 @@ function renderConnection() {
 function renderComposerControls() {
   const running = isRunning();
   const unavailable = state.readOnly || state.loading || state.sending || !state.online || !state.loaded;
+  const files = currentAttachments();
+  const attachmentPending = files.some((f) => f.uploading || f.error);
   const queue = state.messageQueues.get(state.current?.id);
   const hasQueue = queue?.entries?.length > 0;
-  const hasText = !!$("prompt").value.trim();
+  const hasText = (!!$("prompt").value.trim() || files.length > 0) && !attachmentPending;
+  $("attach-files").disabled = unavailable || !state.info?.attachments;
+  $("attach-files").title = state.info?.attachments ? "添加文件或图片（每个最大 20 MB）" : "请更新本地 Agent 以支持文件和图片";
   const sendLabel = hasQueue ? "排队发送" : "发送消息";
   $("send").disabled = unavailable || !hasText || (hasQueue && !state.info?.messageQueue);
   $("send").hidden = running;
@@ -741,6 +1071,7 @@ function renderComposerControls() {
   $("model").disabled = !state.online || state.loading || state.sending || running || state.readOnly;
   $("effort").disabled = $("model").disabled;
   $("refresh-models").disabled = !state.online || state.modelsLoading;
+  renderModelControl();
 }
 function selectDevice(device) {
   if (device.agent.agentId !== state.selected) {
@@ -754,11 +1085,13 @@ function selectDevice(device) {
 }
 function createDeviceButton(device) {
   const selected = device.agent.agentId === state.selected;
+  const version = selected && state.info?.version ? state.info.version : device.agent.appVersion;
+  const versionLabel = version ? ` · v${version}` : "";
   const button = document.createElement("button");
   button.type = "button";
   button.className = `device ${selected ? "selected" : ""} ${selected && state.online ? "online" : ""}`;
   button.setAttribute("aria-pressed", selected);
-  button.innerHTML = `<span class="device-icon">${icon("monitor")}</span><span><strong>${escapeHTML(device.agent.serverName)}</strong><small>${escapeHTML(device.agent.os || "computer")} · ${selected ? (state.online ? "在线" : "离线") : "已配对"}</small></span><i class="status-dot"></i>`;
+  button.innerHTML = `<span class="device-icon">${icon("monitor")}</span><span><strong>${escapeHTML(device.agent.serverName)}</strong><small>${escapeHTML(device.agent.os || "computer")}${escapeHTML(versionLabel)} · ${selected ? (state.online ? "在线" : "离线") : "已配对"}</small></span><i class="status-dot"></i>`;
   button.onclick = () => selectDevice(device);
   return button;
 }
@@ -816,10 +1149,11 @@ async function loadThreads(more = false) {
         archived: false,
       });
       if (!active()) return;
-      for (const thread of result.data || []) threads.set(thread.id, thread);
+      for (const thread of result.data || [])
+        if (!state.archivedThreads.has(thread.id)) threads.set(thread.id, thread);
       // Keep notifications received while pagination was in flight.
       for (const thread of state.threads)
-        if (threadTime(thread) > (baseline.get(thread.id) || 0) && threadTime(thread) > threadTime(threads.get(thread.id))) threads.set(thread.id, thread);
+        if (!state.archivedThreads.has(thread.id) && threadTime(thread) > (baseline.get(thread.id) || 0) && threadTime(thread) > threadTime(threads.get(thread.id))) threads.set(thread.id, thread);
       state.threads = [...threads.values()];
       cursor = result.nextCursor || null;
       state.cursor = cursor;
@@ -852,6 +1186,123 @@ function workspaceGroups() {
     group.updatedAt = Math.max(group.updatedAt, threadTime(t));
   }
   return [...groups.values()].sort((a, b) => b.updatedAt - a.updatedAt || a.path.localeCompare(b.path));
+}
+let threadMenuTarget = null;
+let deleteThreadTarget = null;
+function threadActionButton(id) {
+  return [...$("workspaces").querySelectorAll(".thread-row")]
+    .find((row) => row.dataset.threadId === id)?.querySelector(".thread-more");
+}
+function closeThreadMenu(focus = false) {
+  const target = threadMenuTarget;
+  threadMenuTarget = null;
+  $("thread-menu").hidden = true;
+  if (target) {
+    const button = threadActionButton(target.id);
+    button?.setAttribute("aria-expanded", "false");
+    if (focus) button?.focus();
+  }
+}
+function archiveThreadReason(thread) {
+  if (!state.online || !state.loaded) return "设备连接后可以删除对话";
+  if (state.loading || state.sending) return "请等待当前请求完成";
+  if (!thread) return "对话已不在列表中";
+  if (state.archivingThreads.has(thread.id)) return "正在删除此对话";
+  if (thread.status?.type === "active" || (state.current?.id === thread.id && isRunning()))
+    return "请先停止正在运行的对话";
+  return "";
+}
+function openThreadMenu(thread, x, y, origin) {
+  closeThreadMenu();
+  closeModelMenu();
+  threadMenuTarget = { id: thread.id };
+  origin?.setAttribute("aria-expanded", "true");
+  const item = $("delete-thread");
+  const reason = archiveThreadReason(thread);
+  item.disabled = !!reason;
+  item.title = reason;
+  const menu = $("thread-menu");
+  menu.hidden = false;
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - (rect.width || 168) - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - (rect.height || 48) - 8))}px`;
+  (reason ? menu : item).focus();
+}
+function requestThreadDeletion(id) {
+  const thread = state.threads.find((t) => t.id === id);
+  const reason = archiveThreadReason(thread);
+  closeThreadMenu();
+  if (reason) return toast(reason);
+  deleteThreadTarget = { id, generation: state.generation, device: state.selected, saving: false };
+  $("delete-thread-name").textContent = title(thread);
+  $("delete-thread-error").hidden = true;
+  $("confirm-delete-thread").disabled = false;
+  $("confirm-delete-thread").textContent = "删除对话";
+  $("delete-thread-dialog").showModal();
+}
+function removeArchivedThread(id) {
+  state.archivedThreads.add(id);
+  if (threadMenuTarget?.id === id) closeThreadMenu();
+  if (deleteThreadTarget?.id === id) $("delete-thread-dialog").close();
+  // Invalidate list, resume and history requests that may still contain the archived conversation.
+  state.threadListVersion++;
+  state.threadListLoading = false;
+  state.historyVersion++;
+  state.olderTurnsRequest = null;
+  state.openThreadRequest = null;
+  state.threads = state.threads.filter((thread) => thread.id !== id);
+  state.messageQueues.delete(id);
+  for (const [key, request] of state.requests)
+    if (request.params?.threadId === id) state.requests.delete(key);
+  if (state.current?.id === id) newChat(false, true);
+  renderThreads();
+  renderApprovals();
+}
+async function archiveThread(id) {
+  const thread = state.threads.find((t) => t.id === id) || (state.current?.id === id ? state.current : null);
+  const reason = archiveThreadReason(thread);
+  if (reason) throw new Error(reason);
+  const generation = state.generation;
+  const device = state.selected;
+  const active = () => state.generation === generation && state.selected === device;
+  state.archivingThreads.add(id);
+  try {
+    await rpc("thread/archive", { threadId: id });
+    if (!active()) return false;
+    removeArchivedThread(id);
+    return true;
+  } finally {
+    if (active()) state.archivingThreads.delete(id);
+  }
+}
+async function confirmThreadDeletion() {
+  const target = deleteThreadTarget;
+  if (!target || target.saving) return;
+  if (target.generation !== state.generation || target.device !== state.selected) {
+    $("delete-thread-dialog").close();
+    return;
+  }
+  target.saving = true;
+  $("confirm-delete-thread").disabled = true;
+  $("confirm-delete-thread").textContent = "正在删除…";
+  $("delete-thread-error").hidden = true;
+  try {
+    if (await archiveThread(target.id)) {
+      if (deleteThreadTarget === target) $("delete-thread-dialog").close();
+      toast("对话已删除，历史已保留在本地归档");
+    }
+  } catch (error) {
+    if (deleteThreadTarget === target) {
+      $("delete-thread-error").textContent = error.message;
+      $("delete-thread-error").hidden = false;
+    }
+  } finally {
+    target.saving = false;
+    if (deleteThreadTarget === target) {
+      $("confirm-delete-thread").disabled = false;
+      $("confirm-delete-thread").textContent = "删除对话";
+    }
+  }
 }
 function renderThreads() {
   const root = $("workspaces");
@@ -904,22 +1355,55 @@ function renderThreads() {
     history.className = "workspace-history thread-list";
     history.hidden = !expanded;
     for (const t of threads) {
-    const row = document.createElement("div");
-    row.dataset.threadId = t.id;
-    row.className = `thread-row ${t.id === state.current?.id ? "active" : ""}`;
-    const button = document.createElement("button");
-    const name = document.createElement("span");
-    name.textContent = title(t);
-    button.append(name);
-    button.title = `${title(t)}${t.cwd ? `\n${t.cwd}` : ""}`;
-    button.onclick = () => openThread(t.id).catch(showError);
-    row.append(button);
-    if (t.status?.type === "active") {
-      const dot = document.createElement("i");
-      dot.className = "thread-dot";
-      row.append(dot);
-    }
-    history.append(row);
+      const row = document.createElement("div");
+      row.dataset.threadId = t.id;
+      row.className = `thread-row ${t.id === state.current?.id ? "active" : ""}`;
+      const button = document.createElement("button");
+      const running = t.status?.type === "active";
+      if (running) {
+        const spinner = document.createElement("span");
+        spinner.className = "thread-spinner";
+        spinner.setAttribute("aria-hidden", "true");
+        button.append(spinner);
+      }
+      const name = document.createElement("span");
+      name.className = "thread-name";
+      name.textContent = title(t);
+      button.append(name);
+      if (running) {
+        const status = document.createElement("span");
+        status.className = "sr-only";
+        status.textContent = "进行中";
+        button.append(status);
+      }
+      button.title = `${title(t)}${t.cwd ? `\n${t.cwd}` : ""}`;
+      button.onclick = () => openThread(t.id).catch(showError);
+      row.append(button);
+      const more = document.createElement("button");
+      more.type = "button";
+      more.className = "thread-more icon-button";
+      more.innerHTML = icon("more");
+      more.setAttribute("aria-label", `对话操作：${title(t)}`);
+      more.setAttribute("aria-haspopup", "menu");
+      more.setAttribute("aria-controls", "thread-menu");
+      more.setAttribute("aria-expanded", String(threadMenuTarget?.id === t.id));
+      more.onclick = () => {
+        if (threadMenuTarget?.id === t.id) return closeThreadMenu(true);
+        const rect = more.getBoundingClientRect();
+        openThreadMenu(t, rect.left, rect.bottom + 4, more);
+      };
+      row.oncontextmenu = (event) => {
+        event.preventDefault();
+        openThreadMenu(t, event.clientX, event.clientY, more);
+      };
+      row.onkeydown = (event) => {
+        if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+        event.preventDefault();
+        const rect = row.getBoundingClientRect();
+        openThreadMenu(t, rect.left + 20, rect.bottom, more);
+      };
+      row.append(more);
+      history.append(row);
     }
     if (!threads.length) {
       const hint = document.createElement("p");
@@ -944,19 +1428,86 @@ function renderThreads() {
   $("load-more").hidden = state.threadListLoading || !state.cursor;
 }
 function upsertThread(thread) {
+  if (state.archivedThreads.has(thread.id)) return;
   const index = state.threads.findIndex((t) => t.id === thread.id);
   if (index < 0) state.threads.unshift(thread);
   else state.threads[index] = { ...state.threads[index], ...thread };
   renderThreads();
 }
+let titleEditVersion = 0;
+let titleEditSaving = false;
+function cancelTitleEdit() {
+  titleEditVersion++;
+  titleEditSaving = false;
+  $("title-rename-form").hidden = true;
+  $("title-rename-input").disabled = false;
+  $("header-subtitle").hidden = false;
+}
+function renderThreadTitle() {
+  const home = !state.current;
+  const text = home ? "新会话" : title(state.current);
+  $("header-title").hidden = !home;
+  $("header-divider").hidden = !home;
+  $("header-subtitle").textContent = text;
+  $("header-subtitle").disabled = home;
+  $("header-subtitle").title = home ? "" : "点击重命名会话";
+  $("header-subtitle").setAttribute("aria-label", home ? "新会话" : `重命名会话：${text}`);
+}
 function setHome(home) {
+  cancelTitleEdit();
   $("main").classList.toggle("home", home);
   $("welcome").hidden = !home;
-  $("header-subtitle").textContent = home ? "新会话" : title(state.current);
+  renderThreadTitle();
   $("thread-actions").hidden = home;
 }
+function beginTitleEdit() {
+  if (!state.current) return;
+  const input = $("title-rename-input");
+  input.value = title(state.current);
+  $("title-rename-form").hidden = false;
+  $("header-subtitle").hidden = true;
+  input.focus();
+  input.select();
+}
+async function saveTitleEdit() {
+  if (!state.current || titleEditSaving) return;
+  const input = $("title-rename-input");
+  const name = input.value.trim();
+  if (!name) {
+    toast("会话名称不能为空");
+    input.focus();
+    return;
+  }
+  if (name === title(state.current)) {
+    cancelTitleEdit();
+    return;
+  }
+  const threadId = state.current.id;
+  const version = ++titleEditVersion;
+  titleEditSaving = true;
+  input.disabled = true;
+  try {
+    await renameThread(threadId, name);
+    if (version === titleEditVersion) cancelTitleEdit();
+  } catch (error) {
+    if (version === titleEditVersion) {
+      input.disabled = false;
+      titleEditSaving = false;
+      input.focus();
+      showError(error);
+    }
+  }
+}
 function resetView() {
+  closeThreadMenu();
+  $("delete-thread-dialog").close();
+  state.archivingThreads.clear();
+  state.archivedThreads.clear();
+  cancelThreadCreation();
   clearTimeout(state.snapshotTimer);
+  state.historyVersion++;
+  state.olderTurnsRequest = null;
+  state.openThreadRequest = null;
   state.current = null;
   state.turns = [];
   state.messageQueues.clear();
@@ -977,8 +1528,10 @@ function resetView() {
   state.historyCursor = null;
   state.started = 0;
   state.sending = false;
+  state.creating = null;
   state.loading = false;
   state.readOnly = false;
+  state.detached = false;
   $("demo-badge").hidden = true;
   $("messages").replaceChildren();
   $("approval-area").replaceChildren();
@@ -992,22 +1545,30 @@ function resetView() {
   restoreDraft();
   renderConnection();
 }
-function newChat(saveCurrent = true) {
-  if (state.sending || state.loading) {
+function newChat(saveCurrent = true, force = false) {
+  if (!force && (state.sending || state.loading)) {
     toast("请等待当前请求完成后新建会话");
     return;
   }
   if (saveCurrent) saveDraft();
+  if (force) cancelThreadCreation();
+  closeThreadMenu();
+  closeModelMenu();
   state.current = null;
   clearTimeout(state.snapshotTimer);
+  state.historyVersion++;
+  state.olderTurnsRequest = null;
+  state.openThreadRequest = null;
   state.turns = [];
   state.historyCursor = null;
   state.loading = false;
   state.readOnly = false;
+  state.detached = false;
+  state.snapshotOlder = false;
   state.started = 0;
-  renderModels(workspaceModelPreference().model || "");
-  if ([...$("effort").options].some((o) => o.value === workspaceModelPreference().effort))
-    $("effort").value = workspaceModelPreference().effort;
+  const preference = defaultModelPreference();
+  renderModels(preference.model || "");
+  renderEfforts(preference.effort || "");
   renderWorkspacePath();
   $("messages").replaceChildren();
   setHome(true);
@@ -1019,13 +1580,22 @@ function newChat(saveCurrent = true) {
   $("prompt").focus();
 }
 async function openThread(id, silent = false) {
+  closeThreadMenu();
+  if (state.archivingThreads.has(id) || state.archivedThreads.has(id)) return;
   if (state.loading) return;
   if (!state.online) {
     toast("设备离线，恢复连接后可以读取会话");
     return;
   }
   saveDraft();
+  cancelThreadCreation();
+  clearTimeout(state.snapshotTimer);
+  state.historyVersion++;
+  state.olderTurnsRequest = null;
   const generation = state.generation;
+  const request = {};
+  state.openThreadRequest = request;
+  const active = () => generation === state.generation && state.openThreadRequest === request && !state.archivedThreads.has(id);
   state.loading = true;
   renderConnection();
   try {
@@ -1046,7 +1616,7 @@ async function openThread(id, silent = false) {
         });
       } else throw error;
     }
-    if (generation !== state.generation) return;
+    if (!active()) return;
     let thread = result.thread;
     let cursor = result.nextCursor || null;
     if (thread.historyMode === "paginated" && !(readOnly && state.info?.threadSnapshots)) {
@@ -1056,7 +1626,7 @@ async function openThread(id, silent = false) {
         sortDirection: "desc",
         itemsView: "full",
       });
-      if (generation !== state.generation) return;
+      if (!active()) return;
       thread.turns = (page.data || []).reverse();
       cursor = page.nextCursor;
     }
@@ -1067,11 +1637,11 @@ async function openThread(id, silent = false) {
       saveWorkspaceView();
     }
     state.readOnly = readOnly;
+    state.detached = false;
     state.snapshotOlder = false;
     state.turns = thread.turns || [];
     state.historyCursor = cursor;
     state.started = isRunning() ? Date.now() : 0;
-    $("header-subtitle").textContent = title(thread);
     renderWorkspacePath();
     selectThreadModel(result);
     setHome(false);
@@ -1080,27 +1650,36 @@ async function openThread(id, silent = false) {
     renderApprovals();
     restoreDraft();
     renderConnection();
-    if (state.info?.messageQueue)
+    if (state.info?.messageQueue) {
       await loadMessageQueue(id).catch((e) => toast(`排队列表同步失败：${e.message}`));
+      if (!active()) return;
+    }
     scheduleSnapshot();
     if (!silent) closeSidebar();
     scrollBottom();
   } finally {
-    if (generation === state.generation) {
+    if (generation === state.generation && state.openThreadRequest === request) {
+      state.openThreadRequest = null;
       state.loading = false;
       renderConnection();
+      scheduleSnapshot();
     }
   }
 }
 function scheduleSnapshot() {
   clearTimeout(state.snapshotTimer);
-  if (!state.readOnly || !state.current || !state.online || !state.info?.threadSnapshots) return;
+  if (!(state.readOnly || state.detached) || !state.current || !state.online || state.loading || !state.info?.threadSnapshots) return;
   const generation = state.generation;
   const id = state.current.id;
   state.snapshotTimer = setTimeout(async () => {
     try {
       const result = await rpc("codexrm/thread/snapshot", { threadId: id });
-      if (generation !== state.generation || state.current?.id !== id || !state.readOnly || state.loading) return;
+      if (generation !== state.generation || state.current?.id !== id || !(state.readOnly || state.detached) || state.loading) return;
+      if (state.detached && result.active) {
+        state.detached = false;
+        state.readOnly = true;
+        renderConnection();
+      }
       const incoming = result.thread.turns || [];
       const boundary = state.turns.findIndex((t) => t.id === incoming[0]?.id);
       state.turns = state.snapshotOlder && boundary >= 0
@@ -1111,7 +1690,7 @@ function scheduleSnapshot() {
       upsertThread(state.current);
       scheduleRender();
     } catch (error) {
-      if (generation === state.generation && state.online) toast(`桌面会话同步失败：${error.message}`);
+      if (generation === state.generation && state.online && (state.readOnly || state.detached)) toast(`会话同步失败：${error.message}`);
     } finally {
       if (generation === state.generation && state.current?.id === id) scheduleSnapshot();
     }
@@ -1123,22 +1702,40 @@ function displayedTurnStatus(turn) {
   return turn.status;
 }
 async function olderTurns() {
-  if (!state.current || !state.historyCursor) return;
+  if (!state.current || !state.historyCursor || state.olderTurnsRequest || state.loading) return;
+  const generation = state.generation;
+  const version = state.historyVersion;
   const id = state.current.id;
+  const cursor = state.historyCursor;
+  const request = {};
+  state.olderTurnsRequest = request;
   const before = $("scroll-area").scrollHeight;
-  const page = await rpc("thread/turns/list", {
-    threadId: id,
-    cursor: state.historyCursor,
-    limit: 30,
-    sortDirection: "desc",
-    itemsView: "full",
-  });
-  if (state.current?.id !== id) return;
-  state.turns = [...(page.data || []).reverse(), ...state.turns];
-  state.snapshotOlder = state.readOnly;
-  state.historyCursor = page.nextCursor;
-  renderMessages();
-  $("scroll-area").scrollTop = $("scroll-area").scrollHeight - before;
+  try {
+    const page = await rpc("thread/turns/list", {
+      threadId: id,
+      cursor,
+      limit: 30,
+      sortDirection: "desc",
+      itemsView: "full",
+    });
+    if (generation !== state.generation || version !== state.historyVersion || state.olderTurnsRequest !== request ||
+        state.current?.id !== id || state.historyCursor !== cursor || state.archivedThreads.has(id)) return;
+    const existing = new Set(state.turns.map((turn) => turn.id));
+    const added = new Set();
+    const older = [];
+    for (const turn of (page.data || []).reverse()) {
+      if (existing.has(turn.id) || added.has(turn.id)) continue;
+      added.add(turn.id);
+      older.push(turn);
+    }
+    state.turns = [...older, ...state.turns];
+    state.snapshotOlder = state.readOnly || state.detached;
+    state.historyCursor = page.nextCursor || null;
+    renderMessages();
+    $("scroll-area").scrollTop = $("scroll-area").scrollHeight - before;
+  } finally {
+    if (state.olderTurnsRequest === request) state.olderTurnsRequest = null;
+  }
 }
 function modelKey(provider, model) {
   return JSON.stringify([provider || "", model]);
@@ -1151,10 +1748,21 @@ function workspaceModelPreference() {
   view.models ||= {};
   return view.models[pathKey(selectedCwd())] || {};
 }
+function defaultModelPreference() {
+  const available = state.models.filter((m) => !state.providers.find((p) => p.id === m.providerId)?.unavailable);
+  for (const preference of [workspaceView().lastModel, workspaceModelPreference()]) {
+    if (preference?.model && available.some((m) => m.key === preference.model)) return preference;
+  }
+  const model = available.find((m) => !m.providerId && m.isDefault) ||
+    available.find((m) => m.isDefault) || available[0];
+  return { model: model?.key || "", effort: model?.defaultReasoningEffort || "" };
+}
 function saveModelPreference() {
+  if (!selectedModel()) return;
   const view = workspaceView();
   view.models ||= {};
-  view.models[pathKey(selectedCwd())] = { model: $("model").value, effort: $("effort").value };
+  view.lastModel = { model: $("model").value, effort: $("effort").value };
+  view.models[pathKey(selectedCwd())] = view.lastModel;
   saveWorkspaceView();
 }
 async function loadModels(refresh = false) {
@@ -1167,17 +1775,23 @@ async function loadModels(refresh = false) {
       ? await rpc("codexrm/model/list")
       : { providers: [{ id: "", name: "当前 Codex 配置", models: (await rpc("model/list", { limit: 100 })).data || [] }] };
     if (generation !== state.generation || version !== state.modelListVersion) return;
-    const previous = $("model").value || workspaceModelPreference().model || "";
+    const previous = $("model").value;
     const previousEffort = $("effort").value;
     state.providers = result.providers || [];
     state.models = state.providers.flatMap((p) => (p.models || []).filter((m) => !m.hidden).map((m) => ({
       ...m, model: m.model || m.id, providerId: p.id, providerName: p.name,
       key: modelKey(p.id, m.model || m.id),
     })));
-    renderModels(previous);
-    if (state.current) selectThreadModel({ thread: state.current }, previous, previousEffort);
-    else if ([...$("effort").options].some((o) => o.value === workspaceModelPreference().effort))
-      $("effort").value = workspaceModelPreference().effort;
+    if (state.current) {
+      renderModels(previous);
+      selectThreadModel({ thread: state.current }, previous, previousEffort);
+    } else {
+      const preference = defaultModelPreference();
+      const keepSelection = state.models.some((m) => m.key === previous &&
+        !state.providers.find((p) => p.id === m.providerId)?.unavailable);
+      renderModels(keepSelection ? previous : preference.model);
+      renderEfforts(keepSelection ? previousEffort : preference.effort);
+    }
     const warnings = [...(result.warnings || []), ...state.providers.filter((p) => p.warning).map((p) => `${p.name}：${p.warning}`)];
     $("refresh-models").title = warnings.length ? warnings.join("\n") : "刷新所有供应商的模型";
     if (refresh) toast(`已加载 ${state.providers.length} 组供应商、${state.models.length} 个模型${warnings.length ? `；${warnings.length} 组列表使用缓存或暂不可用` : ""}`);
@@ -1190,6 +1804,7 @@ async function loadModels(refresh = false) {
   }
 }
 function renderModels(preferred = $("model").value) {
+  $("model").value = "";
   $("model").replaceChildren(new Option("默认模型 · 当前 Codex 配置", ""));
   for (const p of state.providers) {
     const group = document.createElement("optgroup");
@@ -1259,6 +1874,136 @@ function renderEfforts(previous = $("effort").value) {
   }
   if ([...$("effort").options].some((o) => o.value === previous))
     $("effort").value = previous;
+  renderModelControl();
+  if (!$("model-menu").hidden) renderModelChoices();
+}
+function renderModelControl() {
+  const model = selectedModel();
+  const effort = [...$("effort").options].find((option) => option.value === $("effort").value)?.textContent || "默认思考";
+  $("model-label").textContent = model?.displayName || model?.model || (state.modelsLoading ? "加载模型…" : "当前 Codex 配置");
+  $("model-effort-label").textContent = $("effort").value ? effort : "";
+  $("model-trigger").title = model ? `${model.providerName} · ${model.displayName || model.model} · ${effort}` : "选择供应商与模型";
+  $("model-trigger").disabled = $("model").disabled;
+  $("model-menu-current").textContent = model ? `${model.providerName} · ${model.displayName || model.model}` : "当前 Codex 配置";
+  $("model-menu-effort").textContent = effort;
+  $("choose-effort").disabled = $("effort").options.length <= 1;
+  $("permission-label").textContent = { "danger-full-access": "完整访问", "workspace-write": "工作区访问", "read-only": "只读" }[state.settings.sandbox || "danger-full-access"];
+  if ($("model-trigger").disabled && !$("model-menu").hidden) closeModelMenu();
+}
+function closeModelMenu(focus = false) {
+  const menu = $("model-menu");
+  if (menu.hidden) return;
+  menu.hidePopover?.();
+  menu.hidden = true;
+  $("model-trigger").setAttribute("aria-expanded", "false");
+  if (focus) $("model-trigger").focus();
+}
+function modelMenuPane(pane = "root") {
+  $("model-menu").dataset.pane = pane;
+  $("model-menu-root").hidden = pane !== "root";
+  $("model-menu-models").hidden = pane !== "models";
+  $("effort-choices").hidden = pane !== "effort";
+  $("model-menu-back").hidden = pane === "root";
+  $("model-menu-title").textContent = { root: "模型设置", models: "选择模型", effort: "思考强度" }[pane];
+  renderModelChoices();
+  if (pane === "models") $("model-search").focus();
+  else if (pane === "root") $("choose-model").focus();
+  else $("effort-choices").querySelector("[aria-checked='true']")?.focus();
+}
+function renderModelChoices() {
+  const root = $("model-choices");
+  root.replaceChildren();
+  const query = $("model-search").value.trim().toLocaleLowerCase();
+  for (const provider of state.providers) {
+    const models = state.models.filter((m) => m.providerId === provider.id &&
+      `${provider.name} ${m.displayName || ""} ${m.model}`.toLocaleLowerCase().includes(query));
+    if (!models.length && (query || !provider.warning)) continue;
+    const group = document.createElement("div");
+    group.className = "model-group";
+    const label = document.createElement("div");
+    label.className = "model-group-label";
+    label.textContent = provider.name;
+    group.append(label);
+    if (provider.warning) {
+      const warning = document.createElement("p");
+      warning.className = "model-warning";
+      warning.textContent = provider.warning;
+      group.append(warning);
+    }
+    for (const model of models) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "model-choice";
+      option.setAttribute("role", "radio");
+      option.setAttribute("aria-checked", String(model.key === $("model").value));
+      option.disabled = !!provider.unavailable;
+      option.title = `${provider.name} · ${model.model}`;
+      const label = document.createElement("span");
+      label.textContent = model.displayName || model.model;
+      const check = document.createElement("span");
+      check.className = "model-check";
+      check.textContent = model.key === $("model").value ? "✓" : "";
+      option.append(label, check);
+      option.onclick = () => {
+        $("model").value = model.key;
+        $("model").onchange();
+        closeModelMenu(true);
+      };
+      group.append(option);
+    }
+    root.append(group);
+  }
+  if (!root.children.length) {
+    const empty = document.createElement("p");
+    empty.className = "model-empty";
+    empty.textContent = state.modelsLoading ? "正在加载模型…" : query ? "没有匹配的模型" : "暂无可用模型，请刷新列表";
+    root.append(empty);
+  }
+  const efforts = $("effort-choices");
+  efforts.replaceChildren();
+  for (const effort of $("effort").options) {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "model-choice";
+    option.setAttribute("role", "radio");
+    option.setAttribute("aria-checked", String(effort.value === $("effort").value));
+    option.textContent = `${effort.textContent}${effort.value === $("effort").value ? "　✓" : ""}`;
+    option.onclick = () => {
+      $("effort").value = effort.value;
+      $("effort").onchange();
+      renderModelControl();
+      closeModelMenu(true);
+    };
+    efforts.append(option);
+  }
+}
+function positionModelMenu() {
+  const menu = $("model-menu");
+  if (menu.hidden) return;
+  const bounds = $("model-trigger").getBoundingClientRect();
+  const viewport = window.visualViewport;
+  const left = viewport?.offsetLeft || 0;
+  const top = viewport?.offsetTop || 0;
+  const width = viewport?.width || window.innerWidth;
+  const height = viewport?.height || window.innerHeight;
+  const menuWidth = Math.min(360, width - 24);
+  menu.style.width = `${menuWidth}px`;
+  menu.style.left = `${Math.max(left + 12, Math.min(bounds.left, left + width - menuWidth - 12))}px`;
+  menu.style.top = "auto";
+  const bottom = Math.min(Math.max(bounds.top - 8, top + 132), top + height - 12);
+  menu.style.bottom = `${window.innerHeight - bottom}px`;
+  menu.style.maxHeight = `${Math.max(40, bottom - top - 12)}px`;
+}
+function openModelMenu() {
+  const menu = $("model-menu");
+  if (!menu.hidden) return closeModelMenu(true);
+  if ($("model-trigger").disabled) return;
+  $("model-search").value = "";
+  menu.hidden = false;
+  menu.showPopover?.();
+  positionModelMenu();
+  $("model-trigger").setAttribute("aria-expanded", "true");
+  modelMenuPane();
 }
 function isRunning() {
   if (state.readOnly) return false;
@@ -1332,15 +2077,29 @@ function onEvent(msg) {
     if (t) t.name = p.threadName ?? p.name;
     if (state.current?.id === p.threadId) {
       state.current.name = p.threadName ?? p.name;
-      $("header-subtitle").textContent = title(state.current);
+      renderThreadTitle();
     }
     renderThreads();
     return;
   }
   if (method === "thread/archived") {
-    state.threads = state.threads.filter((t) => t.id !== p.threadId);
-    if (state.current?.id === p.threadId) newChat();
-    renderThreads();
+    removeArchivedThread(p.threadId);
+    return;
+  }
+  if (method === "codexrm/thread/detached" || method === "codexrm/thread/loaded") {
+    if (state.current?.id !== p.threadId) return;
+    clearTimeout(state.snapshotTimer);
+    if (method === "codexrm/thread/detached") {
+      state.detached = true;
+      state.readOnly = false;
+    } else {
+      state.detached = false;
+      state.readOnly = false;
+      state.snapshotOlder = false;
+    }
+    renderConnection();
+    scheduleRender();
+    scheduleSnapshot();
     return;
   }
   const threadID = p.threadId || p.turn?.threadId;
@@ -1354,7 +2113,8 @@ function onEvent(msg) {
   }
   if (method === "turn/completed") {
     for (const [id, req] of state.requests)
-      if (req.params?.threadId === threadID && req.params?.turnId === p.turn.id)
+      if (req.params?.threadId === threadID && req.params?.turnId === p.turn.id &&
+          !(req.method === "item/tool/requestUserInput" && req.params.isBlocking === false && p.turn.status === "completed"))
         state.requests.delete(id);
     renderApprovals();
   }
@@ -1521,14 +2281,8 @@ function markdown(text = "") {
 function itemHTML(item) {
   const type = item.type;
   if (type === "userMessage") {
-    const content = (item.content || [])
-      .map(
-        (c) =>
-          c.text ||
-          (c.type === "image" || c.type === "localImage" ? "[图片]" : ""),
-      )
-      .join("\n");
-    return `<div class="message user"><div class="user-bubble">${escapeHTML(content)}</div></div>`;
+    const content = userContent(item.content);
+    return `<div class="message user"><div class="user-bubble">${content.text ? `<div>${escapeHTML(content.text)}</div>` : ""}${content.files.length ? `<div class="message-attachments">${content.files.map(attachmentHTML).join("")}</div>` : ""}</div></div>`;
   }
   if (type === "agentMessage")
     return `<article class="message assistant"><div class="message-label"><span class="mini-mark">${icon("terminal")}</span>Codex</div><div class="markdown">${markdown(item.text || "")}</div><div class="message-tools"><button data-copy="${escapeHTML(item.id)}" aria-label="复制回复">复制回复</button></div></article>`;
@@ -1616,6 +2370,7 @@ function renderMessages() {
   const layout = JSON.stringify([
     !!state.historyCursor,
     state.readOnly,
+    state.detached,
     state.turns.map((turn) => [
       (turn.items || []).map((item) => item.id),
       turn.error || null,
@@ -1639,6 +2394,7 @@ function renderMessages() {
     }
     if (incremental) {
       dirtyMessageItems.clear();
+      hydrateAttachmentImages();
       return;
     }
   }
@@ -1652,6 +2408,8 @@ function renderMessages() {
   if (state.readOnly)
     html +=
       '<div class="turn-status">此会话由桌面客户端管理，自动同步已保存的消息。结束原会话后可重新打开继续。</div>';
+  else if (state.detached)
+    html += '<div class="turn-status">会话已分离，正在自动同步最新状态。</div>';
   const rendered = new Map();
   for (const turn of state.turns) {
     for (const item of turn.items || []) {
@@ -1679,8 +2437,23 @@ function renderMessages() {
   messageRender.layout = layout;
   messageRender.items = rendered;
   dirtyMessageItems.clear();
+  hydrateAttachmentImages();
 }
 $("messages").addEventListener("click", async (event) => {
+  const attachmentButton = event.target.closest("[data-attachment]");
+  if (attachmentButton) {
+    if (!state.online) return toast("请连接设备后再下载附件");
+    attachmentButton.disabled = true;
+    try {
+      const file = await readAttachment(attachmentButton.dataset.attachment);
+      const link = document.createElement("a");
+      link.href = file.url;
+      link.download = file.file.name;
+      link.click();
+    } catch (error) { showError(error); }
+    finally { attachmentButton.disabled = false; }
+    return;
+  }
   if (event.target.closest("#older-turns")) {
     olderTurns().catch(showError);
     return;
@@ -1711,6 +2484,89 @@ function answerRequest(id, result, error) {
   state.responding.add(id);
   renderApprovals();
   return true;
+}
+function renderUserInput(card, id, params) {
+  const note = document.createElement("p");
+  note.textContent = params.isBlocking === false
+    ? "你可以继续操作，准备好后再提交回答。"
+    : "提交回答后，Codex 会继续处理任务。";
+  card.append(note);
+  const form = document.createElement("form");
+  form.className = "question-form";
+  const fields = params.questions.map((question, index) => {
+    const group = document.createElement("fieldset");
+    group.className = "question-group";
+    const legend = document.createElement("legend");
+    legend.textContent = question.header || `问题 ${index + 1}`;
+    const prompt = document.createElement("p");
+    prompt.className = "question-prompt";
+    prompt.textContent = question.question;
+    group.append(legend, prompt);
+    const custom = document.createElement(question.isSecret ? "input" : "textarea");
+    if (question.isSecret) {
+      custom.type = "password";
+      custom.autocomplete = "off";
+    } else custom.rows = 2;
+    const options = (question.options || []).map((option, optionIndex) => {
+      const label = document.createElement("label");
+      label.className = "question-option";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = `question-${id}-${index}`;
+      radio.value = option.label;
+      radio.setAttribute("aria-label", option.description ? `${option.label}：${option.description}` : option.label);
+      radio.checked = optionIndex === 0;
+      radio.onchange = () => { custom.value = ""; };
+      const text = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = option.label;
+      text.append(title);
+      if (option.description) {
+        const description = document.createElement("span");
+        description.textContent = option.description;
+        text.append(description);
+      }
+      label.append(radio, text);
+      group.append(label);
+      return radio;
+    });
+    custom.placeholder = options.length ? "也可以输入自己的回答" : "请输入回答";
+    custom.setAttribute("aria-label", `${question.header || question.question || question.id}：${options.length ? "自定义回答" : "回答"}`);
+    custom.oninput = () => {
+      for (let i = 0; i < options.length; i++)
+        options[i].checked = !custom.value.trim() && i === 0;
+    };
+    group.append(custom);
+    form.append(group);
+    return { question, options, custom };
+  });
+  const actions = document.createElement("div");
+  actions.className = "approval-buttons";
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "accept";
+  submit.textContent = "提交回答";
+  form.onsubmit = (event) => {
+    event.preventDefault();
+    const answers = Object.create(null);
+    for (const { question, options, custom } of fields) {
+      const answer = custom.value.trim() ? custom.value : options.find((option) => option.checked)?.value;
+      if (!answer) {
+        toast(`请回答「${question.header || question.question || question.id}」后再提交`);
+        custom.focus();
+        return;
+      }
+      answers[question.id] = { answers: [answer] };
+    }
+    answerRequest(id, { answers });
+  };
+  const skip = document.createElement("button");
+  skip.type = "button";
+  skip.textContent = "跳过";
+  skip.onclick = () => answerRequest(id, { answers: {} });
+  actions.append(submit, skip);
+  form.append(actions);
+  card.append(form);
 }
 function renderApprovals() {
   const root = $("approval-area");
@@ -1745,7 +2601,7 @@ function renderApprovals() {
       continue;
     const existing = state.approvalCards.get(id);
     if (existing) {
-      for (const control of existing.querySelectorAll("button, input, select"))
+      for (const control of existing.querySelectorAll("button, input, select, textarea"))
         control.disabled = state.responding.has(id);
       existing.setAttribute("aria-busy", String(state.responding.has(id)));
       root.append(existing);
@@ -1777,45 +2633,8 @@ function renderApprovals() {
       cwd.textContent = p.cwd;
       card.append(cwd);
     }
-    if (p.questions) {
-      const inputs = [];
-      for (const q of p.questions) {
-        const label = document.createElement("label");
-        label.textContent = q.question;
-        card.append(label);
-        let field;
-        if (q.options?.length) {
-          field = document.createElement("select");
-          for (const o of q.options) {
-            const option = new Option(o.label, o.label);
-            option.title = o.description;
-            field.append(option);
-          }
-        } else {
-          field = document.createElement("input");
-          field.type = q.isSecret ? "password" : "text";
-        }
-        field.setAttribute("aria-label", q.question);
-        card.append(field);
-        const other = document.createElement("input");
-        other.placeholder = "也可以输入自己的回答";
-        other.setAttribute("aria-label", `${q.header || q.id}：自定义回答`);
-        if (q.options?.length) card.append(other);
-        inputs.push({ q, field, other });
-      }
-      const actions = document.createElement("div");
-      actions.className = "approval-buttons";
-      const button = document.createElement("button");
-      button.className = "accept";
-      button.textContent = "提交回答";
-      button.onclick = () => {
-        const answers = {};
-        for (const { q, field, other } of inputs)
-          answers[q.id] = { answers: [other.value || field.value] };
-        answerRequest(id, { answers });
-      };
-      actions.append(button);
-      card.append(actions);
+    if (Array.isArray(p.questions)) {
+      renderUserInput(card, id, p);
     } else if (isPermissionRequest(msg)) {
       if (p.permissions) {
         const details = document.createElement("pre");
@@ -1885,14 +2704,14 @@ function sandboxPolicy() {
   if (mode === "read-only") return { type: "readOnly", networkAccess: false };
   return { type: "dangerFullAccess" };
 }
-function turnParams(text) {
+function turnParams(text, files = []) {
   const model = selectedModel();
   const effort = $("effort").value || model?.defaultReasoningEffort;
   return {
     threadId: state.current.id,
     approvalPolicy: state.settings.approvalPolicy || "never",
     sandboxPolicy: sandboxPolicy(),
-    input: [{ type: "text", text, text_elements: [] }],
+    input: messageInput(text, files),
     ...(model ? { model: model.model } : {}),
     ...(effort ? { effort } : {}),
   };
@@ -1936,7 +2755,8 @@ function renderMessageQueue() {
     const row = document.createElement("div");
     row.className = "queue-entry";
     const text = document.createElement("p");
-    text.textContent = `${index + 1}. ${(entry.input || []).filter((i) => i.type === "text").map((i) => i.text).join("\n")}`;
+    const content = userContent(entry.input);
+    text.textContent = `${index + 1}. ${[content.text, ...content.files.map((f) => `📎 ${f.name}`)].filter(Boolean).join("\n")}`;
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = queue.dispatching && index === 0 ? "发送中…" : "取消";
@@ -1998,15 +2818,16 @@ async function sendFollowup(text, mode) {
   if (mode !== "steer" && !state.info?.messageQueue)
     return toast("请更新本地 Agent 以支持排队发送");
   const original = $("prompt").value;
+  const key = draftKey();
+  const files = [...currentAttachments()];
+  const params = turnParams(text, files);
   const optimistic = mode === "steer" ? {
     id: `optimistic-user-${Date.now()}-${++state.nextID}`,
-    type: "userMessage", content: [{ type: "text", text }],
+    type: "userMessage", content: params.input,
   } : null;
   if (optimistic) turn.items.push(optimistic);
-  const params = turnParams(text);
   state.sending = true;
-  $("prompt").value = "";
-  resizePrompt();
+  clearSentDraft(key, files);
   renderMessages();
   scrollBottom();
   try {
@@ -2017,11 +2838,11 @@ async function sendFollowup(text, mode) {
       const result = await rpc("codexrm/queue/add", params);
       if (generation === state.generation) acceptMessageQueue(result);
     }
+    if (generation === state.generation && state.current?.id === threadId) saveModelPreference();
   } catch (e) {
     if (optimistic) turn.items = turn.items.filter((i) => i !== optimistic);
+    restoreSentDraft(key, original, files);
     if (generation === state.generation && state.current?.id === threadId) {
-      $("prompt").value = original + ($("prompt").value ? `\n\n${$("prompt").value}` : "");
-      resizePrompt();
       renderMessages();
     }
     if (generation === state.generation) showError(e);
@@ -2041,7 +2862,10 @@ async function submit(event, mode = "auto") {
     return;
   }
   const text = $("prompt").value.trim();
-  if (!text || state.sending) return;
+  const files = [...currentAttachments()];
+  if ((!text && !files.length) || state.sending) return;
+  if (files.some((f) => f.uploading || f.error)) return toast("请等待附件上传完成，或重试失败的附件");
+  if (files.length && !state.info?.attachments) return toast("请更新本地 Agent 以支持文件和图片");
   if (!currentDevice()) {
     openPair();
     return;
@@ -2052,27 +2876,48 @@ async function submit(event, mode = "auto") {
   }
   if (mode === "steer" || mode === "queue" || isRunning() || state.messageQueues.get(state.current?.id)?.entries?.length)
     return sendFollowup(text, mode);
-  state.sending = true;
-  renderConnection();
   const generation = state.generation;
+  const originalKey = draftKey();
+  const original = $("prompt").value;
+  const creating = !state.current;
+  const operation = creating ? { originalKey, original, files, cancelled: false, restored: false, turnStarted: false } : null;
+  state.sending = true;
+  if (creating) {
+    state.creating = operation;
+    clearSentDraft(originalKey, files);
+  }
+  renderConnection();
   try {
-    const creating = !state.current;
     if (creating) {
-      const result = await rpc("thread/start", {
-        ...(selectedModel() ? { model: selectedModel().model, codexrmProvider: selectedModel().providerId } : {}),
-        ...(selectedCwd() ? { cwd: selectedCwd() } : {}),
-        sandbox: state.settings.sandbox || "danger-full-access",
-        approvalPolicy: state.settings.approvalPolicy || "never",
-      });
-      if (generation !== state.generation) return;
+      let result;
+      try {
+        result = await rpc("thread/start", {
+          ...(selectedModel() ? { model: selectedModel().model, codexrmProvider: selectedModel().providerId } : {}),
+          ...(selectedCwd() ? { cwd: selectedCwd() } : {}),
+          sandbox: state.settings.sandbox || "danger-full-access",
+          approvalPolicy: state.settings.approvalPolicy || "never",
+        });
+      } catch (error) {
+        restoreCreatingDraft(operation);
+        throw error;
+      }
+      if (generation !== state.generation || operation.cancelled || state.creating !== operation) return;
+      operation.turnStarted = true;
+      state.creating = null;
       state.current = result.thread;
       if (result.model) state.current.model = result.model;
       state.turns = [];
+      if ($("prompt").value) {
+        writeDraft(originalKey, "");
+        writeDraft(draftKey(), $("prompt").value);
+      }
       setHome(false);
       upsertThread(result.thread);
       renderWorkspacePath();
     }
     const threadId = state.current.id;
+    const key = draftKey();
+    const params = turnParams(text, files);
     const optimistic = {
       id: `local-${Date.now()}`,
       status: "pending",
@@ -2080,20 +2925,20 @@ async function submit(event, mode = "auto") {
         {
           id: `optimistic-user-${Date.now()}`,
           type: "userMessage",
-          content: [{ type: "text", text }],
+          content: params.input,
         },
       ],
     };
     state.turns.push(optimistic);
     renderMessages();
     scrollBottom();
-    $("prompt").value = "";
-    resizePrompt();
+    if (!creating) clearSentDraft(originalKey, files);
     try {
-      const result = await rpc("turn/start", turnParams(text));
+      const result = await rpc("turn/start", params);
       if (generation !== state.generation || state.current?.id !== threadId)
         return;
       if (selectedModel()) state.current.model = selectedModel().model;
+      saveModelPreference();
       state.turns = state.turns.filter((t) => t !== optimistic);
       const existing = state.turns.find((t) => t.id === result.turn.id);
       if (existing) {
@@ -2109,22 +2954,25 @@ async function submit(event, mode = "auto") {
       state.started = Date.now();
       scheduleRender();
       if (creating) {
-        const name = Array.from(text.split("\n")[0]).slice(0, 40).join("");
+        const name = Array.from((text || files[0]?.name || "新会话").split("\n")[0]).slice(0, 40).join("");
         rpc("thread/name/set", { threadId, name }).catch(() => {});
       }
     } catch (error) {
+      restoreSentDraft(key, original, files);
+      if (creating) operation.restored = true;
       if (generation === state.generation && state.current?.id === threadId) {
         state.turns = state.turns.filter((t) => t !== optimistic);
-        $("prompt").value = text;
-        resizePrompt();
         renderMessages();
       }
       throw error;
     }
   } catch (error) {
-    if (generation === state.generation) showError(error);
+    if (creating) restoreCreatingDraft(operation);
+    if (generation === state.generation && !operation?.cancelled) showError(error);
   } finally {
-    if (generation === state.generation) {
+    const ownsSend = !creating || (!operation.cancelled && (operation.turnStarted || state.creating === operation));
+    if (generation === state.generation && ownsSend) {
+      if (state.creating === operation) state.creating = null;
       state.sending = false;
       renderConnection();
     }
@@ -2162,12 +3010,68 @@ const mobileLayoutQuery =
 function isMobileLayout() {
   return matchMedia(mobileLayoutQuery).matches;
 }
+let sidebarWidth = readStorage("codexrm.sidebarWidth", null);
+if (!Number.isFinite(sidebarWidth)) sidebarWidth = null;
+let sidebarResize = null;
+function sidebarWidthBounds() {
+  return { min: 220, max: Math.max(220, Math.min(520, Math.floor(window.innerWidth * 0.45))) };
+}
+function syncSidebarWidth() {
+  const { min, max } = sidebarWidthBounds();
+  if (sidebarWidth === null) document.documentElement.style.removeProperty("--sidebar-width");
+  else document.documentElement.style.setProperty("--sidebar-width", `${Math.max(min, Math.min(520, sidebarWidth))}px`);
+  const width = Math.max(min, Math.min(max, sidebarWidth ?? (window.innerWidth <= 1050 ? 240 : 260)));
+  const handle = $("sidebar-resize");
+  handle.setAttribute("aria-valuemin", String(min));
+  handle.setAttribute("aria-valuemax", String(max));
+  handle.setAttribute("aria-valuenow", String(Math.round(width)));
+}
+function setSidebarWidth(width, persist = true) {
+  const { min, max } = sidebarWidthBounds();
+  sidebarWidth = width === null ? null : Math.round(Math.max(min, Math.min(max, width)));
+  syncSidebarWidth();
+  if (persist) {
+    try { localStorage.setItem("codexrm.sidebarWidth", JSON.stringify(sidebarWidth)); } catch {}
+  }
+}
+function finishSidebarResize(event) {
+  if (!sidebarResize || (event?.pointerId !== undefined && event.pointerId !== sidebarResize.id)) return;
+  const id = sidebarResize.id;
+  sidebarResize = null;
+  document.body.classList.remove("sidebar-resizing");
+  const handle = $("sidebar-resize");
+  if (handle.hasPointerCapture?.(id)) handle.releasePointerCapture(id);
+  try { localStorage.setItem("codexrm.sidebarWidth", JSON.stringify(sidebarWidth)); } catch {}
+}
+function startSidebarResize(event) {
+  if (event.button !== 0 || event.isPrimary === false || isMobileLayout() || document.body.classList.contains("sidebar-collapsed")) return;
+  event.preventDefault();
+  closeThreadMenu();
+  closeModelMenu();
+  sidebarResize = { id: event.pointerId, x: event.clientX, width: $("sidebar").getBoundingClientRect().width || sidebarWidth || 260 };
+  $("sidebar-resize").setPointerCapture(event.pointerId);
+  document.body.classList.add("sidebar-resizing");
+}
+function moveSidebarResize(event) {
+  if (!sidebarResize || event.pointerId !== sidebarResize.id) return;
+  if (isMobileLayout()) return finishSidebarResize();
+  setSidebarWidth(sidebarResize.width + event.clientX - sidebarResize.x, false);
+}
+function sidebarResizeKey(event) {
+  if (isMobileLayout() || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const { min, max } = sidebarWidthBounds();
+  const width = Number($("sidebar-resize").getAttribute("aria-valuenow"));
+  const step = event.shiftKey ? 50 : 10;
+  setSidebarWidth(event.key === "Home" ? min : event.key === "End" ? max : width + (event.key === "ArrowRight" ? step : -step));
+}
 function openSidebar() {
   if (!isMobileLayout()) return;
   document.body.classList.add("sidebar-open");
   $("sidebar-overlay").hidden = false;
 }
 function closeSidebar() {
+  closeThreadMenu();
   document.body.classList.remove("sidebar-open");
   $("sidebar-overlay").hidden = true;
 }
@@ -2246,15 +3150,38 @@ function settings() {
   $("sandbox").value = state.settings.sandbox || "danger-full-access";
   $("approval-policy").value = state.settings.approvalPolicy || "never";
   const d = currentDevice();
+  const version = state.info?.version || d?.agent.appVersion;
   $("device-detail").textContent = d
-    ? `${d.agent.serverName} · ${d.agent.os} ${d.agent.arch}${state.info ? ` · ${state.info.transport} · v${state.info.version}` : ""}`
+    ? `${d.agent.serverName} · ${d.agent.os} ${d.agent.arch}${version ? ` · 电脑 Agent v${version}` : " · 电脑 Agent 版本未知"}${state.info ? ` · ${state.info.transport}` : ""}`
     : "尚未选择设备";
   $("disconnect").hidden = !d;
+  const remoteUpdate = Boolean(d && state.online && state.info?.remoteUpdate);
+  $("update-agent").hidden = !remoteUpdate;
+  $("update-agent-help").hidden = !remoteUpdate;
   const desktopControl = Boolean(d && state.online && state.info?.desktopControl);
   $("close-codex-desktop").hidden = !desktopControl;
   $("close-codex-desktop-help").hidden = !desktopControl;
   $("settings-dialog").showModal();
 }
+async function updateAgent() {
+  if (!state.online || !state.info?.remoteUpdate) return toast("电脑 Agent 离线或不支持远程更新");
+  if (!window.confirm("检查并更新电脑 Agent 吗？更新会在当前任务和排队消息结束后安装，随后电脑 Agent 会自动重启。")) return;
+  const button = $("update-agent");
+  button.disabled = true;
+  button.textContent = "正在检查更新…";
+  try {
+    const result = await rpc("codexrm/update", {}, 600000);
+    if (!result.updateAvailable) toast("电脑 Agent 已是最新版本");
+    else if (result.updatePending) toast("更新已校验，将在当前任务和排队消息结束后自动安装");
+    else toast("更新已校验，电脑 Agent 将重启完成安装");
+  } catch (e) {
+    showError(e);
+  } finally {
+    button.disabled = false;
+    button.textContent = "检查并更新电脑 Agent";
+  }
+}
+$("update-agent").onclick = updateAgent;
 async function closeCodexDesktop() {
   if (!state.online) return toast("设备离线，无法关闭 Codex 桌面客户端");
   if (!window.confirm("确定关闭 Codex 桌面客户端吗？未保存的桌面操作可能丢失。")) return;
@@ -2317,6 +3244,7 @@ $("settings-form").onsubmit = (event) => {
   } catch {}
   renderWorkspacePath();
   $("settings-dialog").close();
+  renderModelControl();
   toast("设置已保存，将应用于下一次发送");
 };
 $("disconnect").onclick = async () => {
@@ -2342,30 +3270,52 @@ $("disconnect").onclick = async () => {
   $("disconnect").disabled = false;
   toast("已解除配对");
 };
+async function renameThread(threadId, name) {
+  await rpc("thread/name/set", { threadId, name });
+  const listed = state.threads.find((thread) => thread.id === threadId);
+  if (listed) listed.name = name;
+  if (state.current?.id === threadId) {
+    state.current.name = name;
+    upsertThread(state.current);
+    renderThreadTitle();
+  } else if (listed) {
+    upsertThread(listed);
+  }
+}
+$("header-subtitle").onclick = beginTitleEdit;
+$("title-rename-form").onsubmit = (event) => {
+  event.preventDefault();
+  return saveTitleEdit();
+};
+$("title-rename-input").onkeydown = (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  cancelTitleEdit();
+};
+$("title-rename-input").onblur = () => {
+  if (!titleEditSaving) cancelTitleEdit();
+};
 $("rename-form").onsubmit = async (event) => {
   event.preventDefault();
   if (!state.current) return;
+  const threadId = state.current.id;
+  const name = $("thread-name").value.trim();
+  if (!name) return;
   try {
-    await rpc("thread/name/set", {
-      threadId: state.current.id,
-      name: $("thread-name").value.trim(),
-    });
-    state.current.name = $("thread-name").value.trim();
-    upsertThread(state.current);
-    $("header-subtitle").textContent = title(state.current);
-    $("thread-dialog").close();
+    await renameThread(threadId, name);
+    if (state.current?.id === threadId) $("thread-dialog").close();
   } catch (e) {
     showError(e);
   }
 };
 $("archive-thread").onclick = async () => {
   if (!state.current) return;
+  const id = state.current.id;
   try {
-    await rpc("thread/archive", { threadId: state.current.id });
-    $("thread-dialog").close();
-    newChat();
-    await loadThreads();
-    toast("会话已归档");
+    if (await archiveThread(id)) {
+      $("thread-dialog").close();
+      toast("会话已归档");
+    }
   } catch (e) {
     showError(e);
   }
@@ -2375,6 +3325,25 @@ $("thread-actions").onclick = () => {
   $("thread-name").value = title(state.current);
   $("thread-dialog").showModal();
 };
+$("delete-thread").onclick = () => {
+  if (threadMenuTarget) requestThreadDeletion(threadMenuTarget.id);
+};
+$("confirm-delete-thread").onclick = confirmThreadDeletion;
+$("delete-thread-dialog").addEventListener("close", () => {
+  const target = deleteThreadTarget;
+  deleteThreadTarget = null;
+  (threadActionButton(target?.id) || threadActionButton(state.current?.id) || $("prompt")).focus();
+});
+$("thread-menu").addEventListener("keydown", (event) => {
+  if (event.key === "Escape" || event.key === "Tab") {
+    if (event.key === "Escape") event.preventDefault();
+    event.stopPropagation();
+    closeThreadMenu(true);
+  } else if (["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    if (!$("delete-thread").disabled) $("delete-thread").focus();
+  }
+});
 document
   .querySelectorAll("[data-close]")
   .forEach((b) => (b.onclick = () => $(b.dataset.close).close()));
@@ -2400,7 +3369,6 @@ $("device-pair").onclick = () => {
   openPair();
 };
 $("open-settings").onclick = settings;
-$("workspace-settings").onclick = openWorkspacePicker;
 $("add-workspace").onclick = openWorkspacePicker;
 $("workspace-select").onchange = () =>
   selectWorkspace($("workspace-select").value).catch(showError);
@@ -2439,6 +3407,10 @@ $("select-directory").onclick = async () => {
 $("toggle-workspaces").onclick = toggleWorkspaceSection;
 $("refresh").onclick = async () => {
   try {
+    if (state.online && (!state.loaded || !state.info)) {
+      await bootstrap(state.generation);
+      return;
+    }
     await loadWorkspaces();
     await loadThreads();
   } catch (e) {
@@ -2446,7 +3418,10 @@ $("refresh").onclick = async () => {
   }
 };
 $("load-more").onclick = () => loadThreads(true).catch(showError);
-$("search").oninput = renderThreads;
+$("search").oninput = () => {
+  closeThreadMenu();
+  renderThreads();
+};
 $("model").onchange = () => {
   renderEfforts();
   saveModelPreference();
@@ -2455,12 +3430,86 @@ $("model").onchange = () => {
     toast("已切换供应商，发送消息将创建新会话");
   }
 };
-$("effort").onchange = saveModelPreference;
+$("effort").onchange = () => {
+  saveModelPreference();
+  renderModelControl();
+};
+$("model-trigger").onclick = openModelMenu;
+$("permission-trigger").onclick = settings;
+$("choose-model").onclick = () => modelMenuPane("models");
+$("choose-effort").onclick = () => modelMenuPane("effort");
+$("model-menu-back").onclick = () => modelMenuPane();
+$("close-model-menu").onclick = () => closeModelMenu(true);
+$("model-search").oninput = renderModelChoices;
+$("model-menu").addEventListener("toggle", (event) => {
+  if (event.newState === "closed") {
+    $("model-menu").hidden = true;
+    $("model-trigger").setAttribute("aria-expanded", "false");
+  }
+});
+$("model-menu").addEventListener("keydown", (event) => {
+  if (event.isComposing) return;
+  if (event.key === "Escape" || (event.key === "Tab" && event.shiftKey)) {
+    event.preventDefault();
+    if ($("model-menu").dataset.pane !== "root") modelMenuPane();
+    else closeModelMenu(true);
+    return;
+  }
+  const options = [...$("model-menu").querySelectorAll("button:not([disabled])")]
+    .filter((button) => !button.closest("[hidden]"));
+  const active = options.indexOf(document.activeElement);
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const direction = event.key === "ArrowDown" ? 1 : -1;
+    options[(active + direction + options.length) % options.length]?.focus();
+  } else if (event.key === "Enter" && event.target === $("model-search")) {
+    event.preventDefault();
+    $("model-choices").querySelector("button:not([disabled])")?.click();
+  } else if (event.key === "Tab") {
+    event.preventDefault();
+    options[(active + 1) % options.length]?.focus();
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  if (threadMenuTarget && !$("thread-menu").contains(event.target) && !threadActionButton(threadMenuTarget.id)?.contains(event.target)) closeThreadMenu();
+  if (!$("model-menu").hidden && !$("model-menu").contains(event.target) && !$("model-trigger").contains(event.target)) closeModelMenu();
+});
+window.addEventListener("resize", () => {
+  if (isMobileLayout()) finishSidebarResize();
+  syncSidebarWidth();
+  closeThreadMenu();
+  positionModelMenu();
+});
+window.addEventListener("blur", finishSidebarResize);
+$("sidebar").addEventListener("scroll", () => closeThreadMenu(), { passive: true, capture: true });
+window.visualViewport?.addEventListener("resize", positionModelMenu);
+window.visualViewport?.addEventListener("scroll", positionModelMenu);
 $("refresh-models").onclick = () => loadModels(true).catch(showError);
 $("composer").onsubmit = submit;
 $("queue-send").onclick = () => submit(null, "queue");
 $("steer").onclick = () => submit(null, "steer");
 $("stop").onclick = stopTurn;
+$("attach-files").onclick = () => $("file-input").click();
+$("file-input").onchange = (event) => {
+  const files = [...event.target.files];
+  event.target.value = "";
+  addAttachments(files).catch(showError);
+};
+document.addEventListener("paste", pasteAttachments);
+$("composer").addEventListener("dragover", (event) => {
+  if ([...(event.dataTransfer?.types || [])].includes("Files")) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = attachmentBlockedReason() ? "none" : "copy";
+  }
+});
+$("composer").addEventListener("drop", (event) => {
+  if (event.dataTransfer?.files.length) {
+    event.preventDefault();
+    const blocked = attachmentBlockedReason();
+    if (blocked) return toast(blocked);
+    addAttachments([...event.dataTransfer.files]).catch(showError);
+  }
+});
 $("prompt").oninput = resizePrompt;
 $("prompt").onkeydown = (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
@@ -2469,6 +3518,8 @@ $("prompt").onkeydown = (e) => {
   }
 };
 $("toggle-sidebar").onclick = () => {
+  closeThreadMenu();
+  finishSidebarResize();
   if (isMobileLayout()) {
     if (document.body.classList.contains("sidebar-open")) closeSidebar();
     else openSidebar();
@@ -2476,6 +3527,13 @@ $("toggle-sidebar").onclick = () => {
 };
 $("close-sidebar").onclick = closeSidebar;
 $("sidebar-overlay").onclick = closeSidebar;
+$("sidebar-resize").onpointerdown = startSidebarResize;
+$("sidebar-resize").onpointermove = moveSidebarResize;
+$("sidebar-resize").onpointerup = finishSidebarResize;
+$("sidebar-resize").onpointercancel = finishSidebarResize;
+$("sidebar-resize").onlostpointercapture = finishSidebarResize;
+$("sidebar-resize").onkeydown = sidebarResizeKey;
+$("sidebar-resize").ondblclick = () => setSidebarWidth(null);
 for (const element of [$("main"), $("sidebar"), $("sidebar-overlay")]) {
   element.addEventListener("touchstart", sidebarGestureStart, { passive: true });
   element.addEventListener("touchmove", sidebarGestureMove, { passive: true });
@@ -2495,7 +3553,9 @@ $("theme-toggle").onclick = () => {
   } catch {}
 };
 document.documentElement.dataset.theme = readStorage("codexrm.theme", "dark");
+syncSidebarWidth();
 document.addEventListener("keydown", (e) => {
+  if (document.querySelector("dialog[open]")) return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
     e.preventDefault();
     newChat();

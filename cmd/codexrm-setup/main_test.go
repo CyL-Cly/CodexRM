@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codexrm/codexrm/internal/clientconfig"
 	"github.com/codexrm/codexrm/internal/installation"
 	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/updater"
@@ -112,6 +113,7 @@ func TestOnlineInstallFromManifest(t *testing.T) {
 		Server         string `json:"server"`
 		Workspace      string `json:"workspace"`
 		UpdateManifest string `json:"updateManifestUrl"`
+		UpdateServer   string `json:"updateServer"`
 		AutoUpdate     bool   `json:"autoUpdate"`
 		EnrollmentKey  any    `json:"enrollmentKey"`
 	}
@@ -120,7 +122,7 @@ func TestOnlineInstallFromManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if config.Server != "" || config.Workspace != workspace ||
-		config.UpdateManifest != feed.URL+"/base/update.json" || !config.AutoUpdate {
+		config.UpdateManifest != "" || config.UpdateServer != clientconfig.DefaultUpdateServer || !config.AutoUpdate {
 		t.Fatalf("unexpected installed configuration: %+v", config)
 	}
 	if _, err := os.Stat(filepath.Join(localAppData, "CodexRM", "installation.json")); err != nil {

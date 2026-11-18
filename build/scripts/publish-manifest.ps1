@@ -1,6 +1,7 @@
 param(
     [string]$Manifest,
     [Parameter(Mandatory=$true)]$RM,
+    [ValidateSet('update.json','android-update.json')][string]$Name = 'update.json',
     [switch]$ValidateOnly
 )
 $ErrorActionPreference = 'Stop'
@@ -29,17 +30,17 @@ $sshOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10')
 & ssh @sshOptions $sshTarget "install -d -o '$owner' -g '$owner' -m 0700 '$directory'"
 if ($LASTEXITCODE) { throw 'Could not prepare the RM update directory.' }
 & scp @sshOptions -q $Manifest "${sshTarget}:$remoteStage"
-if ($LASTEXITCODE) { throw 'Could not upload update.json to RM. The previous manifest is retained.' }
+if ($LASTEXITCODE) { throw "Could not upload $Name to RM. The previous manifest is retained." }
 $activate = "chown '${owner}:${owner}' '$remoteStage' && chmod 0600 '$remoteStage' && " +
-    "{ test ! -f '$directory/update.json' || cp -p '$directory/update.json' '$directory/update.json.previous'; } && " +
-    "mv -f '$remoteStage' '$directory/update.json'"
+    "{ test ! -f '$directory/$Name' || cp -p '$directory/$Name' '$directory/$Name.previous'; } && " +
+    "mv -f '$remoteStage' '$directory/$Name'"
 & ssh @sshOptions $sshTarget $activate
-if ($LASTEXITCODE) { throw 'Could not activate update.json on RM.' }
-$url = $server + '/update.json'
+if ($LASTEXITCODE) { throw "Could not activate $Name on RM." }
+$url = $server + '/' + $Name
 $response = Invoke-WebRequest -UseBasicParsing -Uri $url -Headers @{'Cache-Control'='no-cache'} -TimeoutSec 30
 $actual = $response.Content | ConvertFrom-Json
 foreach ($field in @('versionCode','versionName','downloadUrl','releaseNotes','fileSize','sha256')) {
     if ($actual.$field -cne $expected.$field) { throw "RM manifest verification failed: $field" }
 }
-if ($response.Headers['Cache-Control'] -notmatch 'no-store') { throw 'RM update.json must be served with Cache-Control: no-store.' }
+if ($response.Headers['Cache-Control'] -notmatch 'no-store') { throw "RM $Name must be served with Cache-Control: no-store." }
 Write-Host "RM manifest published and verified: $url"

@@ -56,6 +56,7 @@ func (h *Host) SettingsURL() (string, error) {
 	h.page.url = "http://" + listener.Addr().String()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/settings", h.settings)
+	mux.HandleFunc("/api/update", h.update)
 	mux.HandleFunc("/api/pair", h.pair)
 	mux.HandleFunc("/api/devices", h.devices)
 	mux.HandleFunc("/api/devices/", h.devices)
@@ -117,7 +118,7 @@ func (h *Host) snapshot() map[string]any {
 			status = "已连接"
 		}
 	}
-	return map[string]any{"server": h.config.Server, "enrollmentKeySet": h.config.EnrollmentKey != "", "updateServer": h.config.UpdateServer, "updateManifestUrl": h.config.ManifestURL(), "status": status, "error": h.lastError, "version": release.VersionName, "packaged": installation.IsPackaged()}
+	return map[string]any{"server": h.config.Server, "enrollmentKeySet": h.config.EnrollmentKey != "", "updatePending": h.pendingUpdate != nil, "status": status, "error": h.lastError, "version": release.VersionName, "packaged": installation.IsPackaged()}
 }
 
 func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +133,6 @@ func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Server        string  `json:"server"`
 		EnrollmentKey *string `json:"enrollmentKey"`
-		UpdateServer  string  `json:"updateServer"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	decoder := json.NewDecoder(r.Body)
@@ -163,10 +163,6 @@ func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 	if input.EnrollmentKey != nil {
 		cfg.EnrollmentKey = *input.EnrollmentKey
 	}
-	if input.UpdateServer != cfg.UpdateServer {
-		cfg.UpdateManifestURL = ""
-	}
-	cfg.UpdateServer = input.UpdateServer
 	if err := cfg.Normalize(); err != nil {
 		failure(w, err)
 		return
@@ -185,6 +181,21 @@ func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 	default:
 	}
 	respond(w, 200, h.snapshot())
+}
+
+func (h *Host) update(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	// Package downloads can legitimately outlast the small settings requests.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Minute))
+	available, err := h.checkForUpdate()
+	if err != nil {
+		failure(w, err)
+		return
+	}
+	respond(w, http.StatusOK, map[string]bool{"updateAvailable": available, "updatePending": h.snapshot()["updatePending"].(bool)})
 }
 
 func (h *Host) pair(w http.ResponseWriter, r *http.Request) {

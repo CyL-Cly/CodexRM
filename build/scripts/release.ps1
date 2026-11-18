@@ -29,6 +29,42 @@ $originalVersion = [IO.File]::ReadAllBytes($versionPath)
 $publisher = Join-Path $buildRoot 'bin\codexrm-publish.exe'
 $builtPackage = $false
 $versionChanged = $false
+function Assert-ReleasePackage([string]$Archive, [string]$Manifest, [long]$Code, [string]$Name) {
+    $metadata = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([long]$metadata.versionCode -ne $Code -or [string]$metadata.versionName -cne $Name) {
+        throw "dist/update.json version $($metadata.versionName) ($($metadata.versionCode)) does not match release.go $Name ($Code)."
+    }
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $verificationDir = Join-Path $buildRoot ('.work\release-verify-' + [Guid]::NewGuid().ToString('N'))
+    $zip = $null
+    try {
+        [void][IO.Directory]::CreateDirectory($verificationDir)
+        $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+        $entries = @($zip.Entries | Where-Object { $_.FullName.Replace('\', '/') -ceq 'CodexRM/bin/codexrm-agent.exe' })
+        if ($entries.Count -ne 1 -or $entries[0].Length -le 0) {
+            throw 'The release ZIP must contain exactly one non-empty CodexRM/bin/codexrm-agent.exe.'
+        }
+        $binary = Join-Path $verificationDir 'codexrm-agent.exe'
+        $input = $entries[0].Open()
+        try {
+            $output = [IO.File]::Create($binary)
+            try { $input.CopyTo($output) } finally { $output.Dispose() }
+        } finally { $input.Dispose() }
+        $zip.Dispose()
+        $zip = $null
+        . (Join-Path $PSScriptRoot 'client-install.ps1')
+        $binaryVersion = Get-CodexRMBinaryVersion $binary
+        if ([long]$binaryVersion.versionCode -ne $Code -or [string]$binaryVersion.versionName -cne $Name) {
+            throw "ZIP client version $($binaryVersion.versionName) ($($binaryVersion.versionCode)) does not match release.go $Name ($Code)."
+        }
+    } finally {
+        if ($zip) { $zip.Dispose() }
+        if (Test-Path -LiteralPath $verificationDir -PathType Container) {
+            Remove-Item -LiteralPath $verificationDir -Recurse -Force
+        }
+    }
+}
 Push-Location $projectRoot
 try {
     $text = [Text.Encoding]::UTF8.GetString($originalVersion)
@@ -63,8 +99,11 @@ try {
         & (Join-Path $PSScriptRoot 'build.ps1') -Target Agent
         if ($DeployServer) { & (Join-Path $PSScriptRoot 'build.ps1') -Linux -Target Server }
         & (Join-Path $PSScriptRoot 'package-client.ps1') -OutputPath $archive -Server $publishConfig.rm.server -ReleaseNotes $ReleaseNotes
-    } elseif (-not (Test-Path -LiteralPath $archive -PathType Leaf) -or -not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-        throw 'No built package/update.json for this version. Run build/release.cmd first.'
+    } else {
+        if (-not (Test-Path -LiteralPath $archive -PathType Leaf) -or -not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw 'No built package/update.json for this version. Run build/release.cmd first.'
+        }
+        Assert-ReleasePackage -Archive $archive -Manifest $manifest -Code $code -Name $name
     }
     $builtPackage = $true
     if ($DeployServer -and -not (Test-Path -LiteralPath $serverBinary -PathType Leaf)) {

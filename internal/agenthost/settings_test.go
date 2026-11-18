@@ -1,8 +1,11 @@
 package agenthost
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
@@ -18,12 +21,18 @@ import (
 	"github.com/codexrm/codexrm/internal/agent"
 	"github.com/codexrm/codexrm/internal/clientconfig"
 	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/server"
+	"github.com/codexrm/codexrm/internal/updater"
 )
 
-func startHost(t *testing.T, cfg clientconfig.Connection) (*Host, string, string, func()) {
+func startHost(t *testing.T, cfg clientconfig.Connection, installDirs ...string) (*Host, string, string, func()) {
 	t.Helper()
-	h, err := New(filepath.Join(t.TempDir(), ".state", "connection.json"), "", cfg, agent.Config{Mock: true, Cwd: t.TempDir(), DataDir: t.TempDir()})
+	installDir := ""
+	if len(installDirs) > 0 {
+		installDir = installDirs[0]
+	}
+	h, err := New(filepath.Join(t.TempDir(), ".state", "connection.json"), installDir, cfg, agent.Config{Mock: true, Cwd: t.TempDir(), DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,8 +119,12 @@ func TestLocalSettingsListenerLifetimeAndAccess(t *testing.T) {
 		}
 	}
 	code, b := request(t, base, token, "GET", "/api/settings", nil)
-	if code != 200 || !bytes.Contains(b, []byte(clientconfig.DefaultUpdateServer)) {
+	if code != 200 || bytes.Contains(b, []byte(`"updateServer"`)) || bytes.Contains(b, []byte(`"updateManifestUrl"`)) {
 		t.Fatalf("default settings: %d %s", code, b)
+	}
+	code, b = request(t, base, "", "GET", "/", nil)
+	if code != 200 || bytes.Contains(b, []byte("update-server")) || bytes.Contains(b, []byte("更新服务器")) {
+		t.Fatalf("update server is still exposed in settings: %d %s", code, b)
 	}
 	stop()
 	u, _ := url.Parse(base)
@@ -154,7 +167,7 @@ func TestSettingsSaveFailureDoesNotApplyAndServerChangeClearsOldKey(t *testing.T
 	if code != 200 || bytes.Contains(b, []byte("old-secret")) {
 		t.Fatal("settings exposed the saved key")
 	}
-	input := map[string]any{"server": "http://127.0.0.1:2", "updateServer": clientconfig.DefaultUpdateServer}
+	input := map[string]any{"server": "http://127.0.0.1:2"}
 	if err := os.MkdirAll(h.path, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +197,96 @@ func TestSettingsSaveFailureDoesNotApplyAndServerChangeClearsOldKey(t *testing.T
 	cfg, err = clientconfig.Load(h.path)
 	if err != nil || cfg.EnrollmentKey != "new-secret" {
 		t.Fatal("blank form erased the saved key")
+	}
+}
+
+func manualUpdateFeed(t *testing.T, versionCode int64) *httptest.Server {
+	t.Helper()
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	file, err := zw.Create("CodexRM/bin/codexrm-agent.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.Write([]byte("new agent")); err != nil {
+		t.Fatal(err)
+	}
+	if err = zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(archive.Bytes())
+	manifest := updater.Manifest{VersionCode: versionCode, VersionName: "forced-test", DownloadURL: "client.zip", FileSize: int64(archive.Len()), SHA256: hex.EncodeToString(hash[:])}
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/update.json":
+			_ = json.NewEncoder(w).Encode(manifest)
+		case "/client.zip":
+			_, _ = w.Write(archive.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(feed.Close)
+	return feed
+}
+
+func TestManualUpdateChecksImmediatelyWithoutRestartingCurrentVersion(t *testing.T) {
+	feed := manualUpdateFeed(t, release.VersionCode)
+	h, base, token, _ := startHost(t, clientconfig.Connection{}, t.TempDir())
+	useUpdateFeed(t, h, feed)
+	code, body := request(t, base, token, http.MethodPost, "/api/update", nil)
+	if code != http.StatusOK || !bytes.Contains(body, []byte(`"updateAvailable":false`)) {
+		t.Fatalf("manual current-version check: %d %s", code, body)
+	}
+	h.mu.Lock()
+	running := h.ctx.Err() == nil
+	h.mu.Unlock()
+	if !running {
+		t.Fatal("current-version check stopped the agent")
+	}
+	if code, _ = request(t, base, token, http.MethodGet, "/api/update", nil); code != http.StatusMethodNotAllowed {
+		t.Fatalf("unexpected update method accepted: %d", code)
+	}
+}
+
+func TestManualUpdateStartsHelperAndStopsRunningHost(t *testing.T) {
+	feed := manualUpdateFeed(t, release.VersionCode+1)
+	h, _, _, _ := startHost(t, clientconfig.Connection{}, t.TempDir())
+	useUpdateFeed(t, h, feed)
+	started := make(chan string, 1)
+	h.startUpdate = func(plan *updater.Plan) error {
+		started <- plan.Manifest.VersionName
+		plan.Discard()
+		return nil
+	}
+	available, err := h.checkForUpdate()
+	if err != nil || !available {
+		t.Fatalf("forced update was not prepared: available=%v, err=%v", available, err)
+	}
+	select {
+	case version := <-started:
+		if version != "forced-test" {
+			t.Fatalf("unexpected update started: %s", version)
+		}
+	default:
+		t.Fatal("verified update did not start its helper")
+	}
+	h.mu.Lock()
+	ctxErr := h.ctx.Err()
+	h.mu.Unlock()
+	if ctxErr == nil {
+		t.Fatal("idle host did not stop for its update")
+	}
+}
+
+func useUpdateFeed(t *testing.T, h *Host, feed *httptest.Server) {
+	t.Helper()
+	h.newUpdater = func(cfg updater.Config) (*updater.Updater, error) {
+		if cfg.ServerURL != clientconfig.DefaultUpdateServer || cfg.ManifestURL != clientconfig.DefaultUpdateServer+"update.json" {
+			t.Errorf("host used a configurable update feed: %+v", cfg)
+		}
+		cfg.ServerURL, cfg.ManifestURL = feed.URL, feed.URL+"/update.json"
+		return updater.New(cfg)
 	}
 }
 
@@ -225,6 +328,13 @@ func TestSettingsPairListAndRevokeAgainstRelay(t *testing.T) {
 	code, b = request(t, base, token, "GET", "/api/devices", nil)
 	if code != 200 || !bytes.Contains(b, []byte(claimed.ClientID)) {
 		t.Fatalf("device missing: %d %s", code, b)
+	}
+	var devices []protocol.ClientInfo
+	if err := json.Unmarshal(b, &devices); err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) != 1 || devices[0].LastConnectedAt == "" || devices[0].LastIP != "127.0.0.1" {
+		t.Fatalf("connection activity missing from local Agent settings: %s", b)
 	}
 	code, b = request(t, base, token, "DELETE", "/api/devices/"+claimed.ClientID, nil)
 	if code != 200 {

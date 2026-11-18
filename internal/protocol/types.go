@@ -4,6 +4,10 @@ import "encoding/json"
 
 const Version = "0.6.0"
 
+// AppVersionHeader reports the running agent build. Registration is skipped
+// while its token remains valid, so the websocket carries the current version.
+const AppVersionHeader = "X-CodexRM-Version"
+
 // Role identifies the peer on a relay websocket.
 type Role string
 
@@ -87,23 +91,27 @@ type PairClaimResponse struct {
 }
 
 type ClientInfo struct {
-	ClientID   string `json:"clientId"`
-	ClientName string `json:"clientName"`
-	DeviceType string `json:"deviceType"`
-	CreatedAt  string `json:"createdAt"`
+	ClientID        string `json:"clientId"`
+	ClientName      string `json:"clientName"`
+	DeviceType      string `json:"deviceType"`
+	CreatedAt       string `json:"createdAt"`
+	LastConnectedAt string `json:"lastConnectedAt,omitempty"`
+	LastIP          string `json:"lastIP,omitempty"`
 }
 
 // Envelope wraps a JSON-RPC payload between client and agent.
 type Envelope struct {
-	Type     string          `json:"type"`
-	ClientID string          `json:"clientId,omitempty"`
-	StreamID string          `json:"streamId,omitempty"`
-	SeqID    uint64          `json:"seqId,omitempty"`
-	Message  json.RawMessage `json:"message,omitempty"`
-	Status   string          `json:"status,omitempty"`
-	Error    string          `json:"error,omitempty"`
-	Agent    *AgentInfo      `json:"agent,omitempty"`
-	PingID   string          `json:"pingId,omitempty"`
+	Type       string          `json:"type"`
+	ClientID   string          `json:"clientId,omitempty"`
+	StreamID   string          `json:"streamId,omitempty"`
+	SeqID      uint64          `json:"seqId,omitempty"`
+	Message    json.RawMessage `json:"message,omitempty"`
+	Status     string          `json:"status,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	Agent      *AgentInfo      `json:"agent,omitempty"`
+	PingID     string          `json:"pingId,omitempty"`
+	P2P        *P2PSignal      `json:"p2p,omitempty"`
+	SkipDirect []string        `json:"skipDirect,omitempty"`
 }
 
 const (

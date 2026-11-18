@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"github.com/codexrm/codexrm/internal/agent"
 	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/server"
 	"github.com/gorilla/websocket"
 	"io"
@@ -306,13 +307,18 @@ func TestPWAAssetsAndCacheHeaders(t *testing.T) {
 		t.Fatalf("service worker Cache-Control: %q", got)
 	}
 
-	resp, err = http.Get(h.URL + "/app.js?v=" + protocol.Version)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if got := resp.Header.Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
-		t.Fatalf("versioned asset Cache-Control: %q", got)
+	for _, path := range []string{"/app.js", "/styles.css", "/dsh-theme.css", "/pwa.js", "/theme.js"} {
+		resp, err = http.Get(h.URL + path + "?v=20261118-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: %s", path, resp.Status)
+		}
+		if got := resp.Header.Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+			t.Fatalf("%s versioned asset Cache-Control: %q", path, got)
+		}
 	}
 	resp, err = http.Get(h.URL + "/app.js?v=old")
 	if err != nil {
@@ -451,5 +457,56 @@ func TestRelayTenantIsolationAndReplacement(t *testing.T) {
 		if env.Type == protocol.TypePong {
 			break
 		}
+	}
+}
+
+func TestAgentConnectionRefreshesAppVersion(t *testing.T) {
+	_, h := newServer(t)
+	var enrolled protocol.EnrollResponse
+	post(t, h, "/api/v1/agent/enroll", "", "test-key", protocol.EnrollRequest{Name: "host", AppVersion: "0.2.0", InstallationID: "stale-version"}, &enrolled)
+	connect := func(version string) {
+		t.Helper()
+		header := http.Header{"Authorization": []string{"Bearer " + enrolled.Token}}
+		if version != "" {
+			header[protocol.AppVersionHeader] = []string{version}
+		}
+		conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(h.URL, "http")+"/api/v1/agent/ws", header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+	}
+	versionOf := func() string {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, h.URL+"/api/v1/agents", nil)
+		req.Header.Set("Authorization", "Bearer test-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var listed struct {
+			Data []protocol.AgentInfo `json:"data"`
+		}
+		if err = json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != 200 || len(listed.Data) != 1 {
+			t.Fatalf("agent list: %d %+v", resp.StatusCode, listed.Data)
+		}
+		return listed.Data[0].AppVersion
+	}
+	connect("")
+	if got := versionOf(); got != "0.2.0" {
+		t.Fatalf("version without a report: %q", got)
+	}
+	connect("   ")
+	connect(strings.Repeat("v", 65))
+	if got := versionOf(); got != "0.2.0" {
+		t.Fatalf("invalid report changed version to %q", got)
+	}
+	connect(" " + release.VersionName + " ")
+	if got := versionOf(); got != release.VersionName {
+		t.Fatalf("version = %q, want %q", got, release.VersionName)
 	}
 }

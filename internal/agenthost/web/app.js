@@ -20,6 +20,7 @@ async function api(path, options = {}) {
   return data;
 }
 function status(data) {
+	$("update-status").textContent = data.updatePending ? "更新已就绪，等待所有进行中的对话和排队消息结束后自动安装。" : "启动时检查更新，之后每 20 小时自动检查一次。";
   $("status").textContent = data.status;
   $("status").className = `status ${data.status === "已连接" ? "connected" : data.status === "连接失败" ? "failed" : ""}`;
   $("connection-error").textContent = data.status === "已连接" ? "" : data.error || "";
@@ -27,9 +28,7 @@ function status(data) {
 function apply(data) {
   saved = data;
   $("server").value = data.server || "";
-  $("update-server").value = data.updateServer;
-  $("update-settings").hidden = !!data.packaged;
-  $("update-server").disabled = !!data.packaged;
+  $("update-card").hidden = !!data.packaged;
   $("package-settings").hidden = !data.packaged;
   $("key").value = "";
   $("key").placeholder = data.enrollmentKeySet ? "已保存密钥；留空保留，输入新密钥可替换" : "输入服务器的连接授权密钥";
@@ -44,7 +43,7 @@ async function action(button, work) {
   try { await work(); } catch (error) { notice(error.message, true); } finally { button.disabled = false; busy = false; }
 }
 function dirty() {
-  return !saved || $("server").value !== saved.server || $("key").value !== "" || $("update-server").value !== saved.updateServer;
+  return !saved || $("server").value !== saved.server || $("key").value !== "";
 }
 function requireSaved() {
   if (dirty()) throw new Error("请先保存连接配置，再进行配对或设备管理。");
@@ -74,7 +73,13 @@ async function devices() {
     const date = document.createElement("p");
     date.className = "hint";
     date.textContent = `配对于 ${row.createdAt ? new Date(row.createdAt).toLocaleString() : "未知时间"}`;
-    info.append(name, date);
+    const connected = document.createElement("p");
+    connected.className = "hint";
+    connected.textContent = `最近连接：${row.lastConnectedAt ? new Date(row.lastConnectedAt).toLocaleString() : "尚无记录"}`;
+    const ip = document.createElement("p");
+    ip.className = "hint";
+    ip.textContent = `最近 IP：${row.lastIP || "尚无记录"}`;
+    info.append(name, date, connected, ip);
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "text-button";
@@ -90,7 +95,7 @@ async function devices() {
 $("settings-form").addEventListener("submit", (event) => {
   event.preventDefault();
   action($("save"), async () => {
-    const input = { server: $("server").value.trim(), updateServer: $("update-server").value.trim() };
+    const input = { server: $("server").value.trim() };
     if ($("key").value) input.enrollmentKey = $("key").value;
     const data = await api("/api/settings", { method: "PUT", body: JSON.stringify(input) });
     apply(data);
@@ -100,6 +105,12 @@ $("settings-form").addEventListener("submit", (event) => {
     notice("设置已保存，Agent 正在连接服务器。");
   });
 });
+$("check-update").addEventListener("click", () => action($("check-update"), async () => {
+  if (dirty()) throw new Error("请先保存设置，再检查更新。");
+  notice("正在检查更新；发现新版本后会在所有对话和排队消息结束后自动安装。");
+  const data = await api("/api/update", { method: "POST" });
+  notice(data.updatePending ? "更新已就绪，等待所有进行中的对话和排队消息结束后自动安装。" : data.updateAvailable ? "更新已校验，Agent 正在重启完成安装。" : "当前已是最新版本。");
+}));
 $("pair").addEventListener("click", () => action($("pair"), async () => {
   requireSaved();
   const data = await api("/api/pair", { method: "POST" });
@@ -119,5 +130,20 @@ $("toggle-key").addEventListener("click", () => {
   $("toggle-key").textContent = show ? "隐藏" : "显示";
   $("toggle-key").setAttribute("aria-label", show ? "隐藏连接授权密钥" : "显示连接授权密钥");
 });
-api("/api/settings").then(async (data) => { apply(data); if (data.server) { try { await devices(); } catch (error) { notice(error.message, true); } } }).catch((error) => notice(error.message, true));
-setInterval(async () => { try { status(await api("/api/settings")); } catch { $("status").textContent = "Agent 已退出或页面已失效"; } }, 5000);
+async function initializeSettings(data) {
+  apply(data);
+  notice("");
+  if (data.server) {
+    try { await devices(); } catch (error) { notice(error.message, true); }
+  }
+}
+api("/api/settings").then(initializeSettings).catch((error) => notice(error.message, true));
+setInterval(async () => {
+  let data;
+  try { data = await api("/api/settings"); } catch {
+    $("status").textContent = "Agent 已退出或页面已失效";
+    return;
+  }
+  if (!saved) await initializeSettings(data);
+  else status(data);
+}, 5000);

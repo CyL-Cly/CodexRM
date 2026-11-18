@@ -67,7 +67,9 @@ func (a *Agent) threadSnapshot(ctx context.Context, app *appserver.Client, param
 			thread["codexrmTurnStates"] = states
 		}
 	}
-	return mustJSON(map[string]any{"thread": thread, "nextCursor": cursor}), nil
+	status, _ := thread["status"].(map[string]any)
+	statusType, _ := status["type"].(string)
+	return mustJSON(map[string]any{"thread": thread, "nextCursor": cursor, "active": statusType == "active"}), nil
 }
 
 // Read a bounded tail. Missing evidence stays unknown; it never proves a stop.

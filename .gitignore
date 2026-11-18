@@ -30,10 +30,6 @@ docs/deployments/
 docs/reviews/
 docs/provider-models-*.md
 
-# Local PHP hosting diagnostics (not distributed)
-/tools/php-relay-probe/
-*.php
-
 # Editors and operating systems
 .idea/
 .vscode/

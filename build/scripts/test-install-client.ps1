@@ -190,11 +190,28 @@ function Resolve-CodexDesktopCli {
     try { Assert-InstallerRejects { Invoke-TestInstaller -Arguments @{Action='CheckUpdate';NonInteractive=$true} } 'Network failures are reported by manual update checks' }
     finally { $env:CODEXRM_TEST_UPDATE_FAIL = $null }
 
-    # Exercise the CMD entry point in a fresh Windows PowerShell process.
+    # Exercise the native Setup/CMD boundary in a fresh process. The fixture only records arguments.
+    $setupDirectory = Join-Path $packageRoot 'dist'
+    [void][IO.Directory]::CreateDirectory($setupDirectory)
+    $setupFixture = Join-Path $setupDirectory 'CodexRM-Setup.exe'
+    Add-Type -OutputAssembly $setupFixture -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+using System.IO;
+public static class SetupFixture {
+    public static int Main(string[] args) {
+        File.WriteAllLines(Path.Combine(Environment.GetEnvironmentVariable("CODEXRM_INSTALL_TEST_ROOT"), "native-setup-args.txt"), args);
+        return Array.IndexOf(args, "--fixture-failure") >= 0 ? 23 : 0;
+    }
+}
+'@
+    $nativeArguments = @('--install-dir', $installRoot, '--workspace', $testRoot, '--non-interactive', '--no-shortcuts', '--no-autostart', '--no-start')
+    $nativeArgumentText = ($nativeArguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    $beforeCmdConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
+    $beforeCmdStartup = (Get-FileHash -LiteralPath $startupPath).Hash
     $cmdOutput = Join-Path $testRoot 'cmd-output.txt'
     $cmdError = Join-Path $testRoot 'cmd-error.txt'
     $cmdProcess = Start-Process -FilePath $env:ComSpec -WindowStyle Hidden -PassThru `
-        -ArgumentList ('/d /c ""' + (Join-Path $packageRoot 'install.cmd') + '" -Action DisableStartup -NonInteractive"') `
+        -ArgumentList ('/d /s /c ""' + (Join-Path $packageRoot 'install.cmd') + '" ' + $nativeArgumentText + '"') `
         -RedirectStandardOutput $cmdOutput -RedirectStandardError $cmdError
     $null = $cmdProcess.Handle
     if (-not $cmdProcess.WaitForExit(10000)) {
@@ -205,7 +222,15 @@ function Resolve-CodexDesktopCli {
         Get-Content -LiteralPath $cmdOutput,$cmdError | Write-Host
         throw "CMD installer failed with exit code: $($cmdProcess.ExitCode)"
     }
-    Assert-InstallCheck ($cmdProcess.ExitCode -eq 0 -and -not (Test-Path -LiteralPath $startupPath)) 'CMD entry point supports noninteractive actions without pausing'
+    $forwardedArguments = @(Get-Content -LiteralPath (Join-Path $testRoot 'native-setup-args.txt'))
+    Assert-InstallCheck ([Linq.Enumerable]::SequenceEqual([string[]]$nativeArguments, [string[]]$forwardedArguments) -and
+        (Get-Content -LiteralPath $configPath -Raw -Encoding UTF8) -ceq $beforeCmdConfig -and
+        (Get-FileHash -LiteralPath $startupPath).Hash -eq $beforeCmdStartup) 'CMD forwards native Setup arguments with spaces and leaves configuration/startup untouched'
+
+    $failureProcess = Start-Process -FilePath $env:ComSpec -WindowStyle Hidden -PassThru -Wait `
+        -ArgumentList ('/d /s /c ""' + (Join-Path $packageRoot 'install.cmd') + '" --non-interactive --fixture-failure"') `
+        -RedirectStandardOutput $cmdOutput -RedirectStandardError $cmdError
+    Assert-InstallCheck ($failureProcess.ExitCode -eq 23) 'CMD preserves a native Setup failure exit code'
 
     # Real isolated processes verify pairing and restart without contacting an RM or running Codex.
     $processFixture = Join-Path $testRoot 'process-fixture.exe'
@@ -317,6 +342,12 @@ function Get-CodexRMConnectorProcess([string]$Binary) {
     Remove-Item -LiteralPath Function:\Start-Process
 
     Remove-Item -LiteralPath (Join-Path $packageRoot '.state\connection.json') -Force
+    @'
+param($Manifest,$OutputPath)
+if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\CodexRM-Setup.exe') -PathType Leaf)) {
+    throw 'The isolated native Setup fixture is missing.'
+}
+'@ | Set-Content -LiteralPath (Join-Path $packageRoot 'scripts\package-setup.ps1') -Encoding UTF8
     # The package must remain compatible with Windows PowerShell even if a source editor omits the BOM.
     $packageInstallerPath = Join-Path $packageRoot 'scripts\install-client.ps1'
     [IO.File]::WriteAllText($packageInstallerPath, [IO.File]::ReadAllText($packageInstallerPath), (New-Object Text.UTF8Encoding $false))
@@ -324,15 +355,16 @@ function Get-CodexRMConnectorProcess([string]$Binary) {
     & (Join-Path $packageRoot 'scripts\package-client.ps1') -OutputPath $zipPath 6>$null
     $expanded = Join-Path $testRoot 'expanded'
     Expand-Archive -LiteralPath $zipPath -DestinationPath $expanded
-    Assert-InstallCheck ((Test-Path -LiteralPath (Join-Path $expanded 'CodexRM\scripts\client-install.ps1')) -and
-        -not (Test-Path -LiteralPath (Join-Path $expanded 'CodexRM\.state\connection.json'))) 'A generic package includes setup support and can omit a preset RM URL'
+    Assert-InstallCheck ((Test-Path -LiteralPath (Join-Path $expanded 'CodexRM\CodexRM-Setup.exe') -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $expanded 'CodexRM\.state\connection.json'))) 'A generic package includes native Setup and can omit a preset RM URL'
+    Assert-InstallCheck ([Linq.Enumerable]::SequenceEqual([byte[]][IO.File]::ReadAllBytes($setupFixture),
+        [byte[]][IO.File]::ReadAllBytes((Join-Path $expanded 'CodexRM\CodexRM-Setup.exe')))) 'Packaging preserves the native Setup executable bytes'
     foreach ($packagedScript in @(Get-ChildItem -LiteralPath (Join-Path $expanded 'CodexRM\scripts') -Filter '*.ps1')) {
-        $bytes = [IO.File]::ReadAllBytes($packagedScript.FullName)
         $parseErrors = $null
         $tokens = $null
         $null = [System.Management.Automation.Language.Parser]::ParseFile($packagedScript.FullName, [ref]$tokens, [ref]$parseErrors)
-        Assert-InstallCheck ($bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191 -and
-            -not $parseErrors.Count) ('Packaged script has a UTF-8 BOM and parses in Windows PowerShell: ' + $packagedScript.Name)
+        Assert-InstallCheck ((Get-Content -LiteralPath $packagedScript.FullName -Raw).Contains('Legacy update compatibility') -and
+            -not $parseErrors.Count) ('Packaged compatibility script parses and points to native Setup: ' + $packagedScript.Name)
     }
     $manifestPath = Join-Path $testRoot 'update.json'
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -343,10 +375,13 @@ function Get-CodexRMConnectorProcess([string]$Binary) {
     $beforeManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8
     @{ server = 'https://private.example'; enrollmentKey = 'private-test-key' } | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $packageRoot '.state\connection.json') -Encoding UTF8
-    & (Join-Path $packageRoot 'scripts\package-client.ps1') -OutputPath (Join-Path $testRoot 'private.zip') -IncludeEnrollmentKey 6>$null
-    Assert-InstallCheck ((Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8) -ceq $beforeManifest) 'Private installation packages cannot replace the public update manifest'
+    $privateZip = Join-Path $testRoot 'private.zip'
+    Assert-InstallerRejects { & (Join-Path $packageRoot 'scripts\package-client.ps1') -OutputPath $privateZip -IncludeEnrollmentKey 6>$null } 'Retired IncludeEnrollmentKey packages are rejected instead of exposing a key'
+    Assert-InstallCheck ((Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8) -ceq $beforeManifest -and
+        -not (Test-Path -LiteralPath $privateZip)) 'Rejected private packages preserve the public update manifest and create no ZIP'
 
-    $uninstallInstaller = Join-Path $expanded 'CodexRM\scripts\install-client.ps1'
+    [IO.File]::WriteAllText($packageInstallerPath, [IO.File]::ReadAllText($packageInstallerPath), (New-Object Text.UTF8Encoding $true))
+    $uninstallInstaller = $installer
     Invoke-TestInstaller -ScriptPath $uninstallInstaller -Responses @('8', 'n') | Out-Null
     Assert-InstallCheck (Test-Path -LiteralPath $installRoot -PathType Container) 'Declining uninstall preserves the installation'
     Invoke-TestInstaller -ScriptPath $uninstallInstaller -Responses @('8', 'y') | Out-Null

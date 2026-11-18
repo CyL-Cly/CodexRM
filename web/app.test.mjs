@@ -8,18 +8,30 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
   class Element {
     constructor(tagName = "div") {
       this.tagName = tagName.toUpperCase();
-      this.children = []; this.dataset = {}; this.style = {};
+      this.children = []; this.dataset = {}; this.style = {
+        setProperty(name, value) { this[name] = value; },
+        removeProperty(name) { delete this[name]; },
+      };
       this.value = ""; this.textContent = ""; this.scrollTop = 0;
-      this.classList = { toggle() {}, add() {}, remove() {} };
+      const classes = new Set();
+      this.classList = { toggle(name, force = !classes.has(name)) { if (force) classes.add(name); else classes.delete(name); }, add(name) { classes.add(name); }, remove(name) { classes.delete(name); }, contains(name) { return classes.has(name); } };
     }
     append(...nodes) { this.children.push(...nodes); }
     replaceChildren(...nodes) { this.children = nodes; }
     setAttribute(name, value) { this[name] = value; }
-    addEventListener() {}
+    getAttribute(name) { return this[name] ?? null; }
+    addEventListener(type, listener) { (this.listeners ||= new Map()).set(type, listener); }
+    closest() { return null; }
+    querySelector() { return null; }
+    getBoundingClientRect() { return { left: 100, top: 500 }; }
     focus() {}
+    select() { this.selected = true; }
     requestSubmit() { return this.onsubmit?.({ preventDefault() {} }); }
-    close() {}
-    showModal() {}
+    close() { this.open = false; this.listeners?.get("close")?.(); }
+    showModal() { this.open = true; }
+    setPointerCapture(id) { this.pointerID = id; }
+    hasPointerCapture(id) { return this.pointerID === id; }
+    releasePointerCapture() { delete this.pointerID; }
     contains(node) { return this === node || this.children.some((n) => n.contains?.(node)); }
     querySelectorAll(selector) {
       return this.children.flatMap((n) => [
@@ -60,9 +72,10 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
   const history = { replaceState(_state, _title, url) { this.url = url; } };
   const context = vm.createContext({
     document, localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
-    window: { addEventListener(type, listener) { windowListeners.set(type, listener); } },
+    window: { innerWidth: 1200, innerHeight: 800, addEventListener(type, listener) { windowListeners.set(type, listener); } },
     location: { origin: "http://localhost", href: `http://localhost/?keep=1${hash}`, protocol: "http:", pathname: "/", search: "?keep=1", hash },
-    history, URL, URLSearchParams, console, navigator,
+    history, URL, URLSearchParams, console, navigator, Blob, Uint8Array, btoa, atob,
+    matchMedia: () => ({ matches: false }),
     fetch: async (path, options) => {
       if (path === "/api/v1/client/claim") claims.push(JSON.parse(options.body));
       if (path === "/api/v1/client/profile") profiles.push({ ...JSON.parse(options.body), authorization: options.headers.Authorization });
@@ -89,10 +102,45 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
   return { context, elements, claims, profiles, contextRequests, history, document, documentListeners, windowListeners, timers,
     advance,
     profile: vm.runInContext("({browserClientProfile, syncClientProfile})", context),
-    app: vm.runInContext("({state, workspaceGroups, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, closeCodexDesktop, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams})", context) };
+    app: vm.runInContext("({state, workspaceGroups, renderThreads, setHome, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, closeCodexDesktop, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams, addAttachments, currentAttachments, userContent, messageInput, readAttachment, itemHTML, requestThreadDeletion, archiveThread, openThread, olderTurns, scheduleSnapshot, bootstrap, resetView, selectDevice, settings, updateAgent, createDeviceButton})", context) };
+}
+
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+};
+const flush = () => new Promise(setImmediate);
+function newThreadApp(storage = new Map()) {
+  const harness = loadApp(storage);
+  Object.assign(harness.app.state, {
+    selected: "device", devices: [{ token: "token", agent: { agentId: "device" } }],
+    online: true, loaded: true, info: { cwd: "/project" }, current: null,
+  });
+  return harness;
 }
 
 const gpuRenderer = "ANGLE (AMD, AMD Radeon 780M Graphics (0x00001900) Direct3D11 vs_5_0 ps_5_0, D3D11)";
+test("mobile device settings show the Agent version and request a remote update", async () => {
+  const { app, context, elements } = loadApp();
+  Object.assign(app.state, {
+    selected: "device",
+    devices: [{ token: "token", agent: { agentId: "device", serverName: "Computer", os: "windows", arch: "amd64", appVersion: "0.6.0" } }],
+    online: true,
+    info: { version: "0.6.0", remoteUpdate: true, transport: "websocket" },
+  });
+  context.window.confirm = () => true;
+  app.settings();
+  assert.match(elements.get("device-detail").textContent, /电脑 Agent v0\.6\.0/);
+  assert.equal(elements.get("update-agent").hidden, false);
+  assert.match(app.createDeviceButton(app.state.devices[0]).innerHTML, /v0\.6\.0/);
+  let method;
+  context.rpc = async (name) => { method = name; return { updateAvailable: true, updatePending: true }; };
+  await app.updateAgent();
+  assert.equal(method, "codexrm/update");
+  assert.equal(elements.get("update-agent").disabled, false);
+});
+
 function rendererContext(renderer = gpuRenderer) {
   const gl = {
     releases: 0,
@@ -174,8 +222,8 @@ test("profile synchronization failures leave the connection usable and retry on 
   assert.equal(attempts, 2);
 });
 
-function providerApp() {
-  const loaded = loadApp();
+function providerApp(storage) {
+  const loaded = loadApp(storage);
   Object.assign(loaded.app.state, {
     selected: "device", devices: [{ token: "token", agent: { agentId: "device" } }],
     online: true, loaded: true, info: { providerModels: true, cwd: "/project" },
@@ -244,6 +292,136 @@ test("a missing supplier remains distinct from the current Codex configuration",
   elements.get("model").value = app.modelKey("", "shared");
   elements.get("model").onchange();
   assert.equal(app.state.current, null, "current Codex model must start a new thread instead of using the missing supplier");
+});
+
+test("new chats select an available default instead of leaving the model empty", async () => {
+  const { app, providers } = providerApp();
+  providers[0].models.push({ model: "configured", isDefault: true });
+  await app.loadModels();
+  assert.equal(app.selectedModel().model, "configured");
+  app.newChat();
+  assert.equal(app.selectedModel().model, "configured");
+});
+
+test("new chats reuse the last provider, model and effort across workspaces and reloads", async () => {
+  const storage = new Map();
+  const { app, elements } = providerApp(storage);
+  await app.loadModels();
+  elements.get("model").value = app.modelKey("ccswitch_b", "shared");
+  elements.get("model").onchange();
+  elements.get("effort").value = "high";
+  elements.get("effort").onchange();
+  await app.selectWorkspace("/other");
+  assert.equal(app.selectedModel().providerId, "ccswitch_b");
+  assert.equal(elements.get("effort").value, "high");
+  const reloaded = providerApp(storage);
+  await reloaded.app.loadModels();
+  assert.equal(reloaded.app.selectedModel().providerId, "ccswitch_b");
+  assert.equal(reloaded.elements.get("effort").value, "high");
+  reloaded.app.newChat();
+  assert.equal(reloaded.elements.get("effort").value, "high");
+});
+
+test("the last model wins over older workspace preferences and stays scoped to its device", async () => {
+  const { app, elements } = providerApp();
+  await app.loadModels();
+  elements.get("model").value = app.modelKey("ccswitch_a", "alternate");
+  elements.get("model").onchange();
+  await app.selectWorkspace("/other");
+  elements.get("model").value = app.modelKey("ccswitch_b", "shared");
+  elements.get("model").onchange();
+  await app.selectWorkspace("/project");
+  assert.equal(app.selectedModel().providerId, "ccswitch_b");
+  app.state.selected = "another-device";
+  app.newChat();
+  assert.equal(app.selectedModel().providerId, "");
+});
+
+test("removed and unavailable last models fall back without leaking the previous effort", async () => {
+  const { app, context, elements, providers } = providerApp();
+  await app.loadModels();
+  elements.get("model").value = app.modelKey("ccswitch_b", "shared");
+  elements.get("model").onchange();
+  elements.get("effort").value = "high";
+  elements.get("effort").onchange();
+  context.rpc = async () => ({ providers: providers.map((p) => ({ ...p, unavailable: p.id === "ccswitch_b" })) });
+  await app.loadModels(true);
+  assert.equal(app.selectedModel().providerId, "");
+  assert.equal(elements.get("effort").value, "");
+  context.rpc = async () => ({ providers: [] });
+  await app.loadModels(true);
+  app.newChat();
+  assert.equal(app.selectedModel(), undefined);
+  elements.get("effort").onchange();
+  context.rpc = async () => ({ providers });
+  await app.loadModels();
+  assert.equal(app.selectedModel().providerId, "ccswitch_b");
+});
+
+test("reading history preserves the default until a message uses that model", async () => {
+  const { app, context, elements } = providerApp();
+  await app.loadModels();
+  elements.get("model").value = app.modelKey("ccswitch_b", "shared");
+  elements.get("model").onchange();
+  app.state.current = { id: "history", modelProvider: "ccswitch_a", model: "alternate" };
+  app.selectThreadModel({ thread: app.state.current });
+  app.newChat();
+  assert.equal(app.selectedModel().providerId, "ccswitch_b");
+  app.state.current = { id: "history", modelProvider: "ccswitch_a", model: "alternate" };
+  app.selectThreadModel({ thread: app.state.current });
+  elements.get("prompt").value = "continue";
+  context.rpc = async () => ({ turn: { id: "next", status: "inProgress", items: [] } });
+  await app.submit();
+  app.newChat();
+  assert.equal(app.selectedModel().providerId, "ccswitch_a");
+  assert.equal(app.selectedModel().model, "alternate");
+});
+
+test("accepted queued and priority messages remember their model; failed sends preserve the earlier choice", async () => {
+  for (const mode of ["queue", "steer"]) for (const fail of [false, true]) {
+    const { app, context, elements } = providerApp();
+    await app.loadModels();
+    elements.get("model").value = app.modelKey("ccswitch_b", "shared");
+    elements.get("model").onchange();
+    app.state.info.messageQueue = true;
+    app.state.current = { id: "history", modelProvider: "ccswitch_a", model: "alternate" };
+    app.state.turns = [{ id: "active", status: "inProgress", items: [] }];
+    app.selectThreadModel({ thread: app.state.current });
+    elements.get("prompt").value = "continue";
+    context.rpc = async () => {
+      if (fail) throw new Error("offline");
+      return { threadId: "history", version: 1, entries: [], turnId: "active" };
+    };
+    await app.submit(null, mode);
+    app.newChat();
+    assert.equal(app.selectedModel().providerId, fail ? "ccswitch_b" : "ccswitch_a");
+  }
+});
+
+test("the DSH model menu searches providers and models and applies model and effort choices", async () => {
+  const { app, elements, windowListeners } = providerApp();
+  await app.loadModels();
+  elements.get("model-trigger").onclick();
+  assert.equal(elements.get("model-trigger")["aria-expanded"], "true");
+  elements.get("choose-model").onclick();
+  elements.get("model-search").value = "alternate";
+  elements.get("model-search").oninput();
+  windowListeners.get("resize")();
+  assert.equal(elements.get("model-menu").hidden, false);
+  assert.equal(elements.get("model-search").value, "alternate");
+  const groups = elements.get("model-choices").children;
+  assert.equal(groups.length, 1);
+  groups[0].children.at(-1).onclick();
+  assert.equal(app.selectedModel().model, "alternate");
+  assert.equal(elements.get("model-menu").hidden, true);
+  elements.get("model-trigger").onclick();
+  elements.get("choose-effort").onclick();
+  elements.get("effort-choices").children.at(-1).onclick();
+  assert.equal(elements.get("effort").value, "high");
+  assert.equal(elements.get("model-effort-label").textContent, "深入");
+  app.newChat();
+  assert.equal(app.selectedModel().model, "alternate");
+  assert.equal(elements.get("effort").value, "high");
 });
 
 function connectionApp(options = {}) {
@@ -603,6 +781,176 @@ test("workspace section collapse persists across reloads", () => {
   assert.equal(JSON.parse(storage.get("codexrm.workspaceSectionCollapsed")), false);
 });
 
+test("sidebar pointer resizing clamps width, captures the pointer and persists only the final value", () => {
+  const storage = new Map();
+  const { elements, document } = loadApp(storage);
+  const handle = elements.get("sidebar-resize");
+  elements.get("sidebar").getBoundingClientRect = () => ({ width: 260 });
+  handle.onpointerdown({ button: 0, pointerId: 1, clientX: 258, preventDefault() {} });
+  assert.equal(handle.hasPointerCapture(1), true);
+  assert.equal(document.body.classList.contains("sidebar-resizing"), true);
+  handle.onpointermove({ pointerId: 2, clientX: 500 });
+  assert.equal(handle["aria-valuenow"], "260");
+  handle.onpointermove({ pointerId: 1, clientX: 438 });
+  assert.equal(document.documentElement.style["--sidebar-width"], "440px");
+  assert.equal(storage.has("codexrm.sidebarWidth"), false);
+  handle.onpointermove({ pointerId: 1, clientX: 5000 });
+  assert.equal(handle["aria-valuenow"], "520");
+  handle.onpointerup({ pointerId: 1 });
+  assert.equal(handle.hasPointerCapture(1), false);
+  assert.equal(document.body.classList.contains("sidebar-resizing"), false);
+  assert.equal(JSON.parse(storage.get("codexrm.sidebarWidth")), 520);
+  assert.equal(loadApp(storage).elements.get("sidebar-resize")["aria-valuenow"], "520");
+  handle.onpointerdown({ button: 0, pointerId: 3, clientX: 260, preventDefault() {} });
+  handle.onpointermove({ pointerId: 3, clientX: -500 });
+  handle.onpointercancel({ pointerId: 3 });
+  assert.equal(JSON.parse(storage.get("codexrm.sidebarWidth")), 220);
+});
+
+test("sidebar width supports keys and reset, adapts to the viewport and ignores mobile or collapsed drags", () => {
+  const storage = new Map([["codexrm.sidebarWidth", "420"]]);
+  const { elements, context, document, windowListeners } = loadApp(storage);
+  const handle = elements.get("sidebar-resize");
+  handle.onkeydown({ key: "ArrowRight", preventDefault() {} });
+  assert.equal(handle["aria-valuenow"], "430");
+  context.window.innerWidth = 800;
+  windowListeners.get("resize")();
+  assert.equal(handle["aria-valuenow"], "360");
+  assert.equal(JSON.parse(storage.get("codexrm.sidebarWidth")), 430);
+  handle.onkeydown({ key: "Home", preventDefault() {} });
+  assert.equal(handle["aria-valuenow"], "220");
+  handle.onkeydown({ key: "End", preventDefault() {} });
+  assert.equal(handle["aria-valuenow"], "360");
+  handle.ondblclick();
+  assert.equal(handle["aria-valuenow"], "240");
+  assert.equal(document.documentElement.style["--sidebar-width"], undefined);
+  assert.equal(JSON.parse(storage.get("codexrm.sidebarWidth")), null);
+  context.matchMedia = () => ({ matches: true });
+  handle.onpointerdown({ button: 0, pointerId: 1, clientX: 240, preventDefault() { assert.fail("mobile drag"); } });
+  context.matchMedia = () => ({ matches: false });
+  document.body.classList.add("sidebar-collapsed");
+  handle.onpointerdown({ button: 0, pointerId: 2, clientX: 240, preventDefault() { assert.fail("collapsed drag"); } });
+});
+
+function deletionApp() {
+  const harness = loadApp();
+  harness.app.state.online = true;
+  harness.app.state.loaded = true;
+  harness.app.state.selected = "device";
+  harness.app.state.current = { id: "current", name: "当前对话", cwd: "/project" };
+  harness.app.state.threads = [{ ...harness.app.state.current }, { id: "other", name: "另一个对话", cwd: "/project" }];
+  harness.app.renderThreads();
+  return harness;
+}
+
+test("right-click targets the listed conversation without opening it and confirmation deletes only that target", async () => {
+  const { app, elements, context } = deletionApp();
+  const calls = [];
+  context.rpc = async (method, params) => { calls.push({ method, params }); return {}; };
+  const row = elements.get("workspaces").children[0].children[1].children.find(row => row.dataset.threadId === "other");
+  row.oncontextmenu({ clientX: 1195, clientY: 795, preventDefault() {} });
+  assert.equal(elements.get("thread-menu").hidden, false);
+  assert.equal(elements.get("thread-menu").style.left, "1024px");
+  assert.equal(elements.get("thread-menu").style.top, "744px");
+  assert.equal(app.state.current.id, "current");
+  elements.get("delete-thread").onclick();
+  assert.equal(elements.get("delete-thread-dialog").open, true);
+  assert.equal(elements.get("delete-thread-name").textContent, "另一个对话");
+  assert.equal(calls.length, 0);
+  await elements.get("confirm-delete-thread").onclick();
+  assert.deepEqual(calls.map(({ method, params }) => [method, params.threadId]), [["thread/archive", "other"]]);
+  assert.deepEqual(Array.from(app.state.threads, t => t.id), ["current"]);
+  assert.equal(app.state.current.id, "current");
+  assert.equal(elements.get("delete-thread-dialog").open, false);
+});
+
+test("cancelling deletion makes no request; failures keep the conversation and allow a retry", async () => {
+  const { app, elements, context } = deletionApp();
+  let calls = 0;
+  context.rpc = async () => { calls++; throw new Error("archive failed"); };
+  app.requestThreadDeletion("other");
+  elements.get("delete-thread-dialog").close();
+  await elements.get("confirm-delete-thread").onclick();
+  assert.equal(calls, 0);
+  app.requestThreadDeletion("other");
+  await elements.get("confirm-delete-thread").onclick();
+  assert.equal(calls, 1);
+  assert.equal(elements.get("delete-thread-dialog").open, true);
+  assert.equal(elements.get("delete-thread-error").textContent, "archive failed");
+  assert.equal(elements.get("confirm-delete-thread").disabled, false);
+  assert.equal(app.state.threads.length, 2);
+  context.rpc = async () => ({});
+  await elements.get("confirm-delete-thread").onclick();
+  assert.equal(app.state.threads.length, 1);
+});
+
+test("deleting the current conversation returns home and duplicate confirmation sends only once", async () => {
+  const { app, elements, context } = deletionApp();
+  let resolve;
+  let calls = 0;
+  context.rpc = () => { calls++; return new Promise(r => resolve = r); };
+  app.requestThreadDeletion("current");
+  const pending = elements.get("confirm-delete-thread").onclick();
+  await elements.get("confirm-delete-thread").onclick();
+  assert.equal(calls, 1);
+  resolve({});
+  await pending;
+  assert.equal(app.state.current, null);
+  assert.equal(elements.get("welcome").hidden, false);
+  assert.deepEqual(Array.from(app.state.threads, t => t.id), ["other"]);
+});
+
+test("offline and running conversations cannot be deleted and keyboard menus close on Escape", () => {
+  const { app, elements } = deletionApp();
+  const row = elements.get("workspaces").children[0].children[1].children.find(row => row.dataset.threadId === "other");
+  app.state.online = false;
+  row.onkeydown({ key: "F10", shiftKey: true, preventDefault() {} });
+  assert.equal(elements.get("delete-thread").disabled, true);
+  elements.get("thread-menu").listeners.get("keydown")({ key: "Escape", preventDefault() {}, stopPropagation() {} });
+  assert.equal(elements.get("thread-menu").hidden, true);
+  row.onkeydown({ key: "ContextMenu", preventDefault() {} });
+  elements.get("search").oninput();
+  assert.equal(elements.get("thread-menu").hidden, true);
+  row.onkeydown({ key: "ContextMenu", preventDefault() {} });
+  elements.get("sidebar").listeners.get("scroll")();
+  assert.equal(elements.get("thread-menu").hidden, true);
+  app.state.online = true;
+  app.state.threads[1].status = { type: "active" };
+  app.requestThreadDeletion("other");
+  assert.notEqual(elements.get("delete-thread-dialog").open, true);
+});
+
+test("late archive results preserve a newly selected conversation or device", async () => {
+  for (const switchDevice of [false, true]) {
+    const { app, context } = deletionApp();
+    let resolve;
+    context.rpc = () => new Promise(r => resolve = r);
+    const pending = app.archiveThread("current");
+    app.state.current = { id: "other" };
+    if (switchDevice) {
+      app.state.generation++;
+      app.state.selected = "new-device";
+      app.state.threads = [{ id: "current" }];
+    }
+    resolve({});
+    await pending;
+    assert.equal(app.state.current.id, "other");
+    assert.equal(app.state.threads.some(t => t.id === "current"), switchDevice);
+  }
+});
+
+test("an in-flight history response cannot restore an archived conversation", async () => {
+  const { app, context } = deletionApp();
+  let resolve;
+  context.rpc = () => new Promise(r => resolve = r);
+  const pending = app.loadThreads();
+  app.onEvent({ method: "thread/archived", params: { threadId: "other" } });
+  resolve({ data: [{ id: "current" }, { id: "other" }], nextCursor: null });
+  await pending;
+  assert.deepEqual(Array.from(app.state.threads, t => t.id), ["current"]);
+  assert.equal(app.state.threadListLoading, false);
+});
+
 test("discover every cwd, merge Windows aliases, sort folders and chats by update", () => {
   const { app } = loadApp();
   app.state.info = { os: "windows" };
@@ -615,6 +963,75 @@ test("discover every cwd, merge Windows aliases, sort folders and chats by updat
   const groups = app.workspaceGroups();
   assert.deepEqual(Array.from(groups, (g) => g.path), ["c:\\a", "C:/B", "C:/pinned"]);
   assert.deepEqual(Array.from(groups[0].threads, (t) => t.id), ["new", "old"]);
+});
+
+test("running conversations show a spinner before the title and clear it on completion", () => {
+  const { app, elements } = loadApp();
+  app.state.current = { id: "thread", name: "运行任务", cwd: "/project" };
+  app.state.threads = [{ ...app.state.current, status: { type: "idle" } }];
+  app.renderThreads();
+  const button = () => elements.get("workspaces").children[0].children[1].children[0].children[0];
+  assert.equal(button().children[0].className, "thread-name");
+  app.onEvent({ method: "turn/started", params: {
+    threadId: "thread", turn: { id: "turn", status: "inProgress", items: [] },
+  } });
+  assert.equal(button().children[0].className, "thread-spinner");
+  assert.equal(button().children[0]["aria-hidden"], "true");
+  assert.equal(button().children[1].textContent, "运行任务");
+  assert.equal(button().children[2].textContent, "进行中");
+  app.onEvent({ method: "turn/completed", params: {
+    threadId: "thread", turn: { id: "turn", status: "completed", items: [] },
+  } });
+  assert.equal(button().children.length, 1);
+  assert.equal(button().children[0].className, "thread-name");
+});
+
+test("conversation title edits inline and retains the dialog rename entry", async () => {
+  const { app, context, elements } = loadApp();
+  app.state.current = { id: "thread", name: "旧标题", cwd: "/project" };
+  app.state.threads = [{ ...app.state.current }];
+  app.setHome(false);
+  assert.equal(elements.get("header-title").hidden, true);
+  assert.equal(elements.get("header-divider").hidden, true);
+  const calls = [];
+  context.rpc = async (method, params) => {
+    calls.push({ method, params });
+    return {};
+  };
+  const button = elements.get("header-subtitle");
+  const form = elements.get("title-rename-form");
+  const input = elements.get("title-rename-input");
+  button.onclick();
+  assert.equal(form.hidden, false);
+  assert.equal(button.hidden, true);
+  assert.equal(input.value, "旧标题");
+  assert.equal(input.selected, true);
+  input.value = "  新标题  ";
+  await form.requestSubmit();
+  assert.equal(calls[0].method, "thread/name/set");
+  assert.equal(calls[0].params.threadId, "thread");
+  assert.equal(calls[0].params.name, "新标题");
+  assert.equal(app.state.current.name, "新标题");
+  assert.equal(app.state.threads[0].name, "新标题");
+  assert.equal(button.textContent, "新标题");
+  assert.equal(form.hidden, true);
+  assert.equal(button.hidden, false);
+
+  elements.get("thread-actions").onclick();
+  elements.get("thread-name").value = "对话框标题";
+  await elements.get("rename-form").requestSubmit();
+  assert.equal(app.state.current.name, "对话框标题");
+  assert.equal(calls.length, 2);
+
+  button.onclick();
+  input.value = "不保存";
+  let prevented = false;
+  input.onkeydown({ key: "Escape", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(form.hidden, true);
+  assert.equal(button.hidden, false);
+  assert.equal(app.state.current.name, "对话框标题");
+  assert.equal(calls.length, 2);
 });
 
 test("typing and streaming deltas do not rebuild unrelated composer lists", () => {
@@ -670,11 +1087,11 @@ test("parallel approvals retain answers, await acknowledgements and permit retri
   app.state.current = { id: "thread" };
   app.onEvent({ id: "question", method: "item/tool/requestUserInput", params: { threadId: "thread", questions: [{ id: "q", question: "Answer?" }] } });
   const question = app.state.approvalCards.get("question");
-  question.querySelectorAll("input")[0].value = "keep this answer";
+  question.querySelectorAll("textarea")[0].value = "keep this answer";
   for (const id of ["cmd1", "cmd2", "cmd3"])
     app.onEvent({ id, method: "item/commandExecution/requestApproval", params: { threadId: "thread", turnId: "turn", itemId: "same-item" } });
   assert.equal(app.state.approvalCards.get("question"), question);
-  assert.equal(question.querySelectorAll("input")[0].value, "keep this answer");
+  assert.equal(question.querySelectorAll("textarea")[0].value, "keep this answer");
   elements.get("approval-area").querySelectorAll("button").find((b) => b.textContent === "全部允许 (3)").onclick();
   assert.deepEqual(sent.map((s) => s.message.id), ["cmd1", "cmd2", "cmd3"]);
   assert.equal(app.state.requests.size, 4);
@@ -685,7 +1102,105 @@ test("parallel approvals retain answers, await acknowledgements and permit retri
   app.onEvent({ method: "codexrm/request/failed", params: { id: "cmd1", message: "retry" } });
   assert.equal(app.state.responding.has("cmd1"), false);
   assert.equal(app.answerRequest("cmd1", { decision: "accept" }), true);
-  assert.equal(question.querySelectorAll("input")[0].value, "keep this answer");
+  assert.equal(question.querySelectorAll("textarea")[0].value, "keep this answer");
+});
+
+test("Codex questions submit selected or custom answers, multiline text and secrets with retry", () => {
+  for (const customAnswer of [false, true]) {
+    const { app } = loadApp();
+    const sent = [];
+    app.state.online = true;
+    app.state.socket = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+    app.state.current = { id: "thread" };
+    app.onEvent({ id: 0, method: "item/tool/requestUserInput", params: {
+      threadId: "thread", turnId: "turn", isBlocking: false,
+      questions: [
+        { id: "choice", header: "方式", question: "选择实现方式？", options: [
+          { label: "直接实现（推荐）", description: "修改并测试。" },
+          { label: "先看方案", description: "先解释方案。" },
+        ] },
+        { id: "details", header: "要求", question: "补充要求？" },
+        { id: "secret", header: "密钥", question: "输入测试值？", isSecret: true },
+      ],
+    } });
+    const card = app.state.approvalCards.get(0);
+    assert.equal(card.querySelectorAll("span").some((span) => span.textContent === "先解释方案。"), true);
+    const form = card.querySelectorAll("form")[0];
+    form.requestSubmit();
+    assert.equal(sent.length, 0, "blank answers must not silently submit");
+    const [choice, details] = card.querySelectorAll("textarea");
+    const radios = card.querySelectorAll("input").filter((input) => input.type === "radio");
+    assert.equal(radios[0].checked, true);
+    if (customAnswer) {
+      choice.value = "我自己的方案";
+      choice.oninput();
+      assert.equal(radios.some((radio) => radio.checked), false);
+    } else {
+      choice.value = "previous custom draft";
+      radios[0].checked = false;
+      radios[1].checked = true;
+      radios[1].onchange();
+      assert.equal(choice.value, "");
+    }
+    details.value = "保留中文\n以及第二行";
+    const secret = card.querySelectorAll("input").find((input) => input.type === "password");
+    assert.equal(secret.autocomplete, "off");
+    secret.value = "test-only-value";
+    assert.equal(sent.length, 0, "selecting an option requires an explicit submit");
+    form.requestSubmit();
+    form.requestSubmit();
+    assert.equal(sent.length, 1, "an in-flight answer must not be sent twice");
+    assert.deepEqual(sent[0].message, { id: 0, result: { answers: {
+      choice: { answers: [customAnswer ? "我自己的方案" : "先看方案"] },
+      details: { answers: ["保留中文\n以及第二行"] },
+      secret: { answers: ["test-only-value"] },
+    } } });
+    assert.equal(card.querySelectorAll("button, input, textarea").every((control) => control.disabled), true);
+    app.onEvent({ method: "codexrm/request/failed", params: { id: 0, message: "test retry" } });
+    assert.equal(details.disabled, false);
+    assert.equal(details.value, "保留中文\n以及第二行");
+    form.requestSubmit();
+    assert.equal(sent.length, 2);
+    app.onEvent({ method: "codexrm/request/resolved", params: { id: 0 } });
+    assert.equal(app.state.approvalCards.has(0), false);
+  }
+});
+
+test("questions can be explicitly skipped without fabricating empty answers", () => {
+  const { app } = loadApp();
+  const sent = [];
+  app.state.online = true;
+  app.state.socket = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  app.onEvent({ id: "skip-question", method: "item/tool/requestUserInput", params: {
+    questions: [{ id: "q", question: "可选问题？" }],
+  } });
+  app.state.approvalCards.get("skip-question").querySelectorAll("button").find((button) => button.textContent === "跳过").onclick();
+  assert.deepEqual(sent[0].message, { id: "skip-question", result: { answers: {} } });
+});
+
+test("nonblocking questions remain answerable after completion until resolved or interrupted", () => {
+  const { app } = loadApp();
+  app.state.current = { id: "thread" };
+  for (const [id, isBlocking] of [["async", false], ["blocking", true], ["legacy", undefined]])
+    app.onEvent({ id, method: "item/tool/requestUserInput", params: {
+      threadId: "thread", turnId: "turn", isBlocking, questions: [{ id: "q", question: "继续？" }],
+    } });
+  const card = app.state.approvalCards.get("async");
+  const field = card.querySelectorAll("textarea")[0];
+  field.value = "keep this draft";
+  app.onEvent({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed", items: [] } } });
+  assert.deepEqual([...app.state.requests.keys()], ["async"]);
+  assert.equal(app.state.approvalCards.get("async"), card);
+  assert.equal(field.value, "keep this draft");
+  app.onEvent({ method: "serverRequest/resolved", params: { threadId: "thread", requestId: "async" } });
+  assert.equal(app.state.requests.size, 0);
+  for (const status of ["interrupted", "failed"]) {
+    app.onEvent({ id: status, method: "item/tool/requestUserInput", params: {
+      threadId: "thread", turnId: status, isBlocking: false, questions: [{ id: "q", question: "继续？" }],
+    } });
+    app.onEvent({ method: "turn/completed", params: { threadId: "thread", turn: { id: status, status, items: [] } } });
+    assert.equal(app.state.requests.size, 0);
+  }
 });
 
 test("desktop close requires confirmation and calls only the local control RPC", async () => {
@@ -797,6 +1312,209 @@ function runningApp() {
   return loaded;
 }
 
+const readyAttachment = (overrides = {}) => ({
+  id: "12345678-1234-4234-9234-123456789abc", name: "报告.txt", path: "/agent/attachments/file-report.txt",
+  size: 3, mimeType: "text/plain", ...overrides,
+});
+
+test("image paste reaches the composer from the editor and elsewhere on the page exactly once", async () => {
+  for (const source of ["prompt", "body"]) {
+    const { app, context, elements, document, documentListeners } = runningApp();
+    app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+    const image = new File(["png"], "clipboard.png", { type: "image/png" });
+    let uploads = 0;
+    context.rpc = async (method) => {
+      if (method.endsWith("begin")) { uploads++; return { id: "image" }; }
+      if (method.endsWith("chunk")) return { offset: 3 };
+      return readyAttachment({ name: image.name, mimeType: image.type });
+    };
+    const event = {
+      target: source === "prompt" ? elements.get("prompt") : document.body,
+      clipboardData: { items: [{ kind: "string" }, { kind: "file", getAsFile: () => image }], files: [image] },
+      preventDefault() { this.defaultPrevented = true; },
+    };
+    await documentListeners.get("paste")(event);
+    assert.equal(event.defaultPrevented, true);
+    assert.equal(uploads, 1);
+    assert.equal(app.currentAttachments()[0].mimeType, "image/png");
+    await documentListeners.get("paste")(event);
+    assert.equal(uploads, 1);
+  }
+});
+
+test("clipboard file lists work without items and plain text keeps native paste", async () => {
+  const { app, context, document, documentListeners } = runningApp();
+  app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+  context.rpc = async (method) => method.endsWith("begin") ? { id: "file" } : method.endsWith("chunk") ? { offset: 3 } : readyAttachment();
+  const event = {
+    target: document.body, clipboardData: { files: [new File(["abc"], "file.txt")] },
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  await documentListeners.get("paste")(event);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(app.currentAttachments().length, 1);
+  event.defaultPrevented = false;
+  event.clipboardData = { items: [{ kind: "string" }], files: [] };
+  await documentListeners.get("paste")(event);
+  assert.equal(event.defaultPrevented, false);
+  assert.equal(app.currentAttachments().length, 1);
+});
+
+test("paste respects other editors, shadow editors, modal dialogs and blocked composer states", async () => {
+  for (const blocked of ["offline", "unloaded", "loading", "readOnly", "sending", "unsupported", "editor", "shadow", "dialog", "hidden", "menu"]) {
+    const { app, context, elements, document, documentListeners } = runningApp();
+    app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+    if (blocked === "offline") app.state.online = false;
+    else if (blocked === "unloaded") app.state.loaded = false;
+    else if (["loading", "readOnly", "sending"].includes(blocked)) app.state[blocked] = true;
+    else if (blocked === "unsupported") delete app.state.info.attachments;
+    else if (blocked === "dialog") document.querySelector = () => ({ contains: () => false });
+    else if (blocked === "hidden") elements.get("composer").closest = () => ({});
+    else if (blocked === "menu") elements.get("model-menu").hidden = false;
+    context.rpc = async () => { assert.fail(`paste uploaded while blocked: ${blocked}`); };
+    const editor = { closest: () => editor };
+    const event = {
+      target: blocked === "editor" ? editor : document.body,
+      composedPath: () => blocked === "shadow" ? [editor, document.body] : [],
+      clipboardData: { items: [{ kind: "file", getAsFile: () => new File(["abc"], "file.txt") }] },
+      preventDefault() { assert.fail(`paste was consumed while blocked: ${blocked}`); },
+    };
+    await documentListeners.get("paste")(event);
+    assert.equal(app.currentAttachments().length, 0, blocked);
+  }
+});
+
+test("attachments upload in bounded chunks and persist only finalized metadata", async () => {
+  const { app, context, elements } = runningApp();
+  app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+  const data = new Uint8Array(262144 + 17).fill(65);
+  const received = [];
+  const file = readyAttachment({ name: "report.txt", size: data.length });
+  context.rpc = async (method, params) => {
+    if (method.endsWith("begin")) return { id: file.id, chunkSize: 262144 };
+    if (method.endsWith("chunk")) {
+      const bytes = Buffer.from(params.data, "base64");
+      assert.ok(bytes.length <= 262144);
+      assert.equal(params.offset, received.reduce((sum, b) => sum + b.length, 0));
+      received.push(bytes);
+      return { offset: params.offset + bytes.length };
+    }
+    assert.equal(method, "codexrm/attachment/finish");
+    return file;
+  };
+  await app.addAttachments([new File([data], "report.txt", { type: "text/plain" })]);
+  assert.deepEqual(Buffer.concat(received), Buffer.from(data));
+  assert.equal(app.currentAttachments()[0].path, file.path);
+  assert.equal(app.currentAttachments()[0].file, undefined);
+  assert.equal(elements.get("queue-send").disabled, false);
+  const storage = JSON.parse(vm.runInContext('localStorage.getItem("codexrm.attachments.v1")', context));
+  assert.deepEqual(storage["device:thread:thread"], [file]);
+  app.state.current = { id: "other" };
+  app.restoreDraft();
+  assert.equal(app.currentAttachments().length, 0);
+  assert.equal(elements.get("attachments").hidden, true);
+});
+
+test("attachment-only messages work for new turns, queues and steering", async () => {
+  for (const mode of ["auto", "queue", "steer"]) {
+    const { app, context, elements } = runningApp();
+    app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+    const file = readyAttachment({ name: "图片.png", mimeType: "image/png" });
+    app.state.attachmentDrafts["device:thread:thread"] = [file];
+    if (mode === "auto") app.state.turns = [];
+    const calls = [];
+    context.rpc = async (method, params) => {
+      calls.push({ method, params });
+      return method === "turn/start" ? { turn: { id: "new", status: "inProgress", items: [] } }
+        : { threadId: "thread", entries: [{ id: "q", input: params.input }] };
+    };
+    app.resizePrompt();
+    assert.equal(elements.get(mode === "auto" ? "send" : "queue-send").disabled, false);
+    await app.submit(null, mode);
+    assert.equal(calls[0].method, { auto: "turn/start", queue: "codexrm/queue/add", steer: "turn/steer" }[mode]);
+    assert.equal(calls[0].params.input[1].type, "localImage");
+    assert.equal(calls[0].params.input[1].path, file.path);
+    assert.equal(app.currentAttachments().length, 0);
+  }
+});
+
+test("failed attachment sends retain files alongside text typed during the request", async () => {
+  for (const mode of ["auto", "queue", "steer"]) {
+    const { app, context, elements } = runningApp();
+    app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+    if (mode === "auto") app.state.turns = [];
+    const file = readyAttachment();
+    app.state.attachmentDrafts["device:thread:thread"] = [file];
+    elements.get("prompt").value = "original";
+    let reject;
+    context.rpc = () => new Promise((_, fail) => { reject = fail; });
+    const sending = app.submit(null, mode);
+    assert.equal(app.currentAttachments().length, 0);
+    elements.get("prompt").value = "new draft";
+    reject(new Error("connection lost"));
+    await sending;
+    assert.equal(app.currentAttachments()[0].id, file.id);
+    assert.equal(elements.get("prompt").value, "original\n\nnew draft");
+  }
+});
+
+test("uploads in progress or in error block sending, and a removed upload aborts", async () => {
+  const { app, context, elements } = runningApp();
+  app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+  let finishChunk;
+  const methods = [];
+  context.rpc = async (method, params) => {
+    methods.push(method);
+    if (method.endsWith("begin")) return { id: "upload", chunkSize: 262144 };
+    if (method.endsWith("chunk")) return new Promise((resolve) => { finishChunk = () => resolve({ offset: 3 }); });
+    return {};
+  };
+  const uploading = app.addAttachments([new File(["abc"], "report.txt")]);
+  await new Promise(setImmediate);
+  assert.equal(elements.get("queue-send").disabled, true);
+  await app.submit();
+  assert.equal(methods.includes("codexrm/queue/add"), false);
+  elements.get("attachments").children[0].children.at(-1).onclick();
+  finishChunk();
+  await uploading;
+  assert.equal(app.currentAttachments().length, 0);
+  assert.equal(methods.includes("codexrm/attachment/abort"), true);
+  assert.equal(methods.includes("codexrm/attachment/finish"), false);
+});
+
+test("attachment rendering restores merged history and escapes filenames", () => {
+  const { app } = runningApp();
+  const file = readyAttachment({ name: '<img src=x onerror="alert(1)">.txt' });
+  const content = app.messageInput("look", [file]);
+  const merged = [{ type: "text", text: content.map((c) => c.text).join("\n") }];
+  const view = app.userContent(merged);
+  assert.equal(view.text, "look");
+  assert.equal(view.files[0].name, file.name);
+  const html = app.itemHTML({ type: "userMessage", content: merged });
+  assert.ok(html.includes("&lt;img"));
+  assert.equal(html.includes('<img src=x onerror="alert(1)">'), false);
+  assert.equal(html.includes("/agent/attachments/file-report.txt"), false);
+});
+
+test("attachment drafts survive reload without storing file bytes", async () => {
+  const storage = new Map();
+  const loaded = loadApp(storage);
+  const { app, context } = loaded;
+  Object.assign(app.state, {
+    selected: "device", online: true, loaded: true, current: { id: "thread" },
+    info: { attachments: { maxSize: 20 * 1024 * 1024 } },
+  });
+  context.rpc = async (method) => method.endsWith("begin") ? { id: "ready" } : method.endsWith("chunk") ? { offset: 3 } : readyAttachment();
+  await app.addAttachments([new File(["abc"], "report.txt")]);
+  const reloaded = loadApp(storage);
+  reloaded.app.state.selected = "device";
+  reloaded.app.state.current = { id: "thread" };
+  reloaded.app.restoreDraft();
+  assert.equal(reloaded.app.currentAttachments()[0].name, "报告.txt");
+  assert.equal(reloaded.app.currentAttachments()[0].file, undefined);
+  assert.equal(reloaded.elements.get("attachments").hidden, false);
+});
+
 test("Enter queues during a running turn; Ctrl and Command Enter steer that exact turn", async () => {
   const { app, context, elements } = runningApp();
   const calls = [];
@@ -900,4 +1618,278 @@ test("stop is explicit; composing, read-only, offline and empty messages do not 
   await app.stopTurn();
   assert.deepEqual(calls, ["turn/interrupt"]);
   assert.equal(prompt.value, "message");
+});
+
+test("thread/start success preserves text typed while waiting and scopes it to the new thread", async () => {
+  const storage = new Map();
+  const { app, context, elements } = newThreadApp(storage);
+  const started = deferred();
+  const turn = deferred();
+  context.rpc = (method) => method === "thread/start" ? started.promise : turn.promise;
+  elements.get("prompt").value = "original message";
+  app.resizePrompt();
+  const sending = app.submit();
+  assert.equal(elements.get("prompt").value, "");
+  elements.get("prompt").value = "new draft";
+  app.resizePrompt();
+  started.resolve({ thread: { id: "created", cwd: "/project", turns: [] } });
+  await flush();
+  assert.equal(app.state.current.id, "created");
+  assert.equal(elements.get("prompt").value, "new draft");
+  const drafts = JSON.parse(storage.get("codexrm.drafts.v1"));
+  assert.equal(drafts["device:workspace:/project"], undefined);
+  assert.equal(drafts["device:thread:created"], "new draft");
+  turn.resolve({ turn: { id: "turn", status: "inProgress", items: [] } });
+  await sending;
+  assert.equal(elements.get("prompt").value, "new draft");
+  assert.equal(app.state.sending, false);
+});
+
+test("thread/start and first-turn failures restore both the original and newer draft", async () => {
+  for (const failure of ["thread/start", "turn/start"]) {
+    const storage = new Map();
+    const { app, context, elements } = newThreadApp(storage);
+    context.rpc = async (method) => {
+      if (method === failure) throw new Error("request failed");
+      if (method === "thread/start") return { thread: { id: "created", cwd: "/project", turns: [] } };
+      return {};
+    };
+    elements.get("prompt").value = "original message";
+    app.resizePrompt();
+    const sending = app.submit();
+    elements.get("prompt").value = "new draft";
+    app.resizePrompt();
+    await sending;
+    const key = failure === "thread/start" ? "device:workspace:/project" : "device:thread:created";
+    assert.equal(elements.get("prompt").value, "original message\n\nnew draft", failure);
+    assert.equal(JSON.parse(storage.get("codexrm.drafts.v1"))[key], "original message\n\nnew draft", failure);
+    assert.equal(app.state.sending, false, failure);
+  }
+});
+
+test("opening another thread cancels only the pending creation and ignores its late result", async () => {
+  const { app, context, elements } = newThreadApp();
+  const started = deferred();
+  const calls = [];
+  context.rpc = async (method) => {
+    calls.push(method);
+    if (method === "thread/start") return started.promise;
+    if (method === "thread/resume") return { thread: { id: "other", cwd: "/project", turns: [] } };
+    throw new Error(`unexpected ${method}`);
+  };
+  elements.get("prompt").value = "original message";
+  app.resizePrompt();
+  const sending = app.submit();
+  elements.get("prompt").value = "new draft";
+  app.resizePrompt();
+  await app.openThread("other");
+  assert.equal(app.state.current.id, "other");
+  assert.equal(app.state.sending, false);
+  started.resolve({ thread: { id: "created", cwd: "/project", turns: [] } });
+  await sending;
+  assert.equal(app.state.current.id, "other");
+  assert.equal(calls.includes("turn/start"), false);
+  assert.equal(app.state.drafts["device:workspace:/project"], "original message\n\nnew draft");
+  assert.equal(app.state.drafts["device:thread:other"], undefined);
+});
+
+test("a paginated resume cannot restore a thread archived while its turn page was in flight", async () => {
+  const { app, context } = deletionApp();
+  const page = deferred();
+  context.rpc = async (method) => {
+    if (method === "thread/resume") return { thread: { id: "other", historyMode: "paginated", cwd: "/project" } };
+    if (method === "thread/turns/list") return page.promise;
+    throw new Error(`unexpected ${method}`);
+  };
+  const opening = app.openThread("other");
+  await flush();
+  app.onEvent({ method: "thread/archived", params: { threadId: "other" } });
+  page.resolve({ data: [{ id: "turn", items: [] }], nextCursor: null });
+  await opening;
+  assert.equal(app.state.current.id, "current");
+  assert.equal(app.state.threads.some((thread) => thread.id === "other"), false);
+  assert.equal(app.state.archivedThreads.has("other"), true);
+});
+
+test("refresh after an early bootstrap failure retries full initialization and restores loaded", async () => {
+  const { app, context, elements } = loadApp();
+  app.state.online = true;
+  let infos = 0;
+  context.rpc = async () => { infos++; throw new Error("info unavailable"); };
+  await app.bootstrap(app.state.generation);
+  assert.equal(app.state.loaded, false);
+  assert.equal(app.state.bootstrapPromise, null);
+  context.rpc = async (method) => {
+    if (method === "codexrm/info") { infos++; return { name: "Computer", cwd: "/project", workspaces: false }; }
+    if (method === "thread/list") return { data: [], nextCursor: null };
+    if (method === "model/list") return { data: [] };
+    throw new Error(`unexpected ${method}`);
+  };
+  await elements.get("refresh").onclick();
+  assert.equal(infos, 2);
+  assert.equal(app.state.loaded, true);
+  assert.equal(app.state.info.name, "Computer");
+  assert.equal(app.state.bootstrapPromise, null);
+});
+
+test("older turns have one in-flight request, deduplicate overlap and ignore stale responses", async () => {
+  const { app, context } = loadApp();
+  app.state.current = { id: "thread" };
+  app.state.turns = [{ id: "current", items: [{ id: "newest" }] }];
+  app.state.historyCursor = "page-2";
+  const firstPage = deferred();
+  const stalePage = deferred();
+  let calls = 0;
+  context.rpc = () => ++calls === 1 ? firstPage.promise : stalePage.promise;
+  const first = app.olderTurns();
+  await app.olderTurns();
+  assert.equal(calls, 1);
+  firstPage.resolve({ data: [{ id: "older", items: [] }, { id: "current", items: [] }], nextCursor: "page-3" });
+  await first;
+  assert.deepEqual(Array.from(app.state.turns, (turn) => turn.id), ["older", "current"]);
+  assert.equal(app.state.turns[1].items[0].id, "newest");
+  const stale = app.olderTurns();
+  app.newChat();
+  stalePage.resolve({ data: [{ id: "stale", items: [] }], nextCursor: null });
+  await stale;
+  assert.equal(app.state.current, null);
+  assert.equal(app.state.turns.length, 0);
+  assert.equal(app.state.historyCursor, null);
+});
+
+test("detached snapshots enter read-only on active and loaded restores normal cleanup", async () => {
+  const { app, context, advance } = loadApp();
+  Object.assign(app.state, {
+    online: true, loaded: true, info: { threadSnapshots: true },
+    current: { id: "thread", turns: [] }, turns: [],
+  });
+  let snapshots = 0;
+  context.rpc = async (method) => {
+    assert.equal(method, "codexrm/thread/snapshot");
+    snapshots++;
+    return { active: snapshots >= 2, thread: { id: "thread", turns: [] }, nextCursor: null };
+  };
+  app.onEvent({ method: "codexrm/thread/detached", params: { threadId: "thread" } });
+  assert.equal(app.state.detached, true);
+  advance(2999);
+  assert.equal(snapshots, 0);
+  advance(1);
+  await flush();
+  assert.equal(snapshots, 1);
+  assert.equal(app.state.detached, true, "inactive snapshot keeps detached polling");
+  assert.equal(app.state.readOnly, false);
+  advance(3000);
+  await flush();
+  assert.equal(snapshots, 2);
+  assert.equal(app.state.detached, false, "active snapshot enters read-only");
+  assert.equal(app.state.readOnly, true);
+  advance(3000);
+  await flush();
+  assert.equal(snapshots, 3);
+  app.onEvent({ method: "codexrm/thread/loaded", params: { threadId: "thread" } });
+  assert.equal(app.state.detached, false);
+  assert.equal(app.state.readOnly, false);
+  advance(6000);
+  await flush();
+  assert.equal(snapshots, 3);
+});
+
+test("open, new chat, device switch and reset clear detached polling", async () => {
+  for (const action of ["open", "new", "device", "reset"]) {
+    const { app, context, advance } = loadApp();
+    Object.assign(app.state, {
+      online: true, loaded: true, info: { threadSnapshots: true },
+      current: { id: "thread", turns: [] }, turns: [],
+      devices: [{ token: "one", agent: { agentId: "device" } }, { token: "two", agent: { agentId: "other-device" } }],
+      selected: "device",
+    });
+    let snapshots = 0;
+    context.rpc = async (method) => {
+      if (method === "codexrm/thread/snapshot") { snapshots++; return { active: false, thread: { id: "thread", turns: [] } }; }
+      if (method === "thread/resume") return { thread: { id: "other", turns: [] } };
+      throw new Error(`unexpected ${method}`);
+    };
+    app.onEvent({ method: "codexrm/thread/detached", params: { threadId: "thread" } });
+    if (action === "open") await app.openThread("other");
+    else if (action === "new") app.newChat();
+    else if (action === "device") app.selectDevice(app.state.devices[1]);
+    else app.resetView();
+    assert.equal(app.state.detached, false, action);
+    assert.equal(app.state.readOnly, false, action);
+    advance(6000);
+    await flush();
+    assert.equal(snapshots, 0, action);
+  }
+});
+
+test("loading dragover and drop both reject files with a visible reason", async () => {
+  const { app, context, elements } = runningApp();
+  app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+  app.state.loading = true;
+  context.rpc = async () => { assert.fail("loading drop must not upload"); };
+  const dataTransfer = { types: ["Files"], files: [new File(["abc"], "file.txt")], dropEffect: "copy" };
+  const event = { dataTransfer, preventDefault() { this.defaultPrevented = true; } };
+  elements.get("composer").listeners.get("dragover")(event);
+  assert.equal(dataTransfer.dropEffect, "none");
+  elements.get("composer").listeners.get("drop")(event);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(elements.get("toast").hidden, false);
+  assert.match(elements.get("toast").textContent, /正在同步工作区/);
+  app.state.loading = false;
+  elements.get("composer").listeners.get("dragover")(event);
+  assert.equal(dataTransfer.dropEffect, "copy");
+});
+
+function loadAgenthost() {
+  class Element {
+    constructor() { this.children = []; this.dataset = {}; this.value = ""; this.hidden = false; }
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = nodes; }
+    addEventListener(type, listener) { (this.listeners ||= new Map()).set(type, listener); }
+    setAttribute(name, value) { this[name] = value; }
+  }
+  const elements = new Map();
+  const document = {
+    getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
+    createElement() { return new Element(); },
+  };
+  let interval;
+  let settingsCalls = 0;
+  let deviceCalls = 0;
+  const settings = { server: "https://server.example", status: "已连接", version: "1.2.3", packaged: false };
+  const context = vm.createContext({
+    document, location: { hash: "#token" }, console, URL, Date, JSON, Error, Promise,
+    navigator: { clipboard: { writeText: async () => {} } }, confirm: () => true,
+    setInterval(callback) { interval = callback; },
+    fetch: async (path) => {
+      if (path === "/api/settings") {
+        settingsCalls++;
+        if (settingsCalls === 1) throw new Error("temporarily unavailable");
+        return { ok: true, text: async () => JSON.stringify(settings) };
+      }
+      if (path === "/api/devices") {
+        deviceCalls++;
+        return { ok: true, text: async () => JSON.stringify([{ clientId: "browser", clientName: "Browser", deviceType: "desktop" }]) };
+      }
+      throw new Error(`unexpected ${path}`);
+    },
+  });
+  for (const id of ["server", "version", "status", "devices"]) document.getElementById(id);
+  vm.runInContext(readFileSync(new URL("../internal/agenthost/web/app.js", import.meta.url), "utf8"), context);
+  return { context, elements, settings, poll: () => interval(), counts: () => ({ settingsCalls, deviceCalls }) };
+}
+
+test("agenthost polling after the first settings failure applies settings and restores devices", async () => {
+  const harness = loadAgenthost();
+  await flush();
+  assert.equal(harness.elements.get("notice").hidden, false);
+  assert.equal(harness.elements.get("server").value, "");
+  await harness.poll();
+  assert.equal(harness.elements.get("server").value, harness.settings.server);
+  assert.equal(harness.elements.get("version").textContent, "1.2.3");
+  assert.equal(harness.elements.get("status").textContent, "已连接");
+  assert.equal(harness.elements.get("devices").children.length, 1);
+  assert.equal(harness.elements.get("devices").children[0].children[1].children[0].textContent, "Browser");
+  assert.deepEqual(harness.counts(), { settingsCalls: 2, deviceCalls: 1 });
+  assert.equal(vm.runInContext("saved.server", harness.context), harness.settings.server);
 });

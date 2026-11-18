@@ -54,7 +54,9 @@ func main() {
 	enrollKey := flag.String("enroll-key", os.Getenv("CODEXRM_ENROLL_KEY"), "server enrollment key")
 	appToken := flag.String("appserver-token", os.Getenv("CODEXRM_APPSERVER_TOKEN"), "app-server WebSocket bearer token")
 	updateDir := flag.String("update-dir", "", "managed Windows installation directory")
-	manifestURL := flag.String("update-manifest", "", "update manifest override")
+	// Accept the legacy flag for old launch scripts; installed agents always
+	// use the built-in update service.
+	flag.String("update-manifest", "", "deprecated: update service is built in")
 	checkUpdate := flag.Bool("check-update", false, "check for updates, print JSON, and exit")
 	installUpdate := flag.Bool("install-update", false, "update a stopped Windows installation from a temporary copy")
 	currentVersion := flag.Int64("current-version-code", release.VersionCode, "installed release code")
@@ -126,9 +128,6 @@ func main() {
 	}
 	if *codexPath != "" {
 		cfg.CodexPath = *codexPath
-	}
-	if *manifestURL != "" {
-		cfg.UpdateManifestURL = *manifestURL
 	}
 	if err := cfg.Normalize(); err != nil {
 		log.Fatal(err)
@@ -209,6 +208,12 @@ func main() {
 		return
 	}
 	defer instance.Close()
+	if err := desktop.EnsureP2PFirewall(); err != nil {
+		if err == desktop.ErrP2PFirewallRequired {
+			return
+		}
+		log.Fatal(err)
+	}
 	if err := os.MkdirAll(filepath.Dir(*configPath), 0700); err != nil {
 		log.Fatal(err)
 	}

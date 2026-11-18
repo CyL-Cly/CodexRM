@@ -18,6 +18,18 @@ import (
 	"github.com/codexrm/codexrm/internal/updater"
 )
 
+func TestPackageContentType(t *testing.T) {
+	for name, expected := range map[string]string{
+		"client.zip":        "application/zip",
+		"CodexRM.APK":       "application/vnd.android.package-archive",
+		"unexpected.binary": "application/octet-stream",
+	} {
+		if actual := packageContentType(name); actual != expected {
+			t.Fatalf("packageContentType(%q) = %q, expected %q", name, actual, expected)
+		}
+	}
+}
+
 func TestPublicationUploadsOnlyZIPAndPreparesRMManifest(t *testing.T) {
 	for _, mode := range []string{"success", "corrupt download", "upload failure", "bad local hash"} {
 		t.Run(mode, func(t *testing.T) {
@@ -76,8 +88,8 @@ func TestPublicationUploadsOnlyZIPAndPreparesRMManifest(t *testing.T) {
 					}
 					_ = json.NewDecoder(r.Body).Decode(&body)
 					name := strings.TrimPrefix(body.URI, "cloudreve://my/")
-					if !strings.HasSuffix(name, ".zip") {
-						t.Error("only ZIP packages belong on Cloudreve")
+					if !strings.HasSuffix(name, ".zip") && !strings.HasSuffix(name, ".apk") {
+						t.Error("only release packages belong on Cloudreve")
 					}
 					if body.Entity != "version" {
 						t.Error("upload must retain the file and permanent link")

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"github.com/codexrm/codexrm/internal/appserver"
 	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/codexrm/codexrm/internal/release"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"io"
@@ -18,14 +19,21 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
 
+type UpdateResult struct {
+	UpdateAvailable bool `json:"updateAvailable"`
+	UpdatePending   bool `json:"updatePending"`
+}
+
 type Config struct {
 	OnReady                                                                                                         func()
+	CheckForUpdate                                                                                                  func() (UpdateResult, error)
 	ServerURL, AppServerURL, AppServerToken, Name, DataDir, InstallationID, EnrollmentKey, CodexPath, Cwd, MockAddr string
 	CCSwitchDB                                                                                                      string
 	Mock                                                                                                            bool
@@ -40,27 +48,35 @@ type creds struct {
 	ExpiresAt      int64  `json:"expiresAt"`
 }
 type approval struct {
-	ID       json.RawMessage
-	Raw      json.RawMessage
-	Owner    string
-	ThreadID string
-	TurnID   string
-	Sending  bool
+	ID          json.RawMessage
+	Raw         json.RawMessage
+	Owner       string
+	ThreadID    string
+	TurnID      string
+	Sending     bool
+	NonBlocking bool
 }
 type Agent struct {
-	cfg        Config
-	creds      creds
-	credsDirty bool
-	credsMu    sync.RWMutex
-	enrollMu   sync.Mutex
-	mu         sync.Mutex
-	writeMu    sync.Mutex
-	relay      *websocket.Conn
-	owners     map[string]string
-	approvals  map[string]approval
-	queueMu    sync.Mutex
-	queues     map[string]*messageQueue
-	queueCtx   context.Context
+	cfg          Config
+	creds        creds
+	credsDirty   bool
+	credsMu      sync.RWMutex
+	enrollMu     sync.Mutex
+	mu           sync.Mutex
+	writeMu      sync.Mutex
+	eventMu      sync.Mutex
+	direct       map[string]*directSession
+	eventClients map[string]bool // nil until this RM supplies a routing snapshot
+	relay        *websocket.Conn
+	owners       map[string]string
+	approvals    map[string]approval
+	queueMu      sync.Mutex
+	queues       map[string]*messageQueue
+	queueCtx     context.Context
+	requests     int
+	updating     bool
+	attachmentMu sync.Mutex
+	uploads      map[string]*attachmentUpload
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -196,7 +212,7 @@ func (a *Agent) ensureEnrolled(ctx context.Context) error {
 		return nil
 	}
 	var out protocol.EnrollResponse
-	if e := a.request(ctx, "/api/v1/agent/enroll", protocol.EnrollRequest{Name: a.cfg.Name, OS: runtime.GOOS, Arch: runtime.GOARCH, AppVersion: protocol.Version, InstallationID: credentials.InstallationID}, &out); e != nil {
+	if e := a.request(ctx, "/api/v1/agent/enroll", protocol.EnrollRequest{Name: a.cfg.Name, OS: runtime.GOOS, Arch: runtime.GOARCH, AppVersion: release.VersionName, InstallationID: credentials.InstallationID}, &out); e != nil {
 		return e
 	}
 	a.credsMu.Lock()
@@ -354,22 +370,46 @@ func (a *Agent) write(conn *websocket.Conn, env protocol.Envelope) error {
 	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	return conn.WriteJSON(env)
 }
+
+// The provider gateway reports upstream 429 rate limits as a generic
+// "503 Service temporarily unavailable", which Codex surfaces as an
+// unexpected-status error. Rewrite it to the standard retry-limit hint so
+// clients see the quota exhaustion instead of a service outage.
+var maskedRateLimitPattern = regexp.MustCompile(`unexpected status 503 Service Unavailable: Service temporarily unavailable[^"\\]*`)
+var maskedRateLimitRequestID = regexp.MustCompile(`, request id: ([^"\\,]+)`)
+
+func rewriteMaskedRateLimit(raw json.RawMessage) json.RawMessage {
+	if !bytes.Contains(raw, []byte("unexpected status 503 Service Unavailable: Service temporarily unavailable")) {
+		return raw
+	}
+	return maskedRateLimitPattern.ReplaceAllFunc(raw, func(match []byte) []byte {
+		hint := []byte("exceeded retry limit, last status: 429 Too Many Requests")
+		if id := maskedRateLimitRequestID.FindSubmatch(match); id != nil {
+			hint = append(hint, ", request id: "...)
+			hint = append(hint, id[1]...)
+		}
+		return hint
+	})
+}
+
 func (a *Agent) forward(raw json.RawMessage) {
+	raw = rewriteMaskedRateLimit(raw)
 	var m map[string]json.RawMessage
 	if json.Unmarshal(raw, &m) != nil {
 		return
 	}
 	a.mu.Lock()
-	relay := a.relay
 	owner := ""
 	var method string
 	_ = json.Unmarshal(m["method"], &method)
 	var meta struct {
-		ThreadID  string          `json:"threadId"`
-		TurnID    string          `json:"turnId"`
-		RequestID json.RawMessage `json:"requestId"`
-		Turn      struct {
-			ID string `json:"id"`
+		ThreadID   string          `json:"threadId"`
+		TurnID     string          `json:"turnId"`
+		IsBlocking *bool           `json:"isBlocking"`
+		RequestID  json.RawMessage `json:"requestId"`
+		Turn       struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
 		} `json:"turn"`
 	}
 	_ = json.Unmarshal(m["params"], &meta)
@@ -389,7 +429,8 @@ func (a *Agent) forward(raw json.RawMessage) {
 	}
 	if method == "turn/completed" {
 		for key, pending := range a.approvals {
-			if pending.ThreadID == meta.ThreadID && pending.TurnID == meta.Turn.ID {
+			if pending.ThreadID == meta.ThreadID && pending.TurnID == meta.Turn.ID &&
+				(!pending.NonBlocking || meta.Turn.Status != "completed") {
 				delete(a.approvals, key)
 			}
 		}
@@ -399,12 +440,11 @@ func (a *Agent) forward(raw json.RawMessage) {
 		key := "approval_" + uuid.NewString()
 		m["id"] = mustJSON(key)
 		raw = mustJSON(m)
-		a.approvals[key] = approval{ID: id, Raw: raw, Owner: owner, ThreadID: meta.ThreadID, TurnID: meta.TurnID}
+		a.approvals[key] = approval{ID: id, Raw: raw, Owner: owner, ThreadID: meta.ThreadID, TurnID: meta.TurnID,
+			NonBlocking: method == "item/tool/requestUserInput" && meta.IsBlocking != nil && !*meta.IsBlocking}
 	}
 	a.mu.Unlock()
-	if relay != nil {
-		_ = a.write(relay, protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: owner, Message: raw})
-	}
+	a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: owner, Message: raw})
 }
 func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	u, _ := url.Parse(a.cfg.ServerURL + "/api/v1/agent/ws")
@@ -414,15 +454,21 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 		u.Scheme = "ws"
 	}
 	credentials, _ := a.credentials()
-	conn, _, e := (&websocket.Dialer{HandshakeTimeout: 10 * time.Second}).DialContext(ctx, u.String(), http.Header{"Authorization": []string{"Bearer " + credentials.Token}})
+	conn, _, e := (&websocket.Dialer{HandshakeTimeout: 10 * time.Second}).DialContext(ctx, u.String(), http.Header{
+		"Authorization":           []string{"Bearer " + credentials.Token},
+		protocol.AppVersionHeader: []string{release.VersionName},
+	})
 	if e != nil {
 		return e
 	}
 	defer conn.Close()
 	conn.SetReadLimit(16 << 20)
+	a.eventMu.Lock()
+	a.eventClients = nil
 	a.mu.Lock()
 	a.relay = conn
 	a.mu.Unlock()
+	a.eventMu.Unlock()
 	defer func() {
 		a.mu.Lock()
 		if a.relay == conn {
@@ -434,7 +480,13 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	defer cancel()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
 	log.Printf("relay connected as %s (%s)", credentials.AgentID, a.cfg.Name)
+	hello := protocol.P2P("hello", "")
+	hello.LAN = true
+	if e = a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, P2P: hello}); e != nil {
+		return e
+	}
 	slots := make(chan struct{}, 32)
+	send := func(env protocol.Envelope) error { return a.write(conn, env) }
 	for {
 		var env protocol.Envelope
 		if e = conn.ReadJSON(&env); e != nil {
@@ -444,18 +496,57 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 			_ = a.write(conn, protocol.Envelope{Type: protocol.TypePong, PingID: env.PingID})
 			continue
 		}
+		if env.Type == protocol.TypeP2P {
+			a.directSignal(ctx, app, conn, slots, env)
+			continue
+		}
 		if env.Type != protocol.TypeClientMessage {
 			continue
 		}
-		select {
-		case slots <- struct{}{}:
-			go func() { defer func() { <-slots }(); a.handle(ctx, app, conn, env) }()
-		default:
-			a.respond(conn, env, nil, &appserver.RPCError{Code: -32001, Message: "too many concurrent requests"})
-		}
+		a.dispatch(ctx, app, send, slots, env, nil)
 	}
 }
-func (a *Agent) handle(ctx context.Context, app *appserver.Client, conn *websocket.Conn, env protocol.Envelope) {
+
+func (a *Agent) dispatch(ctx context.Context, app *appserver.Client, send sendEnvelope, slots chan struct{}, env protocol.Envelope, direct *directSession) {
+	select {
+	case slots <- struct{}{}:
+		go func() {
+			defer func() { <-slots }()
+			if ctx.Err() == nil {
+				a.handle(ctx, app, send, env, direct)
+			}
+		}()
+	default:
+		a.respond(send, env, nil, &appserver.RPCError{Code: -32001, Message: "too many concurrent requests"})
+	}
+}
+
+func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnvelope, env protocol.Envelope, direct *directSession) {
+	var probe struct {
+		Method string `json:"method"`
+	}
+	_ = json.Unmarshal(env.Message, &probe)
+	if probe.Method == "codexrm/update" {
+		a.mu.Lock()
+		updating := a.updating
+		a.mu.Unlock()
+		if updating {
+			a.respond(send, env, nil, updateInProgressError)
+			return
+		}
+		if a.cfg.CheckForUpdate == nil {
+			a.respond(send, env, nil, &appserver.RPCError{Code: -32601, Message: "此 Agent 不支持远程更新"})
+			return
+		}
+		result, err := a.cfg.CheckForUpdate()
+		a.respond(send, env, mustJSON(result), err)
+		return
+	}
+	if !a.beginRequest() {
+		a.respond(send, env, nil, updateInProgressError)
+		return
+	}
+	defer a.endRequest()
 	var req struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
@@ -502,19 +593,25 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, conn *websock
 			}
 			a.mu.Unlock()
 			if err == nil {
-				_ = a.write(conn, protocol.Envelope{Type: protocol.TypeServerMessage, Message: mustJSON(map[string]any{"method": "codexrm/request/resolved", "params": map[string]any{"id": key}})})
+				a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, Message: mustJSON(map[string]any{"method": "codexrm/request/resolved", "params": map[string]any{"id": key}})})
+				a.queueMu.Lock()
+				lifetime := a.queueCtx
+				a.queueMu.Unlock()
+				if lifetime != nil {
+					go a.releaseIdleThread(lifetime, app, p.ThreadID)
+				}
 			} else {
-				_ = a.write(conn, protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, Message: mustJSON(map[string]any{"method": "codexrm/request/failed", "params": map[string]any{"id": key, "message": err.Error()}})})
+				a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, Message: mustJSON(map[string]any{"method": "codexrm/request/failed", "params": map[string]any{"id": key, "message": err.Error()}})})
 			}
 		}
 		return
 	}
 	if req.Method == "initialize" || req.Method == "initialized" {
-		a.respond(conn, env, nil, &appserver.RPCError{Code: -32600, Message: "Agent owns initialization"})
+		a.respond(send, env, nil, &appserver.RPCError{Code: -32600, Message: "Agent owns initialization"})
 		return
 	}
 	if req.Method == "codexrm/info" {
-		a.respond(conn, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": protocol.Version, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "providerModels": true, "messageQueue": true, "desktopControl": runtime.GOOS == "windows", "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
+		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "providerModels": true, "messageQueue": true, "images": true, "directFiles": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize}, "desktopControl": runtime.GOOS == "windows", "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
 		a.mu.Lock()
 		pending := []approval{}
 		for _, p := range a.approvals {
@@ -524,56 +621,68 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, conn *websock
 		}
 		a.mu.Unlock()
 		for _, p := range pending {
-			_ = a.write(conn, protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, Message: p.Raw})
+			_ = send.write(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, Message: p.Raw})
 		}
 		return
 	}
 	var params map[string]any
 	if len(req.Params) > 0 && string(req.Params) != "null" {
 		if e := json.Unmarshal(req.Params, &params); e != nil {
-			a.respond(conn, env, nil, &appserver.RPCError{Code: -32602, Message: e.Error()})
+			a.respond(send, env, nil, &appserver.RPCError{Code: -32602, Message: e.Error()})
 			return
 		}
 	}
 	if params == nil {
 		params = map[string]any{}
 	}
+	if strings.HasPrefix(req.Method, protocol.DirectFilePrefix) {
+		if len(req.ID) != 0 {
+			result, err := a.directFileRPC(ctx, app, direct, req.Method, params)
+			a.respond(send, env, mustJSON(result), err)
+		}
+		return
+	}
 	if req.Method == "codexrm/model/list" {
 		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		result, err := a.modelCatalog(callCtx, app)
-		a.respond(conn, env, mustJSON(result), err)
+		a.respond(send, env, mustJSON(result), err)
 		return
 	}
 	if req.Method == "codexrm/thread/snapshot" {
 		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		result, err := a.threadSnapshot(callCtx, app, params)
-		a.respond(conn, env, result, err)
+		a.respond(send, env, result, err)
 		return
 	}
 	if strings.HasPrefix(req.Method, "codexrm/queue/") {
 		result, err := a.queueRPC(ctx, app, env.ClientID, req.Method, params)
-		a.respond(conn, env, mustJSON(result), err)
+		a.respond(send, env, mustJSON(result), err)
+		return
+	}
+	if strings.HasPrefix(req.Method, "codexrm/attachment/") {
+		result, err := a.attachmentRPC(env.ClientID, req.Method, params)
+		a.respond(send, env, mustJSON(result), err)
+		return
+	}
+	if req.Method == "codexrm/image/read" {
+		result, err := a.readImage(params)
+		a.respond(send, env, mustJSON(result), err)
 		return
 	}
 	if strings.HasPrefix(req.Method, "codexrm/desktop/") {
 		result, err := a.desktopRPC(req.Method)
-		a.respond(conn, env, mustJSON(result), err)
+		a.respond(send, env, mustJSON(result), err)
 		return
 	}
 	if strings.HasPrefix(req.Method, "codexrm/") {
 		result, err := a.workspaceRPC(req.Method, params)
-		a.respond(conn, env, mustJSON(result), err)
+		a.respond(send, env, mustJSON(result), err)
 		return
 	}
 	if req.Method == "thread/start" && params["cwd"] == nil {
 		params["cwd"] = a.cfg.Cwd
-	}
-	if id, ok := params["threadId"].(string); ok && req.Method == "turn/start" {
-		a.mu.Lock()
-		a.owners[id] = env.ClientID
-		a.mu.Unlock()
 	}
 	if len(req.ID) == 0 {
 		_ = app.Notify(req.Method, params)
@@ -581,37 +690,10 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, conn *websock
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	if err := a.prepareProvider(callCtx, app, req.Method, params); err != nil {
-		a.respond(conn, env, nil, err)
-		return
-	}
-	result, e := app.Call(callCtx, req.Method, params)
-	if e == nil {
-		if err := a.rememberThreadModel(req.Method, params, result); err != nil {
-			log.Printf("unable to save thread model selection: %v", err)
-		}
-	}
-	if e == nil && req.Method == "thread/resume" {
-		if id, ok := params["threadId"].(string); ok {
-			a.mu.Lock()
-			a.owners[id] = env.ClientID
-			a.mu.Unlock()
-		}
-	}
-	if e == nil && req.Method == "thread/start" {
-		var out struct {
-			Thread struct {
-				ID string `json:"id"`
-			} `json:"thread"`
-		}
-		_ = json.Unmarshal(result, &out)
-		a.mu.Lock()
-		a.owners[out.Thread.ID] = env.ClientID
-		a.mu.Unlock()
-	}
-	a.respond(conn, env, result, e)
+	result, e := a.callThread(callCtx, app, env.ClientID, req.Method, params)
+	a.respond(send, env, result, e)
 }
-func (a *Agent) respond(conn *websocket.Conn, env protocol.Envelope, result json.RawMessage, err error) {
+func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.RawMessage, err error) {
 	var req struct {
 		ID json.RawMessage `json:"id"`
 	}
@@ -631,8 +713,8 @@ func (a *Agent) respond(conn *websocket.Conn, env protocol.Envelope, result json
 		if len(result) == 0 {
 			result = json.RawMessage("null")
 		}
-		resp["result"] = result
+		resp["result"] = rewriteMaskedRateLimit(result)
 	}
-	_ = a.write(conn, protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, StreamID: env.StreamID, Message: mustJSON(resp)})
+	_ = send.write(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, StreamID: env.StreamID, Message: mustJSON(resp)})
 }
 func mustJSON(v any) json.RawMessage { b, _ := json.Marshal(v); return b }

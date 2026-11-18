@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"github.com/codexrm/codexrm/internal/p2p"
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/codexrm/codexrm/internal/store"
 	"github.com/google/uuid"
@@ -12,15 +13,22 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type Config struct{ Addr, DataDir, WebDir, AdminToken, UpdateDir string }
+type Config struct {
+	Addr, DataDir, WebDir, AdminToken, UpdateDir string
+	P2PSTUN, P2PVerifyListen, P2PVerifyPublic    string
+	P2PVerifyMore, P2PVerifyKeyFile              string
+	P2PTrustProxy, P2PLocalTest, P2PLAN          bool
+}
 type peer struct {
 	id, agentID, clientID string
 	role                  protocol.Role
@@ -29,23 +37,39 @@ type peer struct {
 	closed                chan struct{}
 	once                  sync.Once
 	expires               time.Time
+	ip                    string
+	directIP              netip.Addr
+	directCapable         bool
+	lanCapable            bool
+	direct                *directPair
+	lastDirect            time.Time
 }
 
 func (p *peer) close() { p.once.Do(func() { close(p.closed); _ = p.conn.Close() }) }
 
 type Server struct {
-	cfg     Config
-	store   *store.Store
-	mu      sync.RWMutex
-	agents  map[string]*peer
-	clients map[string]*peer
-	byAgent map[string]map[string]*peer
-	seq     atomic.Uint64
+	cfg             Config
+	store           *store.Store
+	mu              sync.RWMutex
+	agents          map[string]*peer
+	clients         map[string]*peer
+	byAgent         map[string]map[string]*peer
+	seq             atomic.Uint64
+	maintenanceDone chan struct{}
+	closeOnce       sync.Once
+	stun            []string
+	verifier        *p2p.UDPVerifier
+	verifyPublic    string
+	verifyMore      []string
 
 	beforeClientUpgrade func() // coordinates authorization/revocation interleavings in tests
 }
 
 func New(cfg Config) (*Server, error) {
+	stun, err := stunEndpoints(cfg.P2PSTUN)
+	if err != nil {
+		return nil, err
+	}
 	if cfg.WebDir == "" {
 		cfg.WebDir = "web"
 	}
@@ -56,7 +80,15 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, store: st, agents: map[string]*peer{}, clients: map[string]*peer{}, byAgent: map[string]map[string]*peer{}}, nil
+	if _, err := st.PruneInactiveClients(time.Now(), nil); err != nil {
+		return nil, err
+	}
+	s := &Server{cfg: cfg, store: st, agents: map[string]*peer{}, clients: map[string]*peer{}, byAgent: map[string]map[string]*peer{}, maintenanceDone: make(chan struct{}), stun: stun}
+	if err := s.startVerifier(); err != nil {
+		return nil, err
+	}
+	go s.maintainClients()
+	return s, nil
 }
 func sameOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
@@ -66,8 +98,12 @@ func sameOrigin(r *http.Request) bool {
 	u, err := url.Parse(origin)
 	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, r.Host)
 }
+
+var assetVersionPattern = regexp.MustCompile(`^\d{8}-\d+$`)
+
 func staticResponseHeaders(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	versionedAsset := path == "/app.js" || path == "/styles.css" || path == "/dsh-theme.css" || path == "/pwa.js" || path == "/theme.js"
 	switch {
 	case strings.HasPrefix(path, "/api/"):
 		w.Header().Set("Cache-Control", "no-store")
@@ -78,7 +114,7 @@ func staticResponseHeaders(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
 	case strings.HasPrefix(path, "/icons/"):
 		w.Header().Set("Cache-Control", "public, max-age=86400")
-	case r.URL.Query().Get("v") == protocol.Version && (path == "/app.js" || path == "/styles.css" || path == "/pwa.js"):
+	case versionedAsset && assetVersionPattern.MatchString(r.URL.Query().Get("v")):
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 	if path == "/manifest.webmanifest" {
@@ -91,6 +127,7 @@ func (s *Server) Handler() http.Handler {
 	enrollLimiter := newIPRateLimiter(30, 10)
 	claimLimiter := newIPRateLimiter(10, 5)
 	mux.HandleFunc("GET /update.json", s.updateManifest)
+	mux.HandleFunc("GET /android-update.json", s.androidUpdateManifest)
 	mux.HandleFunc("GET /updates/{file}", s.updatePackage)
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "service": "codexrm", "version": protocol.Version})
@@ -111,7 +148,7 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'")
 		staticResponseHeaders(w, r)
 		if !sameOrigin(r) {
 			fail(w, 403, "origin not allowed")
@@ -228,7 +265,7 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 	if req.DeviceType == "" {
 		req.DeviceType = "browser"
 	}
-	c, a, err := s.store.ClaimPairing(req.Code, req.ClientName, req.DeviceType)
+	c, a, err := s.store.ClaimPairing(req.Code, req.ClientName, req.DeviceType, clientIP(r))
 	if err != nil {
 		status := 400
 		switch {
@@ -312,7 +349,15 @@ func (s *Server) listClients(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "unauthorized")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"data": s.store.ListClients(a.AgentID)})
+	rows := make([]protocol.ClientInfo, 0)
+	for _, c := range s.store.ListClients(a.AgentID) {
+		row := protocol.ClientInfo{ClientID: c.ClientID, ClientName: c.ClientName, DeviceType: c.DeviceType, CreatedAt: c.CreatedAt.Format(time.RFC3339Nano), LastIP: c.LastIP}
+		if !c.LastConnectedAt.IsZero() {
+			row.LastConnectedAt = c.LastConnectedAt.Format(time.RFC3339Nano)
+		}
+		rows = append(rows, row)
+	}
+	writeJSON(w, 200, map[string]any{"data": rows})
 }
 
 func (s *Server) deleteClient(w http.ResponseWriter, r *http.Request) {
@@ -342,6 +387,9 @@ func (s *Server) agentWS(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "unauthorized")
 		return
 	}
+	if err := s.store.SetAgentAppVersion(a.AgentID, r.Header.Get(protocol.AppVersionHeader)); err != nil {
+		log.Printf("update agent version: %v", err)
+	}
 	s.upgrade(w, r, protocol.RoleAgent, a.AgentID, "", a.ExpiresAt, token)
 }
 func (s *Server) clientWS(w http.ResponseWriter, r *http.Request) {
@@ -363,6 +411,8 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.R
 		return
 	}
 	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, conn: conn, send: make(chan protocol.Envelope, 256), closed: make(chan struct{}), expires: expires}
+	p.ip = clientIP(r)
+	p.directIP = s.directIP(r)
 	s.mu.Lock()
 	if role == protocol.RoleAgent {
 		a, authErr := s.store.AuthenticateAgent(token)
@@ -378,22 +428,38 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.R
 			p.close()
 			return
 		}
+		if err := s.store.RecordClientConnection(clientID, p.ip, time.Now(), false); err != nil {
+			s.mu.Unlock()
+			log.Printf("record client connection: %v", err)
+			p.close()
+			return
+		}
 	}
 	if role == protocol.RoleAgent {
 		if old := s.agents[agentID]; old != nil {
 			old.close()
+			for _, c := range s.byAgent[agentID] {
+				s.stopDirect(c)
+			}
 		}
 		s.agents[agentID] = p
 		s.store.SetAgentOnline(agentID, true)
 	} else {
 		if old := s.clients[clientID]; old != nil {
 			old.close()
+			s.stopDirect(old)
 		}
 		s.clients[clientID] = p
 		if s.byAgent[agentID] == nil {
 			s.byAgent[agentID] = map[string]*peer{}
 		}
 		s.byAgent[agentID][clientID] = p
+		if a := s.agents[agentID]; a != nil && a.directCapable {
+			s.sendDirect(a, p, protocol.P2P("join", ""))
+			if s.directAvailable(a, p) {
+				s.sendDirect(p, p, protocol.P2P("available", ""))
+			}
+		}
 	}
 	s.mu.Unlock()
 	if role == protocol.RoleAgent {
@@ -447,12 +513,19 @@ func (s *Server) readPump(p *peer) {
 		changed := false
 		if p.role == protocol.RoleAgent {
 			if s.agents[p.agentID] == p {
+				for _, c := range s.byAgent[p.agentID] {
+					s.stopDirect(c)
+				}
 				delete(s.agents, p.agentID)
 				s.store.SetAgentOnline(p.agentID, false)
 				changed = true
 			}
 		} else {
 			if s.clients[p.clientID] == p {
+				s.stopDirect(p)
+				if a := s.agents[p.agentID]; a != nil && a.directCapable {
+					s.sendDirect(a, p, protocol.P2P("leave", ""))
+				}
 				delete(s.clients, p.clientID)
 				delete(s.byAgent[p.agentID], p.clientID)
 			}
@@ -465,10 +538,19 @@ func (s *Server) readPump(p *peer) {
 	}()
 	p.conn.SetReadLimit(16 << 20)
 	_ = p.conn.SetReadDeadline(time.Now().Add(65 * time.Second))
-	p.conn.SetPongHandler(func(string) error { return p.conn.SetReadDeadline(time.Now().Add(65 * time.Second)) })
+	p.conn.SetPongHandler(func(string) error {
+		if err := s.recordClientHeartbeat(p); err != nil {
+			return err
+		}
+		return p.conn.SetReadDeadline(time.Now().Add(65 * time.Second))
+	})
 	for {
 		var env protocol.Envelope
 		if p.conn.ReadJSON(&env) != nil {
+			return
+		}
+		if err := s.recordClientHeartbeat(p); err != nil {
+			log.Printf("record client heartbeat: %v", err)
 			return
 		}
 		if !p.expires.IsZero() && time.Now().After(p.expires) {
@@ -482,9 +564,18 @@ func (s *Server) readPump(p *peer) {
 		if env.Type == protocol.TypePong {
 			continue
 		}
+		if env.Type == protocol.TypeP2P {
+			s.handleDirect(p, env)
+			continue
+		}
 		if p.role == protocol.RoleClient {
 			if env.Type != protocol.TypeClientMessage || !json.Valid(env.Message) {
 				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "invalid RPC envelope"})
+				continue
+			}
+			var rpc struct{ Method string }
+			if json.Unmarshal(env.Message, &rpc) == nil && strings.HasPrefix(rpc.Method, protocol.DirectFilePrefix) {
+				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "文件管理仅支持 P2P 直连", StreamID: env.StreamID})
 				continue
 			}
 			s.mu.RLock()
@@ -495,22 +586,41 @@ func (s *Server) readPump(p *peer) {
 				continue
 			}
 			env.ClientID = p.clientID
+			env.SkipDirect, env.P2P = nil, nil
 			env.SeqID = s.seq.Add(1)
 			s.send(a, env)
 		} else if env.Type == protocol.TypeServerMessage {
 			env.SeqID = s.seq.Add(1)
 			s.mu.RLock()
+			if s.agents[p.agentID] != p {
+				s.mu.RUnlock()
+				return
+			}
+			skip := func(c *peer) bool {
+				if c.direct == nil || c.direct.agent != p || !c.direct.active || time.Now().After(c.direct.deadline) {
+					return false
+				}
+				for _, id := range env.SkipDirect {
+					if id == c.direct.id {
+						return true
+					}
+				}
+				return false
+			}
 			list := []*peer{}
 			if env.ClientID != "" {
-				if c := s.clients[env.ClientID]; c != nil && c.agentID == p.agentID {
+				if c := s.clients[env.ClientID]; c != nil && c.agentID == p.agentID && !skip(c) {
 					list = append(list, c)
 				}
 			} else {
 				for _, c := range s.byAgent[p.agentID] {
-					list = append(list, c)
+					if !skip(c) {
+						list = append(list, c)
+					}
 				}
 			}
 			s.mu.RUnlock()
+			env.SkipDirect, env.P2P = nil, nil
 			for _, c := range list {
 				s.send(c, env)
 			}
@@ -542,6 +652,12 @@ func (s *Server) broadcastStatus(agentID string) {
 
 // Close releases hijacked WebSockets, which http.Server.Shutdown does not own.
 func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		close(s.maintenanceDone)
+		if s.verifier != nil {
+			s.verifier.Close()
+		}
+	})
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, p := range s.agents {

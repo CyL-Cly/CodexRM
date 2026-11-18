@@ -64,11 +64,6 @@ func Install(ctx context.Context, binary, root string, opts Options) error {
 	if opts.CodexPath != "" {
 		cfg.CodexPath = opts.CodexPath
 	}
-	if opts.ManifestURL != "" {
-		if err := cfg.SetManifestURL(opts.ManifestURL); err != nil {
-			return err
-		}
-	}
 	if err := cfg.Normalize(); err != nil {
 		return err
 	}

@@ -69,7 +69,10 @@ func Launch(ctx context.Context, executable, cwd string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, executable, "app-server", "--listen", "stdio://")
+	// Release the durable writer as soon as the Agent unsubscribes an idle
+	// thread, so the desktop app can resume it immediately. This override is
+	// private to this process and does not change the user's Codex config.
+	cmd := exec.CommandContext(ctx, executable, "-c", "thread_unload_delay_secs=0", "app-server", "--listen", "stdio://")
 	hideChildProcess(cmd)
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = cwd

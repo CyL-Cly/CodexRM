@@ -35,6 +35,14 @@ func TestClientUpdateRoutes(t *testing.T) {
 	if response.StatusCode != 404 || response.Header.Get("Cache-Control") != "no-store" {
 		t.Fatal("unpublished update did not return an uncached 404")
 	}
+	response, err = http.Get(h.URL + "/android-update.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != 404 || response.Header.Get("Cache-Control") != "no-store" {
+		t.Fatal("unpublished Android update did not return an uncached 404")
+	}
 	data := []byte("windows ZIP bytes")
 	hash := sha256.Sum256(data)
 	m := updater.Manifest{VersionCode: 2, VersionName: "0.6.1", DownloadURL: "updates/client.zip", ReleaseNotes: "更新", FileSize: int64(len(data)), SHA256: hex.EncodeToString(hash[:])}
@@ -60,7 +68,7 @@ func TestClientUpdateRoutes(t *testing.T) {
 	if response.StatusCode != 200 || string(downloaded) != string(data) || response.Header.Get("Content-Type") != "application/zip" {
 		t.Fatal("public package download failed")
 	}
-	for _, path := range []string{"/updates/update.json", "/updates/..%5cstate.json", "/updates/missing.zip", "/updates/client.zip/extra"} {
+	for _, path := range []string{"/updates/update.json", "/updates/android-update.json", "/updates/..%5cstate.json", "/updates/missing.zip", "/updates/client.zip/extra"} {
 		response, err = http.Get(h.URL + path)
 		if err != nil {
 			t.Fatal(err)
@@ -69,6 +77,31 @@ func TestClientUpdateRoutes(t *testing.T) {
 		if response.StatusCode != 404 {
 			t.Fatalf("unexpected package path was served: %s", path)
 		}
+	}
+	androidData := []byte("Android APK bytes")
+	androidHash := sha256.Sum256(androidData)
+	androidManifest := updater.Manifest{VersionCode: 4, VersionName: "1.0.3", DownloadURL: "updates/mobile.apk", ReleaseNotes: "Android 更新", FileSize: int64(len(androidData)), SHA256: hex.EncodeToString(androidHash[:])}
+	androidJSON, _ := json.Marshal(androidManifest)
+	_ = os.WriteFile(filepath.Join(directory, "android-update.json"), androidJSON, 0600)
+	_ = os.WriteFile(filepath.Join(directory, "mobile.apk"), androidData, 0600)
+	response, err = http.Get(h.URL + "/android-update.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actualAndroid updater.Manifest
+	err = json.NewDecoder(response.Body).Decode(&actualAndroid)
+	_ = response.Body.Close()
+	if err != nil || actualAndroid != androidManifest || response.StatusCode != 200 || response.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("published Android manifest: %+v, %v", actualAndroid, err)
+	}
+	response, err = http.Get(h.URL + "/updates/mobile.apk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloaded, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != 200 || string(downloaded) != string(androidData) || response.Header.Get("Content-Type") != "application/vnd.android.package-archive" {
+		t.Fatal("public APK download failed")
 	}
 	_ = os.WriteFile(filepath.Join(directory, "update.json"), []byte("invalid JSON"), 0600)
 	response, err = http.Get(h.URL + "/update.json")

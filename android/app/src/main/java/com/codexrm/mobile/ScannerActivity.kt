@@ -64,9 +64,9 @@ internal class ScannerActivity : Activity(), TextureView.SurfaceTextureListener 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = Color.BLACK
-        window.navigationBarColor = Color.BLACK
-        val root = FrameLayout(this)
+        Ui.configureSystemBars(this, dark = true, background = Color.BLACK)
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        Ui.applyWindowInsets(root)
         texture = TextureView(this)
         texture.surfaceTextureListener = this
         root.addView(texture, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))

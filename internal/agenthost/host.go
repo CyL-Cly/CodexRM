@@ -35,13 +35,18 @@ type Host struct {
 	cancel                 context.CancelFunc
 	page                   settingsPage
 	openBrowser            func(string) error
+	startUpdate            func(*updater.Plan) error
+	newUpdater             func(updater.Config) (*updater.Updater, error)
+	pendingUpdate          *updater.Plan
+	updateRetryAt          time.Time
+	updateWake             chan struct{}
 }
 
 func New(path, installDir string, config clientconfig.Connection, base agent.Config) (*Host, error) {
 	if err := config.Normalize(); err != nil {
 		return nil, err
 	}
-	return &Host{path: path, installDir: installDir, config: config, base: base, version: 1, changed: make(chan struct{}, 1), openBrowser: desktop.OpenBrowser}, nil
+	return &Host{path: path, installDir: installDir, config: config, base: base, version: 1, changed: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), openBrowser: desktop.OpenBrowser, newUpdater: updater.New, startUpdate: func(plan *updater.Plan) error { return plan.StartHelper() }}, nil
 }
 
 func (h *Host) StateDir() string { return filepath.Dir(h.path) }
@@ -70,6 +75,23 @@ func (h *Host) Run(ctx context.Context) error {
 	// A configured server may be offline, and a new installation may have no
 	// Codex yet. Both must leave the tray and settings usable after an update.
 	updater.SignalReady()
+	updates := make(chan *updater.Plan)
+	updateDone := make(chan struct{})
+	go func() { defer close(updateDone); h.runUpdates(runCtx, updates) }()
+	defer func() {
+		h.cancel()
+		<-updateDone
+		h.opMu.Lock()
+		h.mu.Lock()
+		if h.pendingUpdate != nil {
+			h.pendingUpdate.Discard()
+			h.pendingUpdate = nil
+		}
+		h.mu.Unlock()
+		h.opMu.Unlock()
+	}()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for runCtx.Err() == nil {
 		h.mu.Lock()
 		cfg, version := h.config, h.version
@@ -77,44 +99,137 @@ func (h *Host) Run(ctx context.Context) error {
 		generationCtx, cancel := context.WithCancel(runCtx)
 		finished := make(chan struct{})
 		go func() { defer close(finished); h.runConnection(generationCtx, cfg, version) }()
-		updates := make(chan *updater.Plan)
-		updateDone := make(chan struct{})
-		go func() {
-			defer close(updateDone)
-			if h.installDir == "" || installation.IsPackaged() || h.base.Mock || !cfg.AutoUpdate || runtime.GOOS != "windows" {
-				return
+		reconfigure := false
+		for !reconfigure && runCtx.Err() == nil {
+			select {
+			case <-runCtx.Done():
+			case <-h.changed:
+				reconfigure = true
+			case plan := <-updates:
+				h.opMu.Lock()
+				h.queueUpdate(plan)
+				h.opMu.Unlock()
+			case <-h.updateWake:
+			case <-ticker.C:
 			}
-			u, err := updater.New(updater.Config{ServerURL: cfg.UpdateServer, ManifestURL: cfg.ManifestURL(), InstallDir: h.installDir, VersionCode: release.VersionCode, Args: []string{"--config", h.path}})
-			if err != nil {
-				log.Printf("automatic update: %v", err)
-				return
+			if !reconfigure && runCtx.Err() == nil {
+				h.opMu.Lock()
+				err := h.applyPendingUpdate()
+				h.opMu.Unlock()
+				if err != nil {
+					log.Printf("update postponed: %v", err)
+				}
 			}
-			u.Run(generationCtx, updates)
-		}()
-		select {
-		case <-runCtx.Done():
-		case <-h.changed:
-		case plan := <-updates:
-			h.opMu.Lock()
-			h.mu.Lock()
-			current := h.version == version && runCtx.Err() == nil
-			h.mu.Unlock()
-			if !current {
-				plan.Discard()
-			} else if err := plan.StartHelper(); err != nil {
-				plan.Discard()
-				log.Printf("automatic update postponed: %v", err)
-			} else {
-				log.Printf("applying update %s", plan.Manifest.VersionName)
-				h.cancel()
-			}
-			h.opMu.Unlock()
 		}
 		cancel()
 		<-finished
-		<-updateDone
 	}
 	return nil
+}
+
+func (h *Host) updaterConfig() updater.Config {
+	return updater.Config{ServerURL: clientconfig.DefaultUpdateServer, ManifestURL: clientconfig.DefaultUpdateServer + "update.json", InstallDir: h.installDir, VersionCode: release.VersionCode, Args: []string{"--config", h.path}}
+}
+
+func (h *Host) runUpdates(ctx context.Context, ready chan<- *updater.Plan) {
+	h.mu.Lock()
+	autoUpdate := h.config.AutoUpdate
+	h.mu.Unlock()
+	if h.installDir == "" || installation.IsPackaged() || h.base.Mock || !autoUpdate || runtime.GOOS != "windows" {
+		return
+	}
+	u, err := h.newUpdater(h.updaterConfig())
+	if err != nil {
+		log.Printf("automatic update: %v", err)
+		return
+	}
+	u.Run(ctx, ready)
+}
+
+// queueUpdate and applyPendingUpdate are serialized with settings and manual
+// checks by opMu. The pending package survives relay and settings reconnections.
+func (h *Host) queueUpdate(plan *updater.Plan) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ctx.Err() != nil || h.pendingUpdate != nil {
+		plan.Discard()
+		return
+	}
+	h.pendingUpdate = plan
+	log.Printf("update %s ready; waiting for conversations to finish", plan.Manifest.VersionName)
+}
+
+func (h *Host) applyPendingUpdate() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pendingUpdate == nil || h.ctx.Err() != nil || time.Now().Before(h.updateRetryAt) {
+		return nil
+	}
+	plan := h.pendingUpdate
+	start := func() error {
+		if err := h.startUpdate(plan); err != nil {
+			h.updateRetryAt = time.Now().Add(time.Minute)
+			return err
+		}
+		h.pendingUpdate = nil // The helper now owns the staged files.
+		log.Printf("applying update %s", plan.Manifest.VersionName)
+		h.cancel()
+		return nil
+	}
+	if h.active != nil && h.activeCtx.Err() == nil {
+		_, err := h.active.TryStartUpdate(start)
+		return err
+	}
+	return start()
+}
+
+// Manual checks use the same idle gate as automatic updates and return while a
+// conversation is still running, leaving the verified package pending.
+func (h *Host) checkForUpdate() (bool, error) {
+	return h.checkForUpdateMode(true)
+}
+
+func (h *Host) checkRemoteUpdate() (agent.UpdateResult, error) {
+	available, err := h.checkForUpdateMode(false)
+	return agent.UpdateResult{UpdateAvailable: available, UpdatePending: available}, err
+}
+
+func (h *Host) checkForUpdateMode(applyImmediately bool) (bool, error) {
+	h.opMu.Lock()
+	defer h.opMu.Unlock()
+	h.mu.Lock()
+	ctx := h.ctx
+	pending := h.pendingUpdate != nil
+	running := ctx != nil && ctx.Err() == nil
+	h.mu.Unlock()
+	if !running {
+		return false, errors.New("Agent 正在退出")
+	}
+	if h.installDir == "" || installation.IsPackaged() || runtime.GOOS != "windows" {
+		return false, errors.New("此版本由 Windows 管理更新，或未使用受管理的安装目录")
+	}
+	if pending {
+		return true, nil
+	}
+	u, err := h.newUpdater(h.updaterConfig())
+	if err != nil {
+		return false, err
+	}
+	plan, err := u.Prepare(ctx)
+	if err != nil || plan == nil {
+		return false, err
+	}
+	h.queueUpdate(plan)
+	if applyImmediately {
+		if err = h.applyPendingUpdate(); err != nil {
+			return true, err
+		}
+		select {
+		case h.updateWake <- struct{}{}:
+		default:
+		}
+	}
+	return true, nil
 }
 
 func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, version uint64) {
@@ -123,6 +238,7 @@ func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, v
 	}
 	base := h.base
 	base.ServerURL, base.EnrollmentKey = cfg.Server, cfg.EnrollmentKey
+	base.CheckForUpdate = h.checkRemoteUpdate
 	base.NoAutoPair = true
 	if cfg.Workspace != "" {
 		base.Cwd = cfg.Workspace
@@ -141,7 +257,7 @@ func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, v
 		return
 	}
 	h.mu.Lock()
-	if h.version != version {
+	if h.version != version || ctx.Err() != nil {
 		h.mu.Unlock()
 		return
 	}

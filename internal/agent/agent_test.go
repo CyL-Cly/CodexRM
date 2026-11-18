@@ -14,6 +14,8 @@ import (
 
 	"github.com/codexrm/codexrm/internal/appserver"
 	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/codexrm/codexrm/internal/release"
+	"github.com/gorilla/websocket"
 )
 
 func TestPairingInstructionsIncludeScannableLink(t *testing.T) {
@@ -56,9 +58,59 @@ func TestFailedApprovalWriteRemainsRetryable(t *testing.T) {
 	}
 	_ = app.Close()
 	a := &Agent{approvals: map[string]approval{"pending": {ID: mustJSON(12), Owner: "owner"}}}
-	a.handle(context.Background(), app, nil, protocol.Envelope{ClientID: "owner", Message: mustJSON(map[string]any{"id": "pending", "result": map[string]any{"decision": "accept"}})})
+	a.handle(context.Background(), app, nil, protocol.Envelope{ClientID: "owner", Message: mustJSON(map[string]any{"id": "pending", "result": map[string]any{"decision": "accept"}})}, nil)
 	if p, ok := a.approvals["pending"]; !ok || p.Sending {
 		t.Fatal("failed response was lost or left locked")
+	}
+}
+
+func TestMaskedRateLimitIsSurfacedAsRetryLimitHint(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+		want    string
+	}{
+		{
+			name:    "error notification with request id",
+			message: "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://sub2api.example/responses, request id: f9531027-82e3-4af9-8186-2db6ec892ec4",
+			want:    "exceeded retry limit, last status: 429 Too Many Requests, request id: f9531027-82e3-4af9-8186-2db6ec892ec4",
+		},
+		{
+			name:    "without request id",
+			message: "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://sub2api.example/responses",
+			want:    "exceeded retry limit, last status: 429 Too Many Requests",
+		},
+		{
+			name:    "other 503 body stays untouched",
+			message: "unexpected status 503 Service Unavailable: upstream connect error, url: https://sub2api.example/responses",
+			want:    "unexpected status 503 Service Unavailable: upstream connect error, url: https://sub2api.example/responses",
+		},
+		{
+			name:    "real 429 hint stays untouched",
+			message: "exceeded retry limit, last status: 429 Too Many Requests, request id: 0d9e9587-da96-462a-932a-002d5a5a4d50",
+			want:    "exceeded retry limit, last status: 429 Too Many Requests, request id: 0d9e9587-da96-462a-932a-002d5a5a4d50",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := mustJSON(map[string]any{"method": "error", "params": map[string]any{
+				"threadId": "thread", "turnId": "turn",
+				"error": map[string]any{"message": tc.message},
+			}})
+			var out struct {
+				Params struct {
+					Error struct {
+						Message string `json:"message"`
+					} `json:"error"`
+				} `json:"params"`
+			}
+			if err := json.Unmarshal(rewriteMaskedRateLimit(raw), &out); err != nil {
+				t.Fatal(err)
+			}
+			if out.Params.Error.Message != tc.want {
+				t.Fatalf("message = %q, want %q", out.Params.Error.Message, tc.want)
+			}
+		})
 	}
 }
 
@@ -107,5 +159,28 @@ func TestUnsavedRenewalIsPersistedBeforeAnotherEnroll(t *testing.T) {
 	}
 	if saved.Token != "renewed-token" {
 		t.Fatalf("saved token %q, want renewed token", saved.Token)
+	}
+}
+
+func TestRelayConnectionReportsCurrentVersion(t *testing.T) {
+	var reported atomic.Value
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reported.Store(r.Header.Get(protocol.AppVersionHeader))
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+	a := &Agent{cfg: Config{ServerURL: server.URL}, creds: creds{Token: "token", AgentID: "agent"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.session(ctx, nil); err == nil {
+		t.Fatal("closed relay was treated as a live session")
+	}
+	if reported.Load() != release.VersionName {
+		t.Fatalf("reported version %v, want %s", reported.Load(), release.VersionName)
 	}
 }

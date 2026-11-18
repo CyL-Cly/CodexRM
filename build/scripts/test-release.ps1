@@ -6,8 +6,12 @@ $scriptDir = Join-Path $testRoot 'build\scripts'
 [void][IO.Directory]::CreateDirectory($scriptDir)
 [void][IO.Directory]::CreateDirectory((Join-Path $testRoot 'internal\release'))
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release.ps1') -Destination (Join-Path $scriptDir 'release.ps1')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'client-install.ps1') -Destination (Join-Path $scriptDir 'client-install.ps1')
 $logPath = Join-Path $testRoot 'events.log'
 $previousLog = $env:CODEXRM_RELEASE_TEST_LOG
+$previousFixtureAgent = $env:CODEXRM_RELEASE_FIXTURE_AGENT
+$previousFixtureCode = $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE
+$previousFixtureName = $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE
 $env:CODEXRM_RELEASE_TEST_LOG = $logPath
 $goCommand = (Get-Command go -ErrorAction Stop).Source
 $fixtureSource = Join-Path $testRoot 'publisher.go'
@@ -16,11 +20,23 @@ $fixturePublisher = Join-Path $testRoot 'fixture-publisher.exe'
 package main
 
 import (
+    "bytes"
     "fmt"
     "os"
 )
 
 func main() {
+    if len(os.Args) == 2 && os.Args[1] == "--version" {
+        executable, err := os.Executable()
+        if err != nil { panic(err) }
+        contents, err := os.ReadFile(executable)
+        if err != nil { panic(err) }
+        marker := []byte("\nCODEXRM_FIXTURE_VERSION:")
+        index := bytes.LastIndex(contents, marker)
+        if index < 0 { os.Exit(2) }
+        fmt.Print(string(contents[index + len(marker):]))
+        return
+    }
     f, err := os.OpenFile(os.Getenv("CODEXRM_RELEASE_TEST_LOG"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
     if err != nil { panic(err) }
     defer f.Close()
@@ -29,6 +45,7 @@ func main() {
 '@ | Set-Content -LiteralPath $fixtureSource -Encoding UTF8
 & $goCommand build -o $fixturePublisher $fixtureSource
 if ($LASTEXITCODE) { throw 'Could not build the fixture publisher.' }
+$env:CODEXRM_RELEASE_FIXTURE_AGENT = $fixturePublisher
 function go {
     Add-Content -LiteralPath $env:CODEXRM_RELEASE_TEST_LOG -Value ('go:' + ($args -join ' ')) -Encoding UTF8
     $output = $null
@@ -55,9 +72,23 @@ if ($Linux) {
 @'
 param($OutputPath,$Server,$ReleaseNotes)
 Add-Content -LiteralPath $env:CODEXRM_RELEASE_TEST_LOG -Value 'package' -Encoding UTF8
+$match = [regex]::Match($OutputPath, '-v(\d+\.\d+\.\d+)-(\d+)\.zip$')
+if (-not $match.Success) { throw 'Fixture package filename has no release version.' }
+$name = $match.Groups[1].Value
+$code = [long]$match.Groups[2].Value
+$binaryName = if ($env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE) { $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE } else { $name }
+$binaryCode = if ($env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE) { [long]$env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE } else { $code }
+$testRoot = Split-Path -Parent $env:CODEXRM_RELEASE_TEST_LOG
+$stage = Join-Path $testRoot 'package-stage\CodexRM\bin'
+[void][IO.Directory]::CreateDirectory($stage)
+$agent = Join-Path $stage 'codexrm-agent.exe'
+Copy-Item -LiteralPath $env:CODEXRM_RELEASE_FIXTURE_AGENT -Destination $agent -Force
+$version = @{versionCode=$binaryCode;versionName=$binaryName} | ConvertTo-Json -Compress
+[IO.File]::AppendAllText($agent, "`nCODEXRM_FIXTURE_VERSION:" + $version, (New-Object Text.UTF8Encoding $false))
 [void][IO.Directory]::CreateDirectory((Split-Path -Parent $OutputPath))
-Set-Content -LiteralPath $OutputPath -Value 'ZIP fixture' -Encoding UTF8
-Set-Content -LiteralPath (Join-Path (Split-Path -Parent $OutputPath) 'update.json') -Value '{"versionCode":1}' -Encoding UTF8
+Compress-Archive -LiteralPath (Split-Path -Parent $stage) -DestinationPath $OutputPath -Force
+$manifest = @{versionCode=$code;versionName=$name;downloadUrl='updates/fixture.zip';fileSize=(Get-Item -LiteralPath $OutputPath).Length;sha256=(Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256).Hash.ToLowerInvariant()}
+[IO.File]::WriteAllText((Join-Path (Split-Path -Parent $OutputPath) 'update.json'), ($manifest | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 '@ | Set-Content -LiteralPath (Join-Path $scriptDir 'package-client.ps1') -Encoding UTF8
 @'
 param($Manifest)
@@ -135,6 +166,35 @@ try {
     Assert-Release (@($events | Where-Object { $_ -eq 'web:False' }).Count -eq 1) '-PublishOnly did not retry frontend deployment.'
     Write-Host 'PASS: Publish-only retries reuse artifacts and can rerun deployment and local verification without another version bump.'
 
+    $archive = Join-Path $testRoot 'build\dist\CodexRM-windows-amd64-v2.0.1-21.zip'
+    $manifestPath = Join-Path $testRoot 'build\dist\update.json'
+    $validManifest = [IO.File]::ReadAllText($manifestPath)
+    foreach ($field in @('versionCode','versionName')) {
+        $metadata = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($field -eq 'versionCode') { $metadata.versionCode = 20 } else { $metadata.versionName = '2.0.0' }
+        [IO.File]::WriteAllText($manifestPath, ($metadata | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+        Clear-Content -LiteralPath $logPath
+        $rejected = $false
+        try { & $releaseScript -Config $config -PublishOnly } catch { $rejected = $true }
+        Assert-Release $rejected "Publish-only accepted a manifest $field mismatch."
+        Assert-Release (-not @(Get-ReleaseEvents | Where-Object { $_ -eq 'publisher' }).Count) "A manifest $field mismatch reached upload."
+        [IO.File]::WriteAllText($manifestPath, $validManifest, (New-Object Text.UTF8Encoding $false))
+    }
+    Write-Host 'PASS: Publish-only rejects dist update.json versionCode/versionName mismatches before upload.'
+
+    $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE = '20'
+    $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE = '2.0.0'
+    & (Join-Path $scriptDir 'package-client.ps1') -OutputPath $archive
+    $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE = $null
+    $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE = $null
+    Clear-Content -LiteralPath $logPath
+    $rejected = $false
+    try { & $releaseScript -Config $config -PublishOnly } catch { $rejected = $true }
+    Assert-Release $rejected 'Publish-only accepted a ZIP client version mismatch.'
+    Assert-Release (-not @(Get-ReleaseEvents | Where-Object { $_ -eq 'publisher' }).Count) 'A ZIP client version mismatch reached upload.'
+    & (Join-Path $scriptDir 'package-client.ps1') -OutputPath $archive
+    Write-Host 'PASS: Publish-only executes and rejects a stale ZIP client before upload.'
+
     Clear-Content -LiteralPath $logPath
     Set-ReleaseVersion 30 '3.0.0'
     New-Item -ItemType File -Path (Join-Path $testRoot 'local-preflight.fail') -Force | Out-Null
@@ -148,6 +208,9 @@ try {
     Write-Host 'PASS: Local preflight failures stop before version changes, builds, uploads, or publication.'
 } finally {
     $env:CODEXRM_RELEASE_TEST_LOG = $previousLog
+    $env:CODEXRM_RELEASE_FIXTURE_AGENT = $previousFixtureAgent
+    $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE = $previousFixtureCode
+    $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE = $previousFixtureName
     $resolvedRoot = [IO.Path]::GetFullPath($testRoot)
     if ($resolvedRoot.StartsWith($tempRoot.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase) -and
         [IO.Path]::GetFileName($resolvedRoot).StartsWith('CodexRM-release-tests-')) {

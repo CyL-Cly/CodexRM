@@ -85,7 +85,7 @@ func TestManifestFormat(t *testing.T) {
 	}
 }
 
-func TestDailyChecksPersistAcrossRestartsAndServerChanges(t *testing.T) {
+func TestTwentyHourChecksPersistAcrossInstancesAndServerChanges(t *testing.T) {
 	var requests atomic.Int32
 	h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -106,13 +106,13 @@ func TestDailyChecksPersistAcrossRestartsAndServerChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted, _ := New(cfg)
-	restarted.now = func() time.Time { return now.Add(23*time.Hour + 59*time.Minute) }
+	restarted.now = func() time.Time { return now.Add(19*time.Hour + 59*time.Minute) }
 	if _, err = restarted.Check(context.Background()); err != nil || requests.Load() != 1 {
 		t.Fatalf("restarted agent checked too soon: %d, %v", requests.Load(), err)
 	}
 	restarted.now = func() time.Time { return now.Add(CheckInterval) }
 	if _, err = restarted.Check(context.Background()); err != nil || requests.Load() != 2 {
-		t.Fatalf("24h check missing: %d, %v", requests.Load(), err)
+		t.Fatalf("20h check missing: %d, %v", requests.Load(), err)
 	}
 	changed, _ := New(Config{ServerURL: h.URL + "/different", InstallDir: cfg.InstallDir, VersionCode: 1})
 	if changed.nextCheck() != 0 {
@@ -121,6 +121,59 @@ func TestDailyChecksPersistAcrossRestartsAndServerChanges(t *testing.T) {
 	restarted.now = func() time.Time { return now.Add(-time.Hour) }
 	if restarted.nextCheck() != 0 {
 		t.Fatal("clock correction suspended updates")
+	}
+}
+
+func TestRunAlwaysChecksAtStartupThenWaitsTwentyHours(t *testing.T) {
+	if CheckInterval != 20*time.Hour {
+		t.Fatalf("unexpected interval: %s", CheckInterval)
+	}
+	var requests atomic.Int32
+	checked := make(chan struct{}, 4)
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+		checked <- struct{}{}
+	}))
+	defer feed.Close()
+	cfg := Config{ServerURL: feed.URL, InstallDir: t.TempDir(), VersionCode: 1}
+	u, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A previous process checked moments ago; each new process still checks.
+	if _, err = u.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-checked
+	for i := 0; i < 2; i++ {
+		restarted, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); restarted.Run(ctx, make(chan *Plan)) }()
+		select {
+		case <-checked:
+		case <-time.After(time.Second):
+			cancel()
+			<-done
+			t.Fatal("startup check was throttled by the persisted interval")
+		}
+		select {
+		case <-checked:
+			t.Error("startup check immediately repeated")
+		case <-time.After(30 * time.Millisecond):
+		}
+		cancel()
+		<-done
+		if delay := restarted.nextCheck(); delay < CheckInterval-time.Minute || delay > CheckInterval {
+			t.Fatalf("next periodic check is not 20h after startup: %s", delay)
+		}
+	}
+	if requests.Load() != 3 {
+		t.Fatalf("unexpected startup checks: %d", requests.Load())
 	}
 }
 

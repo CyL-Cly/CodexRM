@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "20261116-9";
+const VERSION = "20261118-2";
 const CACHE_PREFIX = "codexrm";
 const SHELL_CACHE = `${CACHE_PREFIX}-shell-${VERSION}`;
 const PAGE_CACHE = `${CACHE_PREFIX}-pages-${VERSION}`;
@@ -9,7 +9,9 @@ const CURRENT_CACHES = new Set([SHELL_CACHE, PAGE_CACHE, RUNTIME_CACHE]);
 const SHELL_URLS = [
   "/",
   `/app.js?v=${VERSION}`,
+  `/theme.js?v=${VERSION}`,
   `/styles.css?v=${VERSION}`,
+  `/dsh-theme.css?v=${VERSION}`,
   `/pwa.js?v=${VERSION}`,
   `/manifest.webmanifest?v=${VERSION}`,
   `/icons/icon.svg?v=${VERSION}`,
@@ -17,7 +19,7 @@ const SHELL_URLS = [
   `/icons/icon-512.png?v=${VERSION}`,
   `/icons/maskable-512.png?v=${VERSION}`,
 ];
-const VERSIONED_PATHS = new Set(["/app.js", "/styles.css", "/pwa.js"]);
+const VERSIONED_PATHS = new Set(["/app.js", "/theme.js", "/styles.css", "/dsh-theme.css", "/pwa.js"]);
 const STATIC_PATHS = new Set([
   "/manifest.webmanifest",
   "/icons/icon.svg",

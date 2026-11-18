@@ -7,7 +7,7 @@ $fixture = [pscustomobject]@{versionCode=3;versionName='0.6.2';downloadUrl='http
 $manifest = Join-Path $testRoot 'update.json'
 $fixture | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8
 $rmConfig = [pscustomobject]@{server='https://rm.example/base';sshTarget='test-rm';updateDir='/opt/codexrm/data/updates';owner='codexrm'}
-$state = @{calls=(New-Object Collections.Generic.List[string]);mode='success'}
+$state = @{calls=(New-Object Collections.Generic.List[string]);mode='success';expectedUri='https://rm.example/base/update.json'}
 function ssh {
     $command = [string]$args[-1]
     $state.calls.Add($(if($command.Contains('mv -f')) {'activate'} else {'prepare'}))
@@ -20,7 +20,7 @@ function scp {
 function Invoke-WebRequest {
     param([switch]$UseBasicParsing,$Uri,$Headers,$TimeoutSec)
     $state.calls.Add('verify')
-    if ($Uri -cne 'https://rm.example/base/update.json') { throw 'Publication verified the wrong endpoint.' }
+    if ($Uri -cne $state.expectedUri) { throw 'Publication verified the wrong endpoint.' }
     if ($state.mode -eq 'wrong version') { return [pscustomobject]@{Content='{"versionCode":2}';Headers=@{'Cache-Control'='no-store'}} }
     return [pscustomobject]@{Content=($fixture|ConvertTo-Json);Headers=@{'Cache-Control'='no-store'}}
 }
@@ -28,6 +28,12 @@ try {
     & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -RM $rmConfig
     if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Manifest was not staged before activation and public verification.' }
     Write-Host 'PASS: Manifest is staged, atomically activated, and verified through the RM base URL.'
+    $state.calls.Clear()
+    $state.expectedUri = 'https://rm.example/base/android-update.json'
+    & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'android-update.json' -RM $rmConfig
+    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Android manifest was not published independently.' }
+    $state.expectedUri = 'https://rm.example/base/update.json'
+    Write-Host 'PASS: Android manifest uses its own remote filename and public endpoint.'
     $state.calls.Clear()
     $state.mode = 'upload failure'
     $rejected = $false

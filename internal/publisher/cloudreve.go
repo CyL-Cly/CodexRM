@@ -246,7 +246,7 @@ func (c *Client) VerifyAnonymous(ctx context.Context, link string, size int64, s
 	return nil
 }
 
-// Publish uploads only the ZIP, verifies its anonymous download, and updates the local manifest for RM publication.
+// Publish uploads only the release package, verifies its anonymous download, and updates the local manifest for RM publication.
 func (c *Client) Publish(ctx context.Context, archive, manifestPath string) (updater.Manifest, error) {
 	var m updater.Manifest
 	data, err := os.ReadFile(manifestPath)
@@ -270,7 +270,7 @@ func (c *Client) Publish(ctx context.Context, archive, manifestPath string) (upd
 	if size != m.FileSize || !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), m.SHA256) {
 		return m, errors.New("local package differs from update.json")
 	}
-	if err = c.Upload(ctx, filepath.Base(archive), f, size, "application/zip"); err != nil {
+	if err = c.Upload(ctx, filepath.Base(archive), f, size, packageContentType(archive)); err != nil {
 		return m, err
 	}
 	m.DownloadURL, err = c.Link(ctx, filepath.Base(archive))
@@ -281,4 +281,15 @@ func (c *Client) Publish(ctx context.Context, archive, manifestPath string) (upd
 		return m, err
 	}
 	return m, writeJSON(manifestPath, m)
+}
+
+func packageContentType(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".zip":
+		return "application/zip"
+	case ".apk":
+		return "application/vnd.android.package-archive"
+	default:
+		return "application/octet-stream"
+	}
 }

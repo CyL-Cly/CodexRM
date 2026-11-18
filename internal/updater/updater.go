@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const CheckInterval = 24 * time.Hour
+const CheckInterval = 20 * time.Hour
 const staleUpdateAge = 24 * time.Hour
 
 type Config struct {
@@ -75,7 +75,7 @@ func (u *Updater) nextCheck() time.Duration {
 		return 0
 	}
 	now := u.now()
-	// Clock corrections must not suspend updates for more than a day.
+	// Clock corrections must not suspend updates for more than one interval.
 	if state.LastCheck.After(now) {
 		return 0
 	}
@@ -86,9 +86,11 @@ func (u *Updater) nextCheck() time.Duration {
 	return delay
 }
 
-// Run persists the last attempt, so reconnecting or restarting does not reset the 24h interval.
+// Run checks immediately on process startup, then observes the persisted 20h
+// interval. The host keeps this loop alive across connection setting changes.
 func (u *Updater) Run(ctx context.Context, ready chan<- *Plan) {
-	delay := u.nextCheck()
+	delay := time.Duration(0)
+	startup := true
 	for {
 		timer := time.NewTimer(delay)
 		select {
@@ -97,9 +99,16 @@ func (u *Updater) Run(ctx context.Context, ready chan<- *Plan) {
 			return
 		case <-timer.C:
 		}
-		plan, err := u.Check(ctx)
+		var plan *Plan
+		var err error
+		if startup {
+			plan, err = u.Prepare(ctx)
+			startup = false
+		} else {
+			plan, err = u.Check(ctx)
+		}
 		if err != nil && ctx.Err() == nil {
-			log.Printf("automatic update: %v; next check in 24h", err)
+			log.Printf("automatic update: %v; next check in %s", err, CheckInterval)
 		}
 		if plan != nil {
 			select {
@@ -166,7 +175,7 @@ func (u *Updater) Inspect(ctx context.Context) (*Manifest, error) {
 	return &m, nil
 }
 
-// Prepare bypasses the daily interval for an explicit user-requested update.
+// Prepare bypasses the interval for startup and explicit user-requested checks.
 func (u *Updater) Prepare(ctx context.Context) (*Plan, error) {
 	if err := writeJSON(u.statePath(), checkState{ServerURL: u.cfg.ServerURL, ManifestURL: u.cfg.ManifestURL, LastCheck: u.now().UTC()}); err != nil {
 		return nil, err

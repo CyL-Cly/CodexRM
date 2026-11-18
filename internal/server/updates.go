@@ -10,8 +10,16 @@ import (
 )
 
 func (s *Server) updateManifest(w http.ResponseWriter, r *http.Request) {
+	s.serveUpdateManifest(w, "update.json")
+}
+
+func (s *Server) androidUpdateManifest(w http.ResponseWriter, r *http.Request) {
+	s.serveUpdateManifest(w, "android-update.json")
+}
+
+func (s *Server) serveUpdateManifest(w http.ResponseWriter, name string) {
 	w.Header().Set("Cache-Control", "no-store")
-	f, err := os.Open(filepath.Join(s.cfg.UpdateDir, "update.json"))
+	f, err := os.Open(filepath.Join(s.cfg.UpdateDir, name))
 	if os.IsNotExist(err) {
 		fail(w, http.StatusNotFound, "no client update published")
 		return
@@ -31,7 +39,8 @@ func (s *Server) updateManifest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) updatePackage(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("file")
-	if name != filepath.Base(name) || strings.ContainsAny(name, "/\\:") || !strings.EqualFold(filepath.Ext(name), ".zip") {
+	extension := strings.ToLower(filepath.Ext(name))
+	if name != filepath.Base(name) || strings.ContainsAny(name, "/\\:") || (extension != ".zip" && extension != ".apk") {
 		http.NotFound(w, r)
 		return
 	}
@@ -47,6 +56,10 @@ func (s *Server) updatePackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Content-Type", "application/zip")
+	if extension == ".apk" {
+		w.Header().Set("Content-Type", "application/vnd.android.package-archive")
+	} else {
+		w.Header().Set("Content-Type", "application/zip")
+	}
 	http.ServeContent(w, r, name, info.ModTime(), f)
 }

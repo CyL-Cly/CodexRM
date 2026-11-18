@@ -19,9 +19,12 @@ internal object ProtocolFormatter {
     fun fromItem(item: JSONObject): ChatMessage {
         val id = item.string("id").ifEmpty { "item-${item.hashCode()}" }
         val type = item.string("type")
+        val images = MessageImages.fromItem(item)
         return when (type) {
             "userMessage" -> ChatMessage(id, MessageKind.USER, "", userText(item))
-            "agentMessage", "planMessage" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"))
+            "agentMessage" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"), files = ArtifactCard.fromItem(item))
+            "planMessage" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"))
+            "imageView", "imageGeneration" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"), item.string("status"))
             "reasoning" -> ChatMessage(id, MessageKind.TOOL, "思考过程", reasoningText(item).bounded())
             "commandExecution" -> ChatMessage(
                 id, MessageKind.TOOL, "运行命令",
@@ -29,25 +32,27 @@ internal object ProtocolFormatter {
                     .filter { it.isNotEmpty() }.joinToString("\n\n"),
                 commandStatus(item),
             )
-            "fileChange" -> ChatMessage(id, MessageKind.TOOL, "文件变更", fileChanges(item.arrayAt("changes")), item.string("status"))
+            "fileChange" -> ChatMessage(id, MessageKind.TOOL, "文件变更", fileChanges(item.arrayAt("changes")), item.string("status"), files = ArtifactCard.fromItem(item))
             "diff" -> ChatMessage(id, MessageKind.TOOL, "本轮变更", item.string("diff").bounded(), "Diff")
             "plan" -> ChatMessage(id, MessageKind.TOOL, "执行计划", planText(item))
             "mcpToolCall" -> ChatMessage(
                 id, MessageKind.TOOL, "${item.string("server").ifEmpty { "MCP" }} / ${item.string("tool").ifEmpty { "工具" }}",
-                (item.opt("result") ?: item.opt("arguments") ?: JSONObject()).toPrettyString().bounded(), item.string("status"),
+                MessageImages.printable(item.opt("result") ?: item.opt("arguments") ?: JSONObject()).toPrettyString().bounded(), item.string("status"),
             )
+            "dynamicToolCall" -> ChatMessage(id, MessageKind.TOOL, item.string("tool").ifEmpty { "工具" },
+                MessageImages.printable(item.opt("contentItems") ?: item.opt("arguments")).toPrettyString().bounded(), item.string("status"))
             "webSearch" -> ChatMessage(
                 id, MessageKind.TOOL, "搜索 · ${item.string("query")}",
                 item.opt("action").toPrettyString().bounded(), item.string("status"),
             )
             "contextCompaction" -> ChatMessage(id, MessageKind.STATUS, "", "上下文已压缩")
             else -> ChatMessage(id, MessageKind.TOOL, type.ifEmpty { "执行事件" }, item.toPrettyString().bounded())
-        }
+        }.also { it.images = images }
     }
 
     fun update(message: ChatMessage, item: JSONObject) {
         val formatted = fromItem(item)
-        message.change(formatted.title, formatted.body, formatted.status)
+        message.change(formatted.title, formatted.body, formatted.status, formatted.images, formatted.files)
     }
 
     fun userText(item: JSONObject): String {
@@ -56,8 +61,12 @@ internal object ProtocolFormatter {
         for (index in 0 until content.length()) {
             val value = content.optJSONObject(index)
             val text = value?.string("text").orEmpty()
-            if (text.isNotEmpty()) parts += text
-            else if (value?.string("type") in setOf("image", "localImage")) parts += "[图片]"
+            if (text.isNotEmpty()) for (line in text.lineSequence()) {
+                val file = MessageImages.attachment(line)
+                if (file != null && file.string("name").isNotEmpty() && file.string("path").isNotEmpty()) {
+                    if (!MessageImages.isImage(file)) parts += "📎 ${file.string("name")} · ${AttachmentStore.sizeLabel(file.optLong("size"))}"
+                } else parts += line
+            }
         }
         return parts.joinToString("\n")
     }
@@ -73,9 +82,7 @@ internal object ProtocolFormatter {
             .put("excludeSlashTmp", false)
     }
 
-    fun input(text: String): JSONArray = JSONArray().put(
-        JSONObject().put("type", "text").put("text", text).put("text_elements", JSONArray()),
-    )
+    fun input(text: String, files: List<JSONObject> = emptyList()): JSONArray = AttachmentStore.input(text, files)
 
     fun requestTitle(message: JSONObject): String {
         val method = message.string("method")

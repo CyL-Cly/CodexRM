@@ -1,13 +1,15 @@
 param([int]$Port = 8080)
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$buildRoot = Split-Path -Parent $PSScriptRoot
+$root = Split-Path -Parent $buildRoot
+$webRoot = [IO.Path]::GetFullPath((Join-Path $root 'web'))
 Push-Location $root
 try {
     & (Join-Path $PSScriptRoot 'build.ps1')
-    $demoDir = Join-Path $root '.state/demo'
+    $demoDir = Join-Path $buildRoot '.state/demo'
     New-Item -ItemType Directory -Force -Path $demoDir | Out-Null
-    $serverArgs = '--addr 127.0.0.1:{0} --data "{1}"' -f $Port, (Join-Path $demoDir 'server')
-    $server = Start-Process -FilePath (Join-Path $root 'bin/codexrm-server.exe') -ArgumentList $serverArgs -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput (Join-Path $demoDir 'server.out.log') -RedirectStandardError (Join-Path $demoDir 'server.err.log') -PassThru
+    $serverArgs = '--addr 127.0.0.1:{0} --data "{1}" --web "{2}"' -f $Port, (Join-Path $demoDir 'server'), $webRoot
+    $server = Start-Process -FilePath (Join-Path $buildRoot 'bin/codexrm-server.exe') -ArgumentList $serverArgs -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput (Join-Path $demoDir 'server.out.log') -RedirectStandardError (Join-Path $demoDir 'server.err.log') -PassThru
     try {
         $url = "http://127.0.0.1:$Port"
         $ready = $false
@@ -18,7 +20,7 @@ try {
         if (-not $ready) { throw 'Server startup timed out' }
         . (Join-Path $PSScriptRoot 'client-install.ps1')
         $agentData = Join-Path $demoDir 'agent'
-        $agentBinary = Join-Path $root 'bin/codexrm-agent.exe'
+        $agentBinary = Join-Path $buildRoot 'bin/codexrm-agent.exe'
         $agentArgs = @('--server', $url, '--mock', '--data', $agentData)
         $agent = Start-Process -FilePath $agentBinary -ArgumentList (ConvertTo-CodexRMCommandLine $agentArgs) `
             -WorkingDirectory $root -WindowStyle Hidden -PassThru
