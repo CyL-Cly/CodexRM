@@ -63,6 +63,9 @@ func main() {
 	applyUpdate := flag.String("apply-update", "", "internal: apply a prepared update plan")
 	version := flag.Bool("version", false, "print release version as JSON and exit")
 	installationInfo := flag.Bool("installation-info", false, "print installation identity and configuration path as JSON and exit")
+	setupAction := flag.String("setup-action", "", "internal: perform an installer action")
+	setupDir := flag.String("setup-dir", "", "internal: installer target directory")
+	setupAutostart := flag.Bool("setup-autostart", false, "internal: record the setup startup preference")
 	restart := flag.Bool("restart", false, "stop the existing agent and restart the service")
 	settings := flag.Bool("settings", false, "open the local settings page")
 	uninstall := flag.Bool("uninstall", false, "uninstall this Windows installation")
@@ -77,8 +80,16 @@ func main() {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"packageFamilyName": installation.PackageFamilyName(), "configPath": *configPath, "executable": executable})
 		return
 	}
-	if installation.IsPackaged() && (*applyUpdate != "" || *installUpdate || *updateDir != "" || *uninstallDir != "") {
+	if installation.IsPackaged() && (*applyUpdate != "" || *installUpdate || *updateDir != "" || *uninstallDir != "" || *setupAction != "") {
 		log.Fatal("MSIX 版本由 Windows 管理安装和更新，请使用对应的 MSIX 或 App Installer 文件")
+	}
+	if *setupAction != "" {
+		if err := installation.SetupAction(*setupAction, *setupDir, *setupAutostart); err != nil {
+			// Inno captures this output and displays it in the setup wizard.
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 	if *applyUpdate != "" {
 		if err := updater.Apply(*applyUpdate); err != nil {
@@ -95,7 +106,7 @@ func main() {
 	*configPath, _ = filepath.Abs(*configPath)
 	root := filepath.Dir(filepath.Dir(*configPath))
 	if *uninstall {
-		if installation.IsPackaged() {
+		if installation.IsPackaged() || installation.UsesSetup(root) {
 			if err := desktop.OpenBrowser("ms-settings:appsfeatures"); err != nil {
 				log.Fatal(err)
 			}

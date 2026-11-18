@@ -4,15 +4,15 @@
 
 ## 原生客户端检查更新
 
-安装后的 Agent 直接检查、下载、替换和重启，不调用 PowerShell。设置入口位于系统托盘；设置页的“检查更新”会立即查询固定更新源，发现新版本后自动下载。存在进行中的对话、正在发送的请求或排队消息时，更新保持挂起，全部结束后自动安装。等待审批或用户输入、浏览器关闭以及中继断线均不会把进行中的对话视为空闲。设置页会显示待安装状态。也可重新运行在线安装器更新。更新只替换受管理的 Agent exe，保留连接设置、工作区、设备身份、配对关系和自启动设置。
+安装后的 Agent 直接检查、下载、替换和重启，不调用 PowerShell。设置入口位于系统托盘；设置页的“检查更新”会立即查询固定更新源，发现新版本后自动下载。存在进行中的对话、正在发送的请求或排队消息时，更新保持挂起，全部结束后自动安装。等待审批或用户输入、浏览器关闭以及中继断线均不会把进行中的对话视为空闲。设置页会显示待安装状态。也可重新运行安装器覆盖更新。更新只替换受管理的 Agent exe，保留连接设置、工作区、设备身份、配对关系和自启动设置。
 
 ```cmd
 bin\codexrm-agent.exe --check-update --update-dir "D:\Apps\CodexRM"
 ```
 
-`--check-update` 只查询清单，输出 JSON，不受自动检查间隔限制。内部的 `--install-update` 供临时副本在 Agent 停止后替换 exe；普通用户可直接重新运行在线安装器。
+`--check-update` 只查询清单，输出 JSON，不受自动检查间隔限制。内部的 `--install-update` 供临时副本在 Agent 停止后替换 exe；普通用户可直接运行新版安装器。
 
-旧的 `--update-manifest` 参数仅为兼容启动脚本而接受，不再改变 Agent 的更新源。在线安装器的 `--manifest` 仅影响本次安装包下载，不会保存为后续更新源。
+旧的 `--update-manifest` 参数仅为兼容启动脚本而接受，不再改变 Agent 的更新源。
 
 ## 自动更新
 
@@ -59,7 +59,7 @@ build\release.cmd nopause -TestLocalUpdate -LocalInstallDir "D:\Apps\CodexRM"
 build\release.cmd nopause -DeployServer -TestLocalUpdate
 ```
 
-脚本递增 `internal/release/release.go` 的 `VersionCode` 和 `VersionName` 补丁号，构建 Windows Agent，生成 `build/dist/CodexRM-windows-amd64-v{版本}-{版本代码}.zip`、`build/dist/update.json` 和 `build/dist/CodexRM-Setup.exe`。在线安装器内置 `{RM URL}/update.json`，用户双击即可下载并安装最新包；公共安装包和在线安装器都不包含注册密钥。`-DeployServer` 和 `-TestLocalUpdate` 默认关闭，不影响原有发布流程。
+脚本递增 `internal/release/release.go` 的 `VersionCode` 和 `VersionName` 补丁号，构建 Windows Agent，生成 `build/dist/CodexRM-windows-amd64-v{版本}-{版本代码}.zip`、`build/dist/update.json` 和 `build/dist/CodexRM-Setup.exe`。构建需要 Inno Setup 7。独立 EXE 内置当前版本的 Agent，可离线安装。公共安装包和安装器都不包含注册密钥。`-DeployServer` 和 `-TestLocalUpdate` 默认关闭，不影响原有发布流程。
 
 发布工具通过 Cloudreve v4 的 local/relay 分片上传接口上传 ZIP，生成永久匿名直链，实际匿名下载并校验通过后，才将包含直链的本地清单上传到 RM 更新目录的临时文件，保留上一份 `update.json.previous`，再重命名为 `update.json`。只在网盘上存放 ZIP，清单由 RM 路由提供；以后发布清单无需重启中继。上传工具直接连接网盘，避免继承构建代理。
 
@@ -92,7 +92,7 @@ build\release.cmd nopause -PublishOnly
 
 `versionCode` 为递增整数，仅大于本机时更新；`versionName` 为客户端版本，与中继协议版本独立。下载地址支持 HTTP(S) 完整 URL 或相对清单地址的路径。单个 ZIP 和解压后的受管理文件上限均为 512 MiB。
 
-单独打包可运行 `build/scripts/package-client.ps1`，在 ZIP 同目录生成包含版本、大小、SHA-256 的 `update.json`；`-DownloadUrl` 指定外部下载地址。安装包包含 Agent 和原生安装器，不携带远程连接地址或密钥。为兼容旧版自动更新器，ZIP 保留旧文件名的占位项；原生安装器及更新器只提取 Agent exe，全新安装不落地这些脚本。
+单独打包可运行 `build/scripts/package-client.ps1`，在 ZIP 同目录生成包含版本、大小、SHA-256 的 `update.json`；`-DownloadUrl` 指定外部下载地址。安装包包含 Agent 和 Inno Setup 安装器，不携带远程连接地址或密钥。为兼容旧版自动更新器，ZIP 保留旧文件名的占位项；更新器只提取 Agent exe，全新安装也不会写入这些脚本。
 
 ## 自托管更新源
 

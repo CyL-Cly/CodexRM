@@ -44,6 +44,9 @@ func Install(ctx context.Context, binary, root string, opts Options) error {
 	if filepath.Dir(root) == root {
 		return errors.New("不能安装到磁盘根目录")
 	}
+	if UsesSetup(root) {
+		return errors.New("请使用新版 CodexRM-Setup.exe 更新此安装")
+	}
 	configPath := filepath.Join(root, ".state", "connection.json")
 	cfg, err := clientconfig.Load(configPath)
 	if err != nil {
@@ -67,14 +70,8 @@ func Install(ctx context.Context, binary, root string, opts Options) error {
 	if err := cfg.Normalize(); err != nil {
 		return err
 	}
-	if err := desktop.Stop(filepath.Dir(configPath)); err != nil {
-		return err
-	}
-	if err := waitStopped(ctx, filepath.Dir(configPath)); err != nil {
-		return err
-	}
 	installed := filepath.Join(root, "bin", "codexrm-agent.exe")
-	if err := stopLegacy(ctx, installed); err != nil {
+	if err := stopInstalled(ctx, root); err != nil {
 		return err
 	}
 	if !strings.EqualFold(filepath.Clean(binary), installed) {
@@ -147,6 +144,9 @@ func Uninstall(ctx context.Context, root string) error {
 	if filepath.Dir(root) == root {
 		return errors.New("拒绝卸载磁盘根目录")
 	}
+	if UsesSetup(root) {
+		return errors.New("请在 Windows 设置中卸载 CodexRM")
+	}
 	// Only a directory carrying an installation marker and the agent can be removed.
 	if _, err := os.Stat(filepath.Join(root, ".state", "installation.json")); err != nil {
 		return errors.New("找不到 CodexRM 安装标记")
@@ -154,13 +154,7 @@ func Uninstall(ctx context.Context, root string) error {
 	if _, err := os.Stat(filepath.Join(root, "bin", "codexrm-agent.exe")); err != nil {
 		return err
 	}
-	if err := desktop.Stop(filepath.Join(root, ".state")); err != nil {
-		return err
-	}
-	if err := waitStopped(ctx, filepath.Join(root, ".state")); err != nil {
-		return err
-	}
-	if err := stopLegacy(ctx, filepath.Join(root, "bin", "codexrm-agent.exe")); err != nil {
+	if err := stopInstalled(ctx, root); err != nil {
 		return err
 	}
 	if err := unregister(root); err != nil {
@@ -195,4 +189,15 @@ func BeginUninstall(root string) error {
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+func stopInstalled(ctx context.Context, root string) error {
+	state := filepath.Join(root, ".state")
+	if err := desktop.Stop(state); err != nil {
+		return err
+	}
+	if err := waitStopped(ctx, state); err != nil {
+		return err
+	}
+	return stopLegacy(ctx, filepath.Join(root, "bin", "codexrm-agent.exe"))
 }

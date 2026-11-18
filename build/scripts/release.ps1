@@ -110,12 +110,11 @@ try {
         throw 'No built Linux Server binary. Run with -DeployServer without -PublishOnly first.'
     }
     $updateSource = ([string]$publishConfig.rm.server).TrimEnd('/') + '/update.json'
-    & (Join-Path $PSScriptRoot 'package-setup.ps1') -Manifest $updateSource
     & $publisher -config $Config -package $archive -manifest $manifest
     if ($LASTEXITCODE) { throw 'Cloudreve publication failed.' }
     & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -RM $publishConfig.rm
     Write-Host "Released: $archive"
-    Write-Host "Online installer: $(Join-Path $buildRoot 'dist\CodexRM-Setup.exe')"
+    if (-not $PublishOnly) { Write-Host "Offline installer: $(Join-Path $buildRoot 'dist\CodexRM-Setup.exe')" }
     Write-Host "Update source: $updateSource"
     if ($DeployServer) {
         & (Join-Path $PSScriptRoot 'deploy-server.ps1') -Binary $serverBinary -RM $publishConfig.rm

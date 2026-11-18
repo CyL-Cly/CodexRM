@@ -77,18 +77,18 @@ Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 
 
 需要在 Windows“已安装的应用”中使用 **移动** 更换安装磁盘时，使用原生 **MSIX 版 CodexRM Agent**，参见 [MSIX 安装与跨盘移动](docs/windows-msix.md)。可运行 `.\build\scripts\package-msix.ps1` 构建；MSIX 由 Windows 管理安装、移动、更新和卸载。
 
-首次安装只需下载 `CodexRM-Setup.exe` 并双击。选择安装目录后，Go 安装器下载并校验客户端；安装过程无需设置 RM URL 或密钥。首次启动自动打开本机设置页。离线 ZIP 完整解压后双击同名安装器，会直接使用包内文件安装。
+双击 `CodexRM-Setup.exe` 即可打开安装向导。安装器内置 Agent，支持自定义目录和离线安装。首次启动后可在本机设置页配置 RM URL 和密钥。
 
-默认安装到 `%LOCALAPPDATA%\CodexRM`，仅创建一个桌面快捷方式 **CodexRM 重启服务**，直接指向 `bin\codexrm-agent.exe --restart`。登录自启动直接运行 exe；从 Windows“已安装的应用”中可卸载。目标电脑需要已安装并登录或配置好 Codex 客户端，不需要 PowerShell、Go 或 npm。
+默认安装到 `%LOCALAPPDATA%\CodexRM`，提供开始菜单入口，可选登录自启动和桌面快捷方式。从 Windows「已安装的应用」中卸载。
+
+构建安装器需要 Inno Setup 7。
 
 ```powershell
-# 生成通用安装包，不包含远程连接地址或密钥
-.\build\scripts\package-client.ps1
-# 生成独立的在线安装器；省略 -Manifest 时使用发布配置中的 RM 更新源
-.\build\scripts\package-setup.ps1 -Manifest "https://your-server.example/update.json"
+.\build\scripts\build.ps1 -Target Agent
+.\build\scripts\package-setup.ps1
 ```
 
-安装包输出到 `build/dist`。安装器支持 `--install-dir`、`--workspace`、`--non-interactive` 等参数。详见 [Windows 安装说明](docs/windows-install.md)。
+安装器输出到 `build/dist`。详见 [Windows 安装说明](docs/windows-install.md)。
 
 已安装的 Windows EXE 客户端每次启动立即检查更新，之后每 20 小时检查固定更新服务器的 `update.json`，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。详见 [自动更新与发布](docs/updates.md)。
 
