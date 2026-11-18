@@ -20,6 +20,12 @@ bin\codexrm-agent.exe --check-update --update-dir "D:\Apps\CodexRM"
 
 发现更大的 `versionCode` 时，后台下载 ZIP，校验大小、SHA-256 及包内二进制版本，等待所有对话和排队消息结束后关闭 Codex app-server，由独立更新进程等待旧 Agent 退出、备份替换文件并隐藏启动新 Agent。已暂停的排队消息需恢复执行或移除后才会安装更新，防止重启丢失消息。开始安装与新请求接收共用互斥保护，防止空闲检查后插入新任务。更新辅助进程启动失败时保留待安装包，一分钟后重试。新版本必须在 60 秒内启动 Agent 管理循环；替换或启动失败会回滚文件并尝试启动原版本。服务器暂时不可达或尚未配置 Codex 时，托盘和设置页继续可用。日志写入 `.state/update.log`。
 
+## GitHub Nightly
+
+Nightly 工作流每天新加坡时间 00:23 检查默认分支前一整天的提交。有提交时，使用当天最后一个提交生成 GitHub 预发布版，包含 Windows / Linux amd64 的 Agent、Server 和 Web，以及 Android arm64 调试签名 APK。发布页同时提供 `SHA256SUMS.txt`。
+
+在 Actions 中手动运行 Nightly 时，工作流检查新加坡时间当天截至运行时的提交。夜间包通过 GitHub Releases 下载，正式更新继续使用各平台的 RM 清单。
+
 ## 一键发布到 Cloudreve
 
 全平台发布使用 `build\release-all.cmd`，先构建 Android 正式 APK，再发布 Windows Agent、部署 Linux RM 和 Web、发布 Android 更新，最后上传 Linux amd64 Agent 独立包，并将本地生成的 `build/dist/linux-agent-download.json` 发布到 RM 的 `/linux-update.json`。Windows MSIX 不在此流程内。

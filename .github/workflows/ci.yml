@@ -1,80 +1,152 @@
-name: CI
+name: Nightly
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  schedule:
+    # 00:23 the following day in Asia/Singapore.
+    - cron: '23 16 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  windows-install:
-    runs-on: windows-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Test atomic RM manifest publication without network access
-        shell: powershell
-        run: .\build\scripts\test-publish-manifest.ps1
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Test native installation, settings, restart, replacement and rollback
-        run: go test -race ./internal/installation ./internal/desktop ./internal/agenthost ./cmd/codexrm-setup ./internal/updater ./internal/server
-
-      - name: Test release and Server and frontend deployment without network access
-        shell: powershell
-        run: |
-          .\build\scripts\test-release.ps1
-          .\build\scripts\test-deploy-server.ps1
-          .\build\scripts\test-deploy-web.ps1
-
-  test:
+  select-commit:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.select.outputs.sha }}
+      tag: ${{ steps.select.outputs.tag }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Select the latest main commit for the build date
+        id: select
+        env:
+          # POSIX TZ syntax: Singapore is UTC+8 year-round.
+          TZ: SGT-8
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            day=$(date --date=yesterday +%F)
+          else
+            day=$(date +%F)
+          fi
+          start=$(date --date="$day 00:00:00 +0800" +%s)
+          end=$((start + 86400))
+          sha=$(git log --first-parent --format='%ct %H' | awk -v start="$start" -v end="$end" '$1 >= start && $1 < end && !found { print $2; found = 1 }')
+          if [[ -z "$sha" ]]; then
+            echo "No commits on the default branch for $day (Asia/Singapore)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tag="nightly-$day-${sha:0:12}"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            echo "Nightly $tag already exists." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf 'sha=%s\ntag=%s\n' "$sha" "$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: select-commit
+    if: needs.select-commit.outputs.sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TAG: ${{ needs.select-commit.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.select-commit.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: go.mod
-          cache: true
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Package Windows and Linux amd64
+        env:
+          CGO_ENABLED: 0
+          GOARCH: amd64
+        run: |
+          out="$PWD/nightly-dist"
+          windows="$RUNNER_TEMP/codexrm-windows-amd64"
+          linux="$RUNNER_TEMP/codexrm-linux-amd64"
+          mkdir -p "$out" "$windows" "$linux"
+          GOOS=windows go build -trimpath -ldflags "-s -w -H=windowsgui" -o "$windows/codexrm-agent.exe" ./cmd/codexrm-agent
+          GOOS=windows go build -trimpath -ldflags "-s -w" -o "$windows/codexrm-server.exe" ./cmd/codexrm-server
+          GOOS=linux go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-agent" ./cmd/codexrm-agent
+          GOOS=linux go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-server" ./cmd/codexrm-server
+          for stage in "$windows" "$linux"; do
+            git archive HEAD web | tar -x -C "$stage"
+            rm -f "$stage/web/app.test.mjs" "$stage/web/sw.test.mjs"
+            cp LICENSE "$stage/"
+          done
+          (cd "$windows" && zip -qr "$out/CodexRM-$TAG-windows-amd64.zip" .)
+          tar -czf "$out/CodexRM-$TAG-linux-amd64.tar.gz" -C "$linux" .
+
+      - uses: actions/setup-java@v6.3.0
         with:
-          node-version: 22
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
 
-      - name: Check Go formatting
-        run: test -z "$(gofmt -l cmd internal web)"
-
-      - name: Check module metadata
+      - name: Package Android arm64
         run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
+          # Read SDK pins from the selected source commit.
+          sdk=$(awk '$1 == "compileSdk" && $2 == "=" {print $3}' android/app/build.gradle.kts)
+          ndk=$(awk -F '"' '/^[[:space:]]*ndkVersion[[:space:]]*=/ {print $2}' android/app/build.gradle.kts)
+          sdkmanager --install "platforms;android-$sdk" "ndk;$ndk"
+          (cd android && bash gradlew --no-daemon :app:assembleDebug)
+          cp android/app/build/outputs/apk/debug/app-debug.apk "nightly-dist/CodexRM-$TAG-android-arm64-debug.apk"
 
-      - name: Vet and test Go packages
+      - name: Generate SHA-256 checksums
+        working-directory: nightly-dist
+        run: sha256sum CodexRM-* > SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ env.TAG }}
+          path: nightly-dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [select-commit, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.select-commit.outputs.tag }}
+      SOURCE_SHA: ${{ needs.select-commit.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: ${{ env.TAG }}
+          path: nightly-dist/
+
+      - name: Publish GitHub prerelease
+        working-directory: nightly-dist
         run: |
-          go vet ./...
-          go test -race ./...
-
-      - name: Build Go commands
-        run: go build ./cmd/...
-
-      - name: Check JavaScript syntax
-        run: |
-          node --check web/app.js
-          node --check web/pwa.js
-          node --check web/sw.js
-          node --check internal/agenthost/web/app.js
-
-      - name: Test browser logic
-        run: node --test web/app.test.mjs web/sw.test.mjs
+          sha256sum --check SHA256SUMS.txt
+          assets=(CodexRM-*.zip CodexRM-*.tar.gz CodexRM-*.apk SHA256SUMS.txt)
+          if existing=$(gh release view "$TAG" --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv'); then
+            read -r draft target <<< "$existing"
+            if [[ "$draft" != true ]]; then
+              echo "Nightly $TAG is already published."
+              exit 0
+            fi
+            [[ "$target" == "$SOURCE_SHA" ]]
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --draft=false --prerelease --latest=false
+          else
+            gh release create "$TAG" "${assets[@]}" --target "$SOURCE_SHA" --title "$TAG" \
+              --prerelease --latest=false --notes "Build from commit $SOURCE_SHA. The Android APK is debug-signed by the runner."
+          fi
