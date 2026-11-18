@@ -20,6 +20,22 @@
 
 附件分块经已配对的连接传到 Agent 数据目录的 `attachments/`，中继不保存文件；已发送的文件保留在电脑上供后续会话使用，手动移除后对应历史附件将无法下载。启用此功能需要同步更新网页、Agent 和 Server；旧 Agent 的附件入口会提示更新。
 
+## 界面预览
+
+### Web 工作区
+
+![CodexRM Web 工作区](docs/screenshots/web-workspace.png)
+
+### Windows Agent 设置
+
+<img src="docs/screenshots/agent-settings.png" alt="Windows Agent 设置页" width="640">
+
+### Android 客户端
+
+| 设备与工作区 | 模型选择 | P2P 直连 |
+| :---: | :---: | :---: |
+| <img src="docs/screenshots/android-workspaces.jpg" alt="Android 设备和工作区侧栏" width="220"> | <img src="docs/screenshots/android-model-picker.jpg" alt="Android 模型选择菜单" width="220"> | <img src="docs/screenshots/android-p2p.jpg" alt="Android P2P 直连与往返延迟" width="220"> |
+
 ## PWA 与加载缓存
 
 页面提供 Web App Manifest、桌面/移动端安装图标和 Service Worker，可通过浏览器“安装应用”使用独立窗口。首次在线访问后会预缓存应用壳，离线仍可打开界面和恢复本地草稿；远程设备连接、发送任务和同步会话仍需网络。
