@@ -90,19 +90,21 @@ build\release.cmd nopause -PublishOnly
 
 ## 自托管更新源
 
-服务端通过公开路由 `GET /update.json` 提供清单，默认从 `<服务端数据目录>/updates/update.json` 读取，可通过 `codexrm-server --updates /path/to/releases` 修改，响应使用 `Cache-Control: no-store`。清单下载地址默认指向 Cloudreve，也支持其他 HTTP(S) 直链。`GET /updates/{文件名}.zip` 保留用于直接托管 ZIP；使用 Cloudreve 时无需向 RM 上传 ZIP。
+RM 通过 `GET /update.json` 和 `GET /android-update.json` 发布清单，默认从 `<服务端数据目录>/updates/` 读取。可通过 `codexrm-server --updates /path/to/releases` 修改读取目录，清单响应使用 `Cache-Control: no-store`。
+
+将 Windows ZIP 和 Android APK 上传到 Cloudreve、OSS、EOS 等外部存储，把客户端可直接访问的完整 HTTP(S) 下载地址填入各自清单的 `downloadUrl`，然后将两份清单发布到 RM。
 
 ## Android 手动检查更新
 
 Android 在“侧栏 → 我的远程工作区 → 检查更新”中手动查询 `https://codexrm.dagongren.tech/android-update.json`。该清单与 Windows 版本号和 ZIP 完全独立，不跟随当前配对服务器变化，只有用户点击“立即更新”后才下载和安装。客户端下载 APK 到应用私有缓存，校验清单大小、SHA-256、APK 包名和版本后通过 `PackageInstaller` 覆盖安装。Android 12+ 在已允许“安装未知应用”、声明 `UPDATE_PACKAGES_WITHOUT_USER_ACTION` 且应用更新自身时，使用 `USER_ACTION_NOT_REQUIRED` 免除系统安装确认；系统不允许免确认的设备仍会显示确认界面。
 
-服务端从同一更新目录读取 `android-update.json` 并通过 `GET /android-update.json` 发布，APK 可通过 `GET /updates/{文件名}.apk` 直接托管，也可使用 Cloudreve 直链。签名 APK 使用独立脚本打包：
+签名 APK 使用独立脚本打包。手动发布到对象存储时，可用 `-DownloadUrl` 指定外部下载地址。
 
 ```powershell
 build\scripts\package-android.ps1 -ApkPath android\app\build\outputs\apk\release\app-release.apk -ReleaseNotes "更新说明"
 ```
 
-脚本读取 `android/app/build.gradle.kts` 的 `versionCode` 和 `versionName`，在 `build/dist/` 生成 APK 副本及 `android-update.json`。使用现有 `codexrm-publish` 上传 APK 后，以独立名称发布清单：
+脚本读取 `android/app/build.gradle.kts` 的 `versionCode` 和 `versionName`，在 `build/dist/` 生成 APK 副本及 `android-update.json`。使用 `codexrm-publish` 上传到 Cloudreve 时，工具会把清单的 `downloadUrl` 更新为 APK 的外部直链。确认下载地址可用后，运行下方命令发布 Android 清单。
 
 ```powershell
 $publish = Get-Content build/publish.config.json -Raw | ConvertFrom-Json
