@@ -128,6 +128,7 @@ func (s *Server) Handler() http.Handler {
 	claimLimiter := newIPRateLimiter(10, 5)
 	mux.HandleFunc("GET /update.json", s.updateManifest)
 	mux.HandleFunc("GET /android-update.json", s.androidUpdateManifest)
+	mux.HandleFunc("GET /linux-update.json", s.linuxUpdateManifest)
 	mux.HandleFunc("GET /updates/{file}", s.updatePackage)
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "service": "codexrm", "version": protocol.Version})

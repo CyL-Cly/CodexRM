@@ -201,6 +201,7 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | `GET /api/v1/health` | 健康检查 |
 | `GET /update.json` | Windows 客户端自动更新清单 |
 | `GET /android-update.json` | Android 客户端手动更新清单 |
+| `GET /linux-update.json` | Linux amd64 Agent 手动更新清单 |
 | `POST /api/v1/agent/enroll` | 注册/续期，远程注册需 `X-Enrollment-Key` |
 | `POST /api/v1/agent/pair` | Agent 生成配对码 |
 | `GET /api/v1/agent/pair/status` | 查询配对状态，需 Agent token |
@@ -213,7 +214,7 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | `GET /api/v1/client/ws` | 浏览器 WebSocket |
 | `GET /api/v1/agents` | 返回浏览器已授权的设备 |
 
-更新服务器只发布更新清单。客户端按清单中的 `downloadUrl` 从外部存储下载 Windows ZIP 或 Android APK。项目的发布脚本使用 Cloudreve，自托管时也可使用 OSS、EOS 等对象存储。详见 [客户端更新与发布](docs/updates.md)。
+更新服务器只发布更新清单。客户端按清单中的 `downloadUrl` 从外部存储下载对应平台的 ZIP 或 APK。项目的发布脚本使用 Cloudreve，自托管时也可使用 OSS、EOS 等对象存储。详见 [客户端更新与发布](docs/updates.md)。
 
 普通请求通过 `Authorization: Bearer <token>` 认证。浏览器 WebSocket 使用 `codexrm` 和 `codexrm.token.<token>` 子协议传递凭据，避免 token 出现在 URL 及普通访问日志中。中继的 `message` 包含 Codex JSON-RPC；`codexrm/info` 是 Agent 提供的运行状态接口。请求 ID 在 Agent 内映射，支持多个浏览器各自从相同 ID 开始发送请求。
 

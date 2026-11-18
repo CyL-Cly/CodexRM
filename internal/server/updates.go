@@ -17,6 +17,10 @@ func (s *Server) androidUpdateManifest(w http.ResponseWriter, r *http.Request) {
 	s.serveUpdateManifest(w, "android-update.json")
 }
 
+func (s *Server) linuxUpdateManifest(w http.ResponseWriter, r *http.Request) {
+	s.serveUpdateManifest(w, "linux-update.json")
+}
+
 func (s *Server) serveUpdateManifest(w http.ResponseWriter, name string) {
 	w.Header().Set("Cache-Control", "no-store")
 	f, err := os.Open(filepath.Join(s.cfg.UpdateDir, name))

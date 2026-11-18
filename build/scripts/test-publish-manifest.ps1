@@ -7,10 +7,16 @@ $fixture = [pscustomobject]@{versionCode=3;versionName='0.6.2';downloadUrl='http
 $manifest = Join-Path $testRoot 'update.json'
 $fixture | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8
 $rmConfig = [pscustomobject]@{server='https://rm.example/base';sshTarget='test-rm';updateDir='/opt/codexrm/data/updates';owner='codexrm'}
-$state = @{calls=(New-Object Collections.Generic.List[string]);mode='success';expectedUri='https://rm.example/base/update.json'}
+$state = @{calls=(New-Object Collections.Generic.List[string]);mode='success';expectedUri='https://rm.example/base/update.json';expectedName='update.json'}
 function ssh {
     $command = [string]$args[-1]
-    $state.calls.Add($(if($command.Contains('mv -f')) {'activate'} else {'prepare'}))
+    if ($command.Contains('mv -f')) {
+        $destination = "'$($rmConfig.updateDir)/$($state.expectedName)'"
+        if (-not $command.EndsWith($destination)) { throw 'Publication activated the wrong filename.' }
+        $state.calls.Add('activate')
+    } else {
+        $state.calls.Add('prepare')
+    }
     $global:LASTEXITCODE = 0
 }
 function scp {
@@ -29,11 +35,19 @@ try {
     if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Manifest was not staged before activation and public verification.' }
     Write-Host 'PASS: Manifest is staged, atomically activated, and verified through the RM base URL.'
     $state.calls.Clear()
+    $state.expectedName = 'android-update.json'
     $state.expectedUri = 'https://rm.example/base/android-update.json'
     & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'android-update.json' -RM $rmConfig
     if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Android manifest was not published independently.' }
-    $state.expectedUri = 'https://rm.example/base/update.json'
     Write-Host 'PASS: Android manifest uses its own remote filename and public endpoint.'
+    $state.calls.Clear()
+    $state.expectedName = 'linux-update.json'
+    $state.expectedUri = 'https://rm.example/base/linux-update.json'
+    & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'linux-update.json' -RM $rmConfig
+    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Linux Agent manifest was not published independently.' }
+    Write-Host 'PASS: Linux Agent manifest uses its own remote filename and public endpoint.'
+    $state.expectedName = 'update.json'
+    $state.expectedUri = 'https://rm.example/base/update.json'
     $state.calls.Clear()
     $state.mode = 'upload failure'
     $rejected = $false

@@ -22,7 +22,7 @@ bin\codexrm-agent.exe --check-update --update-dir "D:\Apps\CodexRM"
 
 ## 一键发布到 Cloudreve
 
-全平台发布使用 `build\release-all.cmd`，先构建 Android 正式 APK，再发布 Windows Agent、部署 Linux RM 和 Web、发布 Android 更新，最后上传 Linux amd64 Agent 独立包。Linux 下载链接写入 `build/dist/linux-agent-download.json`，不覆盖 Windows 或 Android 的更新清单。Windows MSIX 不在此流程内。
+全平台发布使用 `build\release-all.cmd`，先构建 Android 正式 APK，再发布 Windows Agent、部署 Linux RM 和 Web、发布 Android 更新，最后上传 Linux amd64 Agent 独立包，并将本地生成的 `build/dist/linux-agent-download.json` 发布到 RM 的 `/linux-update.json`。Windows MSIX 不在此流程内。
 
 ```cmd
 build\release-all.cmd nopause -ReleaseNotes "修复连接问题"
@@ -90,9 +90,13 @@ build\release.cmd nopause -PublishOnly
 
 ## 自托管更新源
 
-RM 通过 `GET /update.json` 和 `GET /android-update.json` 发布清单，默认从 `<服务端数据目录>/updates/` 读取。可通过 `codexrm-server --updates /path/to/releases` 修改读取目录，清单响应使用 `Cache-Control: no-store`。
+RM 通过 `GET /update.json`、`GET /android-update.json` 和 `GET /linux-update.json` 发布各平台清单，默认从 `<服务端数据目录>/updates/` 读取。可通过 `codexrm-server --updates /path/to/releases` 修改读取目录，清单响应使用 `Cache-Control: no-store`。
 
-将 Windows ZIP 和 Android APK 上传到 Cloudreve、OSS、EOS 等外部存储，把客户端可直接访问的完整 HTTP(S) 下载地址填入各自清单的 `downloadUrl`，然后将两份清单发布到 RM。
+将各平台的软件包上传到 Cloudreve、OSS、EOS 等外部存储，把客户端可直接访问的完整 HTTP(S) 下载地址填入对应清单的 `downloadUrl`，然后将清单发布到 RM。
+
+## Linux Agent 手动更新
+
+从 `https://codexrm.dagongren.tech/linux-update.json` 查询 Linux amd64 Agent 版本，按 `downloadUrl` 下载 ZIP，核对 `fileSize` 和 `sha256` 后解压。停止 Agent，替换 `codexrm-agent` 二进制，然后重新启动。
 
 ## Android 手动检查更新
 

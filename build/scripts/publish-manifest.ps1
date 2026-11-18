@@ -1,7 +1,7 @@
 param(
     [string]$Manifest,
     [Parameter(Mandatory=$true)]$RM,
-    [ValidateSet('update.json','android-update.json')][string]$Name = 'update.json',
+    [ValidateSet('update.json','android-update.json','linux-update.json')][string]$Name = 'update.json',
     [switch]$ValidateOnly
 )
 $ErrorActionPreference = 'Stop'

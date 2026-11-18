@@ -114,6 +114,49 @@ func TestClientUpdateRoutes(t *testing.T) {
 	}
 }
 
+func TestLinuxAgentUpdateManifest(t *testing.T) {
+	directory := t.TempDir()
+	s, err := server.New(server.Config{DataDir: t.TempDir(), UpdateDir: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	handler := s.Handler()
+
+	linux := updater.Manifest{VersionCode: 16, VersionName: "0.6.15", DownloadURL: "https://storage.example/linux-amd64.zip", FileSize: 100, SHA256: strings.Repeat("a", 64)}
+	windows := linux
+	windows.DownloadURL = "https://storage.example/windows-amd64.zip"
+	for _, check := range []struct {
+		name string
+		want updater.Manifest
+	}{
+		{"update.json", windows},
+		{"linux-update.json", linux},
+	} {
+		path := "/" + check.name
+		missing := httptest.NewRecorder()
+		handler.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, path, nil))
+		if missing.Code != http.StatusNotFound || missing.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("unpublished %s returned %d with cache policy %q", path, missing.Code, missing.Header().Get("Cache-Control"))
+		}
+
+		body, err := json.Marshal(check.want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, check.name), body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		published := httptest.NewRecorder()
+		handler.ServeHTTP(published, httptest.NewRequest(http.MethodGet, path, nil))
+		var actual updater.Manifest
+		err = json.NewDecoder(published.Body).Decode(&actual)
+		if err != nil || actual != check.want || published.Code != http.StatusOK || published.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("published %s returned %d and %+v: %v", path, published.Code, actual, err)
+		}
+	}
+}
+
 func TestCustomUpdateDirectory(t *testing.T) {
 	directory := t.TempDir()
 	s, err := server.New(server.Config{DataDir: t.TempDir(), UpdateDir: directory})

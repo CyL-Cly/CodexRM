@@ -64,7 +64,7 @@ function Publish-LinuxAgent {
     if ($LASTEXITCODE) { throw 'Publisher build failed.' }
     & $publisher -config $Config -package $archive -manifest $manifest
     if ($LASTEXITCODE) { throw 'Standalone Linux Agent publication failed; retry with -LinuxOnly.' }
-    Write-Host "Linux Agent download manifest: $manifest"
+    & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -RM $cfg.rm -Name 'linux-update.json'
 }
 
 $lock = $null
@@ -75,6 +75,7 @@ try {
     try {
         $lock = [IO.File]::Open((Join-Path $bin '.all-release.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     } catch { throw 'Another all-platform release is running, or the release lock cannot be opened.' }
+    & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -RM $cfg.rm -Name 'linux-update.json' -ValidateOnly
     if (-not $LinuxOnly) {
         & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -RM $cfg.rm -ValidateOnly
         & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -RM $cfg.rm -Name 'android-update.json' -ValidateOnly
