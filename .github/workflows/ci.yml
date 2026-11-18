@@ -95,6 +95,8 @@ jobs:
           java-version: '17'
           cache: gradle
 
+      - uses: android-actions/setup-android@v4.0.4
+
       - name: Package Android arm64
         run: |
           # Read SDK pins from the selected source commit.
