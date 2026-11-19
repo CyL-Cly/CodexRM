@@ -11,6 +11,7 @@ internal data class Device(
     var os: String = "",
     var appVersion: String = "",
     var online: Boolean = false,
+    var pendingAgentUpdateFrom: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("clientId", clientId)
@@ -20,6 +21,13 @@ internal data class Device(
         .put("serverName", serverName)
         .put("os", os)
         .put("appVersion", appVersion)
+        .put("pendingAgentUpdateFrom", pendingAgentUpdateFrom.takeIf { it.isNotBlank() })
+
+    fun confirmAgentUpdate(version: String): Boolean {
+        if (pendingAgentUpdateFrom.isBlank() || version.isBlank() || version == pendingAgentUpdateFrom) return false
+        pendingAgentUpdateFrom = ""
+        return true
+    }
 
     companion object {
         fun fromJson(value: JSONObject): Device = Device(
@@ -30,6 +38,7 @@ internal data class Device(
             serverName = value.string("serverName").ifEmpty { "CodexRM" },
             os = value.string("os"),
             appVersion = value.string("appVersion"),
+            pendingAgentUpdateFrom = value.string("pendingAgentUpdateFrom"),
         )
 
         fun fromClaim(serverUrl: String, value: JSONObject): Device {
@@ -52,6 +61,9 @@ internal data class Device(
     }
 }
 
+internal const val WORKSPACE_THREAD_FOLD_THRESHOLD = 15
+internal const val WORKSPACE_RECENT_THREAD_LIMIT = 10
+
 internal data class ThreadSummary(
     val id: String,
     val title: String,
@@ -59,7 +71,9 @@ internal data class ThreadSummary(
     val active: Boolean,
     val updatedAt: Long = 0,
     val createdAt: Long = 0,
-)
+) {
+    val lastActivityAt: Long get() = if (updatedAt != 0L) updatedAt else createdAt
+}
 
 internal data class Workspace(val name: String, val path: String)
 
@@ -70,6 +84,8 @@ internal data class ModelOption(
     val defaultEffort: String,
     val efforts: List<String>,
     val displayName: String = model,
+    val providerNotes: String = "",
+    val providerName: String = "",
 )
 
 internal enum class MessageKind { USER, ASSISTANT, TOOL, ERROR, STATUS }

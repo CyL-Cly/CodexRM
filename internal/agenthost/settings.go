@@ -1,7 +1,7 @@
 package agenthost
 
 import (
-	"crypto/rand"
+	"context"
 	"crypto/subtle"
 	"embed"
 	"encoding/base64"
@@ -10,11 +10,15 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/codexrm/codexrm/internal/agent"
 	"github.com/codexrm/codexrm/internal/clientconfig"
 	"github.com/codexrm/codexrm/internal/installation"
 	"github.com/codexrm/codexrm/internal/release"
@@ -25,12 +29,16 @@ import (
 var assets embed.FS
 
 type settingsPage struct {
-	mu         sync.Mutex
-	server     *http.Server
-	url, token string
+	mu     sync.Mutex
+	server *http.Server
+	url    string
 }
 
-// SettingsURL starts one lazy, loopback-only listener for this process lifetime.
+func (h *Host) settingsAccessPath() string {
+	return filepath.Join(h.StateDir(), settingsAccessFile)
+}
+
+// SettingsURL starts or reuses the settings listener for this process lifetime.
 func (h *Host) SettingsURL() (string, error) {
 	h.page.mu.Lock()
 	defer h.page.mu.Unlock()
@@ -41,54 +49,96 @@ func (h *Host) SettingsURL() (string, error) {
 		return "", errors.New("agent 尚未启动或已退出")
 	}
 	if h.page.server != nil {
-		return h.page.url + "/#" + h.page.token, nil
+		return h.page.url, nil
 	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	var listener net.Listener
+	var token string
+	var err error
+	if h.LANSettings {
+		listener, token, err = listenLANSettings(h.settingsAccessPath())
+	} else {
+		listener, err = net.Listen("tcp4", "127.0.0.1:0")
+		token = settingsSecret()
+	}
 	if err != nil {
 		return "", err
 	}
-	secret := make([]byte, 32)
-	if _, err = rand.Read(secret); err != nil {
-		listener.Close()
-		return "", err
+	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	localHost := net.JoinHostPort("127.0.0.1", port)
+	h.page.url = "http://" + localHost + "/"
+	if !h.LANSettings {
+		h.page.url += "#" + token
 	}
-	h.page.token = base64.RawURLEncoding.EncodeToString(secret)
-	h.page.url = "http://" + listener.Addr().String()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/settings", h.settings)
 	mux.HandleFunc("/api/update", h.update)
 	mux.HandleFunc("/api/pair", h.pair)
 	mux.HandleFunc("/api/devices", h.devices)
 	mux.HandleFunc("/api/devices/", h.devices)
+	if wxSupported {
+		mux.HandleFunc("/api/wx/accounts", h.wxList)
+		mux.HandleFunc("/api/wx/{action}", h.wxSettings)
+	}
 	root, _ := fs.Sub(assets, "web")
 	mux.Handle("/", http.FileServer(http.FS(root)))
-	h.page.server = &http.Server{Handler: h.guard(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	h.page.server = &http.Server{Handler: guardSettings(mux, localHost, token, h.LANSettings), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	go h.page.server.Serve(listener)
-	return h.page.url + "/#" + h.page.token, nil
+	return h.page.url, nil
 }
 
 func (h *Host) closePage() {
 	h.page.mu.Lock()
 	defer h.page.mu.Unlock()
 	if h.page.server != nil {
+		// Let a manual Linux update return its result before we re-exec.
+		if h.linuxUpdate != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_ = h.page.server.Shutdown(ctx)
+			cancel()
+		}
 		_ = h.page.server.Close()
+		h.page.server = nil
+		h.page.url = ""
 	}
 }
 
-func (h *Host) guard(next http.Handler) http.Handler {
+// Require the literal address of the receiving interface to reject DNS rebinding.
+func matchesSettingsInterface(r *http.Request) bool {
+	local, ok := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	host, port, err := net.SplitHostPort(r.Host)
+	if err != nil || port != strconv.Itoa(local.Port) {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.WithZone("").Unmap() == local.AddrPort().Addr().WithZone("").Unmap()
+}
+
+func guardSettings(next http.Handler, localHost, secret string, lan bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-		if r.Host != strings.TrimPrefix(h.page.url, "http://") || (r.Header.Get("Origin") != "" && r.Header.Get("Origin") != h.page.url) || r.Header.Get("Sec-Fetch-Site") == "cross-site" {
-			http.Error(w, "仅允许本机设置页面访问", http.StatusForbidden)
+		validHost := r.Host == localHost
+		if lan {
+			validHost = matchesSettingsInterface(r)
+		}
+		origin := r.Header.Get("Origin")
+		if !validHost || (origin != "" && origin != "http://"+r.Host) || r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			http.Error(w, "请直接通过 Agent 的 IP 地址打开设置页面", http.StatusForbidden)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(token), []byte(h.page.token)) != 1 {
-				http.Error(w, "请从托盘重新打开设置页面", http.StatusUnauthorized)
+			token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(secret)) != 1 {
+				if lan {
+					respond(w, http.StatusUnauthorized, map[string]any{"error": "请输入正确的设置密码", "passwordRequired": true})
+				} else {
+					http.Error(w, "请从托盘重新打开设置页面", http.StatusUnauthorized)
+				}
 				return
 			}
 		}
@@ -105,20 +155,81 @@ func failure(w http.ResponseWriter, err error) {
 	respond(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 }
 
-func (h *Host) snapshot() map[string]any {
+type Status struct {
+	State           agent.ConnectionState `json:"state"`
+	Error           string                `json:"error,omitempty"`
+	LastConnectedAt *time.Time            `json:"lastConnectedAt,omitempty"`
+	NextRetryAt     *time.Time            `json:"nextRetryAt,omitempty"`
+}
+
+func (h *Host) Status() Status {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	status := "未配置"
-	if h.config.Server != "" {
-		status = "正在连接"
-		if h.lastError != "" {
-			status = "连接失败"
+	if h.config.Server == "" {
+		return Status{}
+	}
+	if h.active != nil && h.activeVersion == h.version {
+		snapshot := h.active.ConnectionSnapshot()
+		lastConnectedAt := snapshot.LastConnectedAt
+		if lastConnectedAt != nil {
+			h.lastConnectedAt = lastConnectedAt
 		}
-		if h.active != nil && h.activeVersion == h.version && h.active.Connected() {
-			status = "已连接"
+		if lastConnectedAt == nil {
+			lastConnectedAt = h.lastConnectedAt
+		}
+		return Status{State: snapshot.State, Error: snapshot.Error, LastConnectedAt: lastConnectedAt, NextRetryAt: snapshot.NextRetryAt}
+	}
+	state := h.connectionState
+	if state == "" {
+		state = agent.Connecting
+	}
+	return Status{State: state, Error: h.lastError, LastConnectedAt: h.lastConnectedAt, NextRetryAt: h.nextRetryAt}
+}
+
+func (h *Host) snapshot() map[string]any {
+	h.mu.Lock()
+	server, keySet := h.config.Server, h.config.EnrollmentKey != ""
+	pending := h.pendingUpdate != nil
+	updaterInstance := h.activeUpdater
+	h.mu.Unlock()
+	connection := h.Status()
+	status := "未配置"
+	switch connection.State {
+	case agent.Connecting:
+		status = "正在连接"
+	case agent.Connected:
+		status = "已连接"
+	case agent.Retrying:
+		status = "等待重试"
+	case agent.Degraded:
+		status = "功能受限"
+	}
+	updateStatus := ""
+	if pending {
+		updateStatus = "更新已校验，等待进行中的对话和排队消息结束后安装并重启。"
+	} else if updaterInstance != nil {
+		s := updaterInstance.Snapshot()
+		switch s.Phase {
+		case "checking":
+			updateStatus = "正在检查更新。"
+		case "error":
+			updateStatus = "更新检查失败"
+			if s.Error != "" {
+				updateStatus += "：" + s.Error
+			}
+			if retry := s.NextRetryAt; retry != nil {
+				updateStatus += "；下次重试 " + retry.Local().Format("15:04:05")
+			}
+		case "ready":
+			updateStatus = "新版本 " + s.TargetVersion + " 已校验。"
+		case "up-to-date":
+			updateStatus = "当前已是最新版本"
+			if !s.LastSuccessfulCheck.IsZero() {
+				updateStatus += "；最近检查 " + s.LastSuccessfulCheck.Local().Format("2006-01-02 15:04")
+			}
 		}
 	}
-	return map[string]any{"server": h.config.Server, "enrollmentKeySet": h.config.EnrollmentKey != "", "updatePending": h.pendingUpdate != nil, "status": status, "error": h.lastError, "version": release.VersionName, "packaged": installation.IsPackaged()}
+	return map[string]any{"server": server, "enrollmentKeySet": keySet, "updatePending": pending, "updateStatus": updateStatus, "updateMode": h.updateMode(), "status": status, "state": connection.State, "error": connection.Error, "lastConnectedAt": connection.LastConnectedAt, "nextRetryAt": connection.NextRetryAt, "version": release.VersionName, "packaged": installation.IsPackaged(), "wxSupported": wxSupported}
 }
 
 func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +286,8 @@ func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 	h.config = cfg
 	h.version++
 	h.lastError = ""
+	h.connectionState = agent.Connecting
+	h.nextRetryAt = nil
 	h.mu.Unlock()
 	select {
 	case h.changed <- struct{}{}:

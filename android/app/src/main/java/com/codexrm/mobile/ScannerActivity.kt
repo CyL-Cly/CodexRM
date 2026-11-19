@@ -77,7 +77,6 @@ internal class ScannerActivity : Activity(), TextureView.SurfaceTextureListener 
         }
         top.addView(Ui.button(this, "取消") { finish() })
         val torchButton = Ui.button(this, "手电筒") { toggleTorch() }
-        val torchParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.END)
         top.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         root.addView(top)
         root.addView(torchButton, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.END).apply {

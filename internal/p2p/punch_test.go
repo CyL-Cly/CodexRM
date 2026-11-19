@@ -17,7 +17,7 @@ func TestAgentProbesStartExactThenExpandAndRetry(t *testing.T) {
 	a := netip.MustParseAddrPort("203.0.113.1:40000")
 	b := netip.MustParseAddrPort("203.0.113.2:65535")
 	private := netip.MustParseAddrPort("192.168.2.10:40000")
-	p := agentProbes{exact: []netip.AddrPort{a, b, private}}
+	p := agentProbes{exact: []netip.AddrPort{a, b, private}, budget: maxProbeTargets}
 	now := time.Now()
 	expandAt := now.Add(exactWindow(protocol.P2PMappingStable, protocol.P2PMappingStable))
 	for i, want := range p.exact {
@@ -47,14 +47,32 @@ func TestAgentProbesStartExactThenExpandAndRetry(t *testing.T) {
 	if got := p.next(expandAt.Add(candidateRetry), expandAt); !slices.Contains(p.exact, got) {
 		t.Fatalf("did not retry exact targets during expansion: %v", got)
 	}
-	if got := expandedTargets([]netip.AddrPort{private, netip.MustParseAddrPort("100.64.1.1:40000")}, 0); len(got) != 0 {
+	if got := expandedTargets([]netip.AddrPort{private, netip.MustParseAddrPort("100.64.1.1:40000")}, 0, maxProbeTargets); len(got) != 0 {
 		t.Fatal("expanded non-public addresses")
+	}
+}
+
+func TestDualNATProbeBudget(t *testing.T) {
+	exact := []netip.AddrPort{netip.MustParseAddrPort("203.0.113.8:20000"), netip.MustParseAddrPort("192.168.1.8:20000")}
+	extra := expandedTargets(exact, 0, dualNATProbeTargets)
+	if len(exact)+len(extra) != dualNATProbeTargets {
+		t.Fatalf("unexpected dual NAT target count: %d", len(exact)+len(extra))
+	}
+	seen := make(map[netip.AddrPort]bool)
+	for _, addr := range extra {
+		if seen[addr] || slices.Contains(exact, addr) || addr.Addr() != exact[0].Addr() || addr.Port() < 1024 {
+			t.Fatalf("unexpected expanded address %v", addr)
+		}
+		seen[addr] = true
+	}
+	if extra[0].Port() != 20001 {
+		t.Fatalf("nearest candidate was not tried first: %v", extra[0])
 	}
 }
 
 func TestLinearStepPrecedesNeighborhood(t *testing.T) {
 	exact := netip.MustParseAddrPort("203.0.113.8:20000")
-	p := agentProbes{exact: []netip.AddrPort{exact}, step: 4}
+	p := agentProbes{exact: []netip.AddrPort{exact}, step: 4, budget: maxProbeTargets}
 	expandAt := time.Now()
 	if got := p.next(expandAt, expandAt); got != exact {
 		t.Fatalf("exact retry = %v", got)
@@ -85,7 +103,7 @@ func TestPunchContinuesPastAnUnconfirmedPair(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		_, addr, err := s.punch(ctx, []netip.AddrPort{a, b}, nil, exactWindow("", ""), 0)
+		_, addr, err := s.punch(ctx, []netip.AddrPort{a, b}, nil, exactWindow("", ""), 0, false)
 		done <- result{addr, err}
 	}()
 	waitSelected := func(c *net.UDPConn) {
@@ -138,7 +156,7 @@ func TestMobileUsesOneSocketForFastPath(t *testing.T) {
 	defer cancel()
 	// The alternate target makes expansion eligible, but we should not reach it.
 	targets := []netip.AddrPort{src, netip.MustParseAddrPort("192.0.2.8:40000")}
-	i, addr, err := s.punch(ctx, targets, nil, exactWindow(protocol.P2PMappingStable, protocol.P2PMappingStable), 0)
+	i, addr, err := s.punch(ctx, targets, nil, exactWindow(protocol.P2PMappingStable, protocol.P2PMappingStable), 0, false)
 	if err != nil || i != 0 || addr != src || len(s.sockets) != 1 {
 		t.Fatalf("fast path socket=%d addr=%v err=%v sockets=%d", i, addr, err, len(s.sockets))
 	}

@@ -64,55 +64,58 @@ func TestFailedApprovalWriteRemainsRetryable(t *testing.T) {
 	}
 }
 
-func TestMaskedRateLimitIsSurfacedAsRetryLimitHint(t *testing.T) {
-	cases := []struct {
-		name    string
-		message string
-		want    string
-	}{
-		{
-			name:    "error notification with request id",
-			message: "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://sub2api.example/responses, request id: f9531027-82e3-4af9-8186-2db6ec892ec4",
-			want:    "exceeded retry limit, last status: 429 Too Many Requests, request id: f9531027-82e3-4af9-8186-2db6ec892ec4",
-		},
-		{
-			name:    "without request id",
-			message: "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://sub2api.example/responses",
-			want:    "exceeded retry limit, last status: 429 Too Many Requests",
-		},
-		{
-			name:    "other 503 body stays untouched",
-			message: "unexpected status 503 Service Unavailable: upstream connect error, url: https://sub2api.example/responses",
-			want:    "unexpected status 503 Service Unavailable: upstream connect error, url: https://sub2api.example/responses",
-		},
-		{
-			name:    "real 429 hint stays untouched",
-			message: "exceeded retry limit, last status: 429 Too Many Requests, request id: 0d9e9587-da96-462a-932a-002d5a5a4d50",
-			want:    "exceeded retry limit, last status: 429 Too Many Requests, request id: 0d9e9587-da96-462a-932a-002d5a5a4d50",
-		},
+func TestUpstream503NotificationPassesThrough(t *testing.T) {
+	raw := mustJSON(map[string]any{"method": "error", "params": map[string]any{
+		"threadId": "thread", "turnId": "turn",
+		"error": map[string]any{"message": upstream503Message},
+	}})
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		a := &Agent{relay: conn}
+		a.forward(raw)
+	}))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			raw := mustJSON(map[string]any{"method": "error", "params": map[string]any{
-				"threadId": "thread", "turnId": "turn",
-				"error": map[string]any{"message": tc.message},
-			}})
-			var out struct {
-				Params struct {
-					Error struct {
-						Message string `json:"message"`
-					} `json:"error"`
-				} `json:"params"`
-			}
-			if err := json.Unmarshal(rewriteMaskedRateLimit(raw), &out); err != nil {
-				t.Fatal(err)
-			}
-			if out.Params.Error.Message != tc.want {
-				t.Fatalf("message = %q, want %q", out.Params.Error.Message, tc.want)
-			}
-		})
+	defer conn.Close()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var got protocol.Envelope
+	if err := conn.ReadJSON(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != protocol.TypeServerMessage || string(got.Message) != string(raw) {
+		t.Fatalf("forwarded notification = %s, want %s", got.Message, raw)
 	}
 }
+
+func TestUpstream503InRPCResultPassesThrough(t *testing.T) {
+	result := mustJSON(map[string]any{"turn": map[string]any{
+		"status": "failed", "error": map[string]any{"message": upstream503Message},
+	}})
+	var got protocol.Envelope
+	send := func(env protocol.Envelope) error {
+		got = env
+		return nil
+	}
+	a := &Agent{}
+	a.respond(send, protocol.Envelope{Message: json.RawMessage(`{"id":1}`)}, result, nil)
+	want := mustJSON(map[string]any{"id": 1, "result": result})
+	if got.Type != protocol.TypeServerMessage || string(got.Message) != string(want) {
+		t.Fatalf("forwarded RPC response = %s, want %s", got.Message, want)
+	}
+}
+
+const upstream503Message = "unexpected status 503 Service Unavailable: Service temporarily unavailable, url: https://provider.example/responses, request id: upstream-123"
 
 func TestUnsavedRenewalIsPersistedBeforeAnotherEnroll(t *testing.T) {
 	var enrollRequests atomic.Int32

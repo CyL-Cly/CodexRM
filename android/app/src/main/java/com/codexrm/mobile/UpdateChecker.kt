@@ -23,9 +23,13 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.security.MessageDigest
+import java.time.OffsetDateTime
+import java.time.ZoneId
 
 internal object UpdateChecker {
-    const val MANIFEST_URL = "https://codexrm.dagongren.tech/android-update.json"
+    private const val UPDATE_ORIGIN = "https://codexrm.dagongren.tech"
+    const val MANIFEST_URL = "$UPDATE_ORIGIN/android-update.json"
+    private const val HISTORY_URL = "$UPDATE_ORIGIN/release-history.json"
     const val MAX_PACKAGE_SIZE = 512L * 1024L * 1024L
     private const val MAX_MANIFEST_SIZE = 1024 * 1024
     private val main by lazy { Handler(Looper.getMainLooper()) }
@@ -68,10 +72,33 @@ internal object UpdateChecker {
         )
     }
 
-    fun fetchLatest(callback: (VersionInfo?, ApiException?) -> Unit): Call {
+    data class ReleaseNote(val versionName: String, val date: String, val notes: String)
+
+    fun fetchLatest(callback: (VersionInfo?, ApiException?) -> Unit): Call =
+        fetchJson(MANIFEST_URL, { parseManifest(it) }, callback)
+
+    fun fetchHistory(callback: (List<ReleaseNote>?, ApiException?) -> Unit): Call =
+        fetchJson(HISTORY_URL, ::parseHistory, callback)
+
+    internal fun parseHistory(text: String): List<ReleaseNote> {
+        val history = JSONObject(text)
+        require(history.optInt("schemaVersion") == 1) { "无法识别更新日志格式" }
+        val releases = history.getJSONArray("releases")
+        return (0 until releases.length()).mapNotNull { index ->
+            val release = releases.getJSONObject(index)
+            if (release.optString("platform") != "android") return@mapNotNull null
+            val publishedAt = release.optString("publishedAt")
+            val date = runCatching {
+                OffsetDateTime.parse(publishedAt).atZoneSameInstant(ZoneId.systemDefault()).toLocalDate().toString()
+            }.getOrDefault("")
+            ReleaseNote(release.getString("versionName"), date, release.optString("releaseNotes").trim())
+        }
+    }
+
+    private fun <T> fetchJson(url: String, parse: (String) -> T, callback: (T?, ApiException?) -> Unit): Call {
         val call = Network.client.newCall(
             Request.Builder()
-                .url(MANIFEST_URL)
+                .url(url)
                 .header("Accept", "application/json")
                 .header("Cache-Control", "no-cache")
                 .build(),
@@ -85,7 +112,7 @@ internal object UpdateChecker {
                 val result = runCatching {
                     response.use {
                         if (!it.isSuccessful) throw ApiException("更新服务器返回 HTTP ${it.code}", it.code)
-                        parseManifest(readManifest(it.body), MANIFEST_URL)
+                        parse(readManifest(it.body))
                     }
                 }
                 main.post {
@@ -93,7 +120,7 @@ internal object UpdateChecker {
                         onSuccess = { callback(it, null) },
                         onFailure = {
                             val error = it as? ApiException
-                                ?: ApiException("更新清单无效：${it.message ?: "无法解析"}")
+                                ?: ApiException("更新数据无效：${it.message ?: "无法解析"}")
                             callback(null, error)
                         },
                     )
@@ -250,7 +277,7 @@ internal object UpdateChecker {
     }
 
     @Suppress("DEPRECATION")
-    fun install(context: Context, apk: File, expectedVersionCode: Long): Boolean {
+    fun install(context: Context, apk: File, expectedVersionCode: Long, requestId: String) {
         val archive = if (Build.VERSION.SDK_INT >= 33) {
             context.packageManager.getPackageArchiveInfo(apk.absolutePath, PackageManager.PackageInfoFlags.of(0))
         } else {
@@ -274,6 +301,7 @@ internal object UpdateChecker {
             }
             val statusIntent = Intent(context, UpdateInstallReceiver::class.java)
                 .setAction(UpdateInstallReceiver.ACTION_INSTALL_STATUS)
+                .putExtra(UpdateInstallReceiver.EXTRA_REQUEST_ID, requestId)
             // PackageInstaller fills in status and user-action extras, so it rejects an immutable callback.
             // The status broadcast is sent by the system, which exempts the receiver's
             // install-confirmation launch from Android 14+ background-start restrictions.
@@ -284,7 +312,6 @@ internal object UpdateChecker {
                 PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0,
             )
             session.commit(pendingIntent.intentSender)
-            return true
         } catch (error: Exception) {
             session.abandon()
             throw error

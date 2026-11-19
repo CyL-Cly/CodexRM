@@ -21,7 +21,7 @@ type directPair struct {
 	agent                                                               *peer
 	deadline                                                            time.Time
 	agentTicket, clientTicket                                           string
-	lan                                                                 bool
+	lan, ipv6                                                           bool
 	agentOffer, clientOffer, agentReady, clientReady, requested, active bool
 }
 
@@ -70,10 +70,10 @@ func stunEndpoints(raw string) ([]string, error) {
 			continue
 		}
 		a, err := netip.ParseAddrPort(s)
-		if err != nil || !a.Addr().Is4() || a.Port() == 0 || len(endpoints) >= 4 {
-			return nil, fmt.Errorf("P2P STUN requires up to four IPv4:port endpoints")
+		if err != nil || a.Addr().Zone() != "" || a.Port() == 0 || len(endpoints) >= 4 {
+			return nil, fmt.Errorf("P2P STUN requires up to four IPv4:port or [IPv6]:port endpoints")
 		}
-		endpoints = append(endpoints, a.String())
+		endpoints = append(endpoints, netip.AddrPortFrom(a.Addr().Unmap(), a.Port()).String())
 	}
 	return endpoints, nil
 }
@@ -93,10 +93,19 @@ func (s *Server) directIP(r *http.Request) netip.Addr {
 	if r.TLS == nil && !(s.cfg.P2PTrustProxy && net.ParseIP(host).IsLoopback() && r.Header.Get("X-Forwarded-Proto") == "https") {
 		return netip.Addr{}
 	}
-	if !ip.Is4() || !ip.IsGlobalUnicast() {
-		return netip.Addr{}
+	if (ip.Is4() && ip.IsGlobalUnicast()) || p2p.IsPublicIPv6(ip) || (s.cfg.P2PLocalTest && ip.IsLoopback()) {
+		return ip
 	}
-	return ip
+	return netip.Addr{}
+}
+
+func stunForPair(endpoints []string, ipv6 bool) []string {
+	if ipv6 {
+		return endpoints
+	}
+	return slices.DeleteFunc(slices.Clone(endpoints), func(raw string) bool {
+		return netip.MustParseAddrPort(raw).Addr().Is6()
+	})
 }
 
 func (s *Server) sendDirect(to, client *peer, sig *protocol.P2PSignal) {
@@ -149,7 +158,7 @@ func (s *Server) lanEligible(agent, client *peer) bool {
 }
 
 func (s *Server) directAvailable(agent, client *peer) bool {
-	return client.directIP.IsValid() && (len(s.stun) > 0 || s.lanEligible(agent, client))
+	return agent.directIP.IsValid() && client.directIP.IsValid() && (len(s.stun) > 0 || s.lanEligible(agent, client))
 }
 
 func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
@@ -173,6 +182,8 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 				return
 			}
 			p.directCapable = true
+			p.dualNATPunchCapable = sig.DualNATPunch
+			p.ipv6Capable = sig.IPv6
 			p.lanCapable = sig.LAN
 			routing := protocol.P2P("routing", "")
 			for id := range s.byAgent[p.agentID] {
@@ -202,7 +213,9 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 	pair := client.direct
 	if sig.Kind == "begin" && p == client {
 		lan := sig.LAN && s.lanEligible(agent, client)
-		if !lan && len(s.stun) == 0 {
+		ipv6 := agent.ipv6Capable && sig.IPv6 && len(s.stun) > 0
+		stun := stunForPair(s.stun, ipv6)
+		if !lan && len(stun) == 0 {
 			return
 		}
 		if pair != nil || now.Sub(client.lastDirect) < protocol.P2PAttempt {
@@ -226,10 +239,11 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 		if _, err := rand.Read(key[:]); err != nil {
 			return
 		}
-		pair = &directPair{id: uuid.NewString(), agent: agent, deadline: now.Add(protocol.P2PAttempt), lan: lan}
+		pair = &directPair{id: uuid.NewString(), agent: agent, deadline: now.Add(protocol.P2PAttempt), lan: lan, ipv6: ipv6}
 		start := protocol.P2P("start", pair.id)
-		start.Secret, start.STUN = hex.EncodeToString(key[:]), s.stun
-		start.LAN = lan
+		start.Secret, start.STUN = hex.EncodeToString(key[:]), stun
+		start.LAN, start.IPv6 = lan, ipv6
+		start.DualNATPunch = len(stun) > 0 && agent.dualNATPunchCapable && sig.DualNATPunch
 		if s.verifier != nil {
 			var err error
 			if pair.agentTicket, err = s.verifier.Ticket(now); err != nil {
@@ -258,7 +272,11 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 	forward := protocol.P2P(sig.Kind, pair.id)
 	switch sig.Kind {
 	case "stop":
-		s.stopDirect(client)
+		if p == agent && !pair.active && pair.agentOffer && pair.clientOffer && sig.Reason == protocol.P2PReasonDualUnpredictableNAT {
+			s.stopDirectWithReason(client, sig.Reason)
+		} else {
+			s.stopDirect(client)
+		}
 		return
 	case "offer":
 		if (p == agent && pair.agentOffer) || (p == client && pair.clientOffer) {
@@ -283,6 +301,9 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			}
 			a, err := netip.ParseAddrPort(value)
 			if err != nil || a.Port() == 0 {
+				continue
+			}
+			if a.Addr().Is6() && (!pair.ipv6 || (!p2p.IsPublicIPv6(a.Addr()) && !(s.cfg.P2PLocalTest && a.Addr().IsLoopback()))) {
 				continue
 			}
 			verified := false

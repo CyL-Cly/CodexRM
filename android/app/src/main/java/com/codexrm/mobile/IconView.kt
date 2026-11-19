@@ -27,7 +27,13 @@ internal class IconView(context: Context, private var icon: String, color: Int =
         path.rewind()
         when (icon) {
             "terminal" -> { move(5,6); line(11,12); line(5,18); move(14,18); line(19,18) }
-            "edit" -> { move(12,20); line(4,20); line(4,12); move(14,4); line(20,10); move(8,16); line(10,10); line(18,2); line(22,6); line(14,14); close() }
+            "chat-plus" -> {
+                move(3.6f,20.9f)
+                cubic(5.1f,19.5f,6.3f,19.5f,7.7f,20.5f)
+                path.arcTo(2.5f, 2.5f, 21.5f, 21.5f, 117f, -325f, false)
+                move(8,12); line(16,12)
+                move(12,8); line(12,16)
+            }
             "search" -> { circle(11,11,7); move(16,16); line(21,21) }
             "plus" -> { move(12,5); line(12,19); move(5,12); line(19,12) }
             "refresh" -> { move(20,7); line(20,12); line(15,12); move(4,17); line(4,12); line(9,12); move(6,6); cubic(9,2,16,3,19,8); move(18,18); cubic(15,22,8,21,5,16) }
@@ -49,8 +55,11 @@ internal class IconView(context: Context, private var icon: String, color: Int =
             "arrow" -> { move(12,20); line(12,4); move(6,10); line(12,4); line(18,10) }
             "arrow-right" -> { move(4,12); line(20,12); move(14,6); line(20,12); line(14,18) }
             "stop" -> { rect(7,7,10,10,1) }
+            "play" -> { move(8,5); line(20,12); line(8,19); close() }
             "lock" -> { rect(6,10,12,11,1); move(8,10); line(8,7); cubic(8,2,16,2,16,7); line(16,10) }
             "copy" -> { rect(8,8,12,12,2); move(16,8); line(16,4); line(4,4); line(4,16); line(8,16) }
+            "camera" -> { move(4,6); line(8,6); line(10,3); line(14,3); line(16,6); line(20,6); line(21,7); line(21,19); line(20,20); line(4,20); line(3,19); line(3,7); close(); circle(12,13,3.5f) }
+            "image" -> { rect(3,3,18,18,3); circle(15.5f,8.5f,1.7f); move(3,16); line(8,11); line(18,21) }
             "attach" -> { move(8,13); line(15,6); cubic(19,2,23,7,19,11); line(10,20); cubic(4,25,-1,17,4,12); line(13,3) }
             else -> { move(8,6); line(2,12); line(8,18); move(16,6); line(22,12); line(16,18); move(14,3); line(10,21) }
         }

@@ -23,15 +23,19 @@ func loopbackUDP(t *testing.T) (*net.UDPConn, netip.AddrPort) {
 }
 
 func stunResponse(req []byte, addr netip.AddrPort) []byte {
-	b := make([]byte, 32)
+	ip := addr.Addr().AsSlice()
+	b := make([]byte, 28+len(ip))
 	copy(b, req)
 	binary.BigEndian.PutUint16(b, 0x101)
-	binary.BigEndian.PutUint16(b[2:], 12)
+	binary.BigEndian.PutUint16(b[2:], uint16(len(b)-20))
 	binary.BigEndian.PutUint16(b[20:], 0x20)
-	binary.BigEndian.PutUint16(b[22:], 8)
+	binary.BigEndian.PutUint16(b[22:], uint16(len(b)-24))
 	b[25] = 1
+	if addr.Addr().Is6() {
+		b[25] = 2
+	}
 	binary.BigEndian.PutUint16(b[26:], addr.Port()^0x2112)
-	for i, v := range addr.Addr().As4() {
+	for i, v := range ip {
 		b[28+i] = v ^ req[4+i]
 	}
 	return b
@@ -52,6 +56,41 @@ func TestBindingReplyMatchesTransaction(t *testing.T) {
 		if got := bindingReply(req, bad); got.IsValid() {
 			t.Fatalf("accepted invalid reply: %v", got)
 		}
+	}
+}
+
+func TestIPv6StunDoesNotAffectIPv4Mapping(t *testing.T) {
+	stun, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	t.Cleanup(func() { _ = stun.Close() })
+	stunAddr := stun.LocalAddr().(*net.UDPAddr).AddrPort()
+	mapped := netip.MustParseAddrPort("[2001:db8::ca:fe]:45000")
+	go func() {
+		var buf [20]byte
+		if n, from, err := stun.ReadFromUDPAddrPort(buf[:]); err == nil && n == len(buf) {
+			_, _ = stun.WriteToUDPAddrPort(stunResponse(buf[:], mapped), from)
+		}
+	}()
+	s := &Session{ipv6: true}
+	c, err := s.openSocket()
+	if err != nil || !s.ipv6 {
+		s.Close()
+		t.Skipf("no dual stack socket: %v", err)
+	}
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	qs := discover(ctx, c, protocol.P2PSignal{IPv6: true, STUN: []string{stunAddr.String()}})
+	if len(qs) != 1 || qs[0].mapped != mapped {
+		t.Fatalf("IPv6 discovery: %+v", qs)
+	}
+	wantV4 := netip.MustParseAddrPort("203.0.113.2:45000")
+	qs = append(qs, discoveryQuery{dst: netip.MustParseAddrPort("192.0.2.10:3478"), mapped: wantV4},
+		discoveryQuery{dst: netip.MustParseAddrPort("192.0.2.11:3478"), mapped: wantV4})
+	if hint := mappingHint(qs); hint != protocol.P2PMappingStable {
+		t.Fatalf("IPv6 result changed IPv4 mapping to %q", hint)
 	}
 }
 

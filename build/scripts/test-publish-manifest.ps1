@@ -14,13 +14,17 @@ function ssh {
         $destination = "'$($rmConfig.updateDir)/$($state.expectedName)'"
         if (-not $command.EndsWith($destination)) { throw 'Publication activated the wrong filename.' }
         $state.calls.Add('activate')
+    } elseif ($command.StartsWith('python3 ')) {
+        if (-not $state.seed -and -not $command.Contains("'$($state.expectedName)' '3'")) { throw 'History writer used the wrong manifest or version.' }
+        $state.calls.Add('record')
     } else {
         $state.calls.Add('prepare')
     }
     $global:LASTEXITCODE = 0
 }
 function scp {
-    $state.calls.Add('upload')
+    if ([string]$args[-2] -like '*record-release-history.py') { $state.calls.Add('stage history writer') }
+    else { $state.calls.Add('upload') }
     $global:LASTEXITCODE = $(if($state.mode -eq 'upload failure') {1} else {0})
 }
 function Invoke-WebRequest {
@@ -32,22 +36,28 @@ function Invoke-WebRequest {
 }
 try {
     & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -RM $rmConfig
-    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Manifest was not staged before activation and public verification.' }
+    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify,stage history writer,record') { throw 'Manifest was not staged before activation and public verification.' }
     Write-Host 'PASS: Manifest is staged, atomically activated, and verified through the RM base URL.'
     $state.calls.Clear()
     $state.expectedName = 'android-update.json'
     $state.expectedUri = 'https://rm.example/base/android-update.json'
     & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'android-update.json' -RM $rmConfig
-    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Android manifest was not published independently.' }
+    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify,stage history writer,record') { throw 'Android manifest was not published independently.' }
     Write-Host 'PASS: Android manifest uses its own remote filename and public endpoint.'
     $state.calls.Clear()
     $state.expectedName = 'linux-update.json'
     $state.expectedUri = 'https://rm.example/base/linux-update.json'
     & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'linux-update.json' -RM $rmConfig
-    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Linux Agent manifest was not published independently.' }
+    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify,stage history writer,record') { throw 'Linux Agent manifest was not published independently.' }
     Write-Host 'PASS: Linux Agent manifest uses its own remote filename and public endpoint.'
     $state.expectedName = 'update.json'
     $state.expectedUri = 'https://rm.example/base/update.json'
+    $state.calls.Clear()
+    $state.seed = $true
+    & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -RM $rmConfig -SeedHistory
+    if (($state.calls -join ',') -cne 'stage history writer,record') { throw 'History initialization replaced the active manifest.' }
+    $state.seed = $false
+    Write-Host 'PASS: History initialization uses the currently active manifests.'
     $state.calls.Clear()
     $state.mode = 'upload failure'
     $rejected = $false

@@ -11,7 +11,11 @@ import (
 	"strings"
 )
 
-const DefaultUpdateServer = "https://codexrm.dagongren.tech/"
+const (
+	DefaultRelayServer  = "https://codexrm.ooth.tech"
+	DefaultUpdateServer = "https://codexrm.dagongren.tech/"
+	LinuxUpdateManifest = DefaultUpdateServer + "linux-update.json"
+)
 
 // Connection retains the field names used by older installations.
 type Connection struct {
@@ -25,10 +29,10 @@ type Connection struct {
 }
 
 func Load(path string) (Connection, error) {
-	c := Connection{AutoUpdate: true}
+	c := Connection{AutoUpdate: true, UpdateServer: DefaultUpdateServer}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		c.UpdateServer = DefaultUpdateServer
+		c.Server = DefaultRelayServer
 		return c, nil
 	}
 	if err != nil {

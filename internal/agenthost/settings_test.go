@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -132,6 +133,27 @@ func TestLocalSettingsListenerLifetimeAndAccess(t *testing.T) {
 	if err == nil {
 		conn.Close()
 		t.Fatal("settings port remained open after shutdown")
+	}
+}
+
+func TestSettingsWeChatCapability(t *testing.T) {
+	_, base, token, _ := startHost(t, clientconfig.Connection{})
+	code, body := request(t, base, token, http.MethodGet, "/api/settings", nil)
+	var settings map[string]any
+	if code != http.StatusOK || json.Unmarshal(body, &settings) != nil {
+		t.Fatalf("settings: %d %s", code, body)
+	}
+	want := runtime.GOOS == "linux"
+	if settings["wxSupported"] != want {
+		t.Fatalf("WeChat capability on %s: got %v, want %v", runtime.GOOS, settings["wxSupported"], want)
+	}
+	if want {
+		return
+	}
+	for _, route := range []string{"/api/wx/accounts", "/api/wx/settings"} {
+		if code, _ := request(t, base, token, http.MethodGet, route, nil); code != http.StatusNotFound {
+			t.Errorf("%s on %s: got %d, want 404", route, runtime.GOOS, code)
+		}
 	}
 }
 

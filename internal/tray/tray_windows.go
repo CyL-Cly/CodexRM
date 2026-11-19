@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/getlantern/systray"
 )
@@ -20,10 +21,7 @@ var iconData []byte
 // Run owns the Windows message loop while the connector runs in the background.
 // The tray menu is the interactive shutdown path; closing it gracefully cancels
 // the connector so its app-server is not left behind.
-func Run(ctx context.Context, stateDir string, openSettings func(), run func(context.Context) error) error {
-	restoreLog := configureLog(filepath.Join(stateDir, "agent.log"))
-	defer restoreLog()
-
+func Run(ctx context.Context, _ string, openSettings func(), statusText func() string, run func(context.Context) error) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	runErr := make(chan error, 1)
@@ -46,8 +44,14 @@ func Run(ctx context.Context, stateDir string, openSettings func(), run func(con
 		quitItem := systray.AddMenuItem("退出 CodexRM", "停止连接器并关闭 Codex app-server")
 
 		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
 			for {
 				select {
+				case <-ticker.C:
+					title := statusText()
+					status.SetTitle(title)
+					systray.SetTooltip(title)
 				case <-settings.ClickedCh:
 					go openSettings()
 				case <-quitItem.ClickedCh:
@@ -74,7 +78,11 @@ func Run(ctx context.Context, stateDir string, openSettings func(), run func(con
 	return err
 }
 
-func configureLog(path string) func() {
+func ConfigureLog(path string) func() {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		log.Printf("agent log file disabled: %v", err)
+		return func() {}
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Printf("agent log file disabled: %v", err)

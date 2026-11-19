@@ -56,8 +56,8 @@ android {
         minSdk = 28
         targetSdk = 35
         ndk { abiFilters.add("arm64-v8a") }
-        versionCode = 20
-        versionName = "1.0.19"
+        versionCode = 27
+        versionName = "1.0.26"
         testInstrumentationRunner = if (p2pQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {
@@ -135,6 +135,7 @@ androidComponents {
 }
 
 dependencies {
+    implementation("androidx.core:core:1.17.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.zxing:core:3.5.4")
     val markwonVersion = "4.6.2"

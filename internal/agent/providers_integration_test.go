@@ -114,20 +114,17 @@ func TestProviderRoutingWithLocalCodex(t *testing.T) {
 			t.Fatalf("start did not return a thread: %v", err)
 		}
 		threads = append(threads, result.Thread.ID)
-		if err := a.rememberThreadModel("thread/start", params, raw); err != nil {
-			t.Fatal(err)
-		}
 	}
 	turn := func(index int, token string) {
 		t.Helper()
 		params := map[string]any{"threadId": threads[index], "model": "same-model", "effort": "low", "input": []any{map[string]any{"type": "text", "text": "Return immediately. Do not use tools."}}}
-		raw, err := app.Call(ctx, "turn/start", params)
+		_, err := app.Call(ctx, "turn/start", params)
 		if err != nil {
 			t.Fatal(err)
 		}
 		select {
 		case got := <-requests:
-			if got.Path != fmt.Sprintf("/%d/responses", index+1) || got.Token != "Bearer "+token || got.Model != "same-model" {
+			if got.Path != map[string]string{"test-key-one": "/1/responses", "rotated-test-key-one": "/1/responses", "test-key-two": "/2/responses"}[key] || got.Token != "Bearer "+token || got.Model != "same-model" {
 				t.Fatalf("wrong supplier request: %#v", got)
 			}
 		case <-ctx.Done():
@@ -140,9 +137,6 @@ func TestProviderRoutingWithLocalCodex(t *testing.T) {
 			}
 		case <-ctx.Done():
 			t.Fatal("Codex did not complete the test turn")
-		}
-		if err := a.rememberThreadModel("turn/start", params, raw); err != nil {
-			t.Fatal(err)
 		}
 	}
 	turn(0, "test-key-one")
@@ -157,18 +151,30 @@ func TestProviderRoutingWithLocalCodex(t *testing.T) {
 		if err := a.prepareProvider(ctx, app, "thread/resume", params); err != nil {
 			t.Fatal(err)
 		}
-		if params["modelProvider"] != items[i].RuntimeID() || params["model"] != "same-model" {
-			t.Fatal("cold resume lost the original supplier or model")
+		if params["modelProvider"] != items[i].RuntimeID() || params["model"] != nil {
+			t.Fatal("cold resume must restore the supplier and let Codex choose the model")
 		}
-		if params["config"].(map[string]any)["model_reasoning_effort"] != "low" {
-			t.Fatal("cold resume lost the original reasoning effort")
-		}
-		if _, err := app.Call(ctx, "thread/resume", params); err != nil {
-			t.Fatal(err)
+		params["excludeTurns"] = true
+		result := queueCall(t, app, "thread/resume", params)
+		if result["model"] != "same-model" {
+			t.Fatalf("Codex did not restore the thread model and effort: %v / %v", result["model"], result["reasoningEffort"])
 		}
 	}
 	turn(0, "rotated-test-key-one")
 	turn(1, "test-key-two")
+	_ = app.Close()
+	app = launch()
+	params := map[string]any{"threadId": threads[0], "codexrmProvider": items[1].ID, "model": "same-model", "excludeTurns": true}
+	if err := a.prepareProvider(ctx, app, "thread/resume", params); err != nil {
+		t.Fatal(err)
+	}
+	result := queueCall(t, app, "thread/resume", params)
+	t.Logf("switched outer=%v inner=%v", result["modelProvider"], result["thread"].(map[string]any)["modelProvider"])
+	turn(0, "test-key-two")
+	_ = app.Close()
+	app = launch()
+	read := queueCall(t, app, "thread/read", map[string]any{"threadId": threads[0]})
+	t.Logf("restarted inner=%v", read["thread"].(map[string]any)["modelProvider"])
 	if _, err := db.Exec("DELETE FROM providers WHERE id = '1'"); err != nil {
 		t.Fatal(err)
 	}

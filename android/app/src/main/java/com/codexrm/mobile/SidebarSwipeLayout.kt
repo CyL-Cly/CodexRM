@@ -15,53 +15,86 @@ import kotlin.math.max
 internal class SidebarSwipeLayout(
     context: Context,
     private val canOpenSidebar: () -> Boolean,
-    private val openSidebar: () -> Unit,
+    private val startSidebarDrag: () -> Float,
+    private val moveSidebar: (Float) -> Unit,
+    private val finishSidebarDrag: (Boolean) -> Unit,
 ) : FrameLayout(context) {
+    private enum class Swipe { IDLE, TRACKING, DRAGGING, CONSUMING }
+
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
-    private val swipeDistance = max(Ui.dp(context, 64), touchSlop * 4)
+    private val openDistance = max(Ui.dp(context, 64), touchSlop * 4)
     private var startX = 0f
     private var startY = 0f
-    private var tracking = false
-    private var consuming = false
+    private var startTranslationX = 0f
+    private var swipe = Swipe.IDLE
+
+    fun stopSidebarSwipe() {
+        when (swipe) {
+            Swipe.TRACKING -> swipe = Swipe.IDLE
+            Swipe.DRAGGING -> swipe = Swipe.CONSUMING
+            else -> Unit
+        }
+    }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                startX = event.x
-                startY = event.y
-                consuming = false
-                tracking = canOpenSidebar() && !blocksSwipe(this, startX, startY)
-            }
-            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> tracking = false
+        val action = event.actionMasked
+        if (action == MotionEvent.ACTION_DOWN) {
+            if (swipe == Swipe.DRAGGING) finishSidebarDrag(false)
+            startX = event.x
+            startY = event.y
+            swipe = if (canOpenSidebar() && !blocksSwipe(this, startX, startY)) Swipe.TRACKING else Swipe.IDLE
         }
 
-        if (tracking && (event.actionMasked == MotionEvent.ACTION_MOVE || event.actionMasked == MotionEvent.ACTION_UP)) {
-            val dx = event.x - startX
-            val dy = abs(event.y - startY)
-            if (event.pointerCount != 1 || !canOpenSidebar() ||
-                event.eventTime - event.downTime >= ViewConfiguration.getLongPressTimeout() ||
-                dx < -touchSlop || (dy > touchSlop && dy >= abs(dx))) {
-                tracking = false
-            } else if (dx >= swipeDistance && dx >= dy * 1.5f) {
-                tracking = false
-                consuming = true
-                // Cancel the original target so a swipe cannot also click a link or button.
-                val cancel = MotionEvent.obtain(event)
-                cancel.action = MotionEvent.ACTION_CANCEL
-                super.dispatchTouchEvent(cancel)
-                cancel.recycle()
-                openSidebar()
+        val dx = event.x - startX
+        if (swipe == Swipe.TRACKING) {
+            when (action) {
+                MotionEvent.ACTION_POINTER_DOWN -> swipe = Swipe.IDLE
+                MotionEvent.ACTION_MOVE -> {
+                    val dy = abs(event.y - startY)
+                    if (event.pointerCount != 1 || !canOpenSidebar() ||
+                        event.eventTime - event.downTime >= ViewConfiguration.getLongPressTimeout() ||
+                        dx < -touchSlop || (dy > touchSlop && dy >= abs(dx))) {
+                        swipe = Swipe.IDLE
+                    } else if (dx > touchSlop && dx >= dy * 1.5f) {
+                        // Cancel the original target so the drag cannot also click a link or button.
+                        val cancel = MotionEvent.obtain(event)
+                        cancel.action = MotionEvent.ACTION_CANCEL
+                        super.dispatchTouchEvent(cancel)
+                        cancel.recycle()
+                        startTranslationX = startSidebarDrag()
+                        swipe = Swipe.DRAGGING
+                    }
+                }
             }
         }
 
-        if (consuming) {
-            if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) consuming = false
-            return true
+        when (swipe) {
+            Swipe.DRAGGING -> {
+                when (action) {
+                    MotionEvent.ACTION_MOVE -> moveSidebar(startTranslationX + dx - touchSlop)
+                    MotionEvent.ACTION_UP -> {
+                        moveSidebar(startTranslationX + dx - touchSlop)
+                        swipe = Swipe.IDLE
+                        finishSidebarDrag(dx >= openDistance)
+                    }
+                    MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                        swipe = if (action == MotionEvent.ACTION_CANCEL) Swipe.IDLE else Swipe.CONSUMING
+                        finishSidebarDrag(false)
+                    }
+                }
+                return true
+            }
+            Swipe.CONSUMING -> {
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) swipe = Swipe.IDLE
+                return true
+            }
+            else -> {
+                val handled = super.dispatchTouchEvent(event)
+                val wasTracking = swipe == Swipe.TRACKING
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) swipe = Swipe.IDLE
+                return handled || wasTracking
+            }
         }
-        val handled = super.dispatchTouchEvent(event)
-        val wasTracking = tracking
-        if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) tracking = false
-        return handled || wasTracking
     }
 
     private fun blocksSwipe(view: View, x: Float, y: Float): Boolean {

@@ -21,6 +21,13 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 	if params == nil {
 		params = map[string]any{}
 	}
+	if method == "thread/turns/list" {
+		page, err := threadHistoryPage(ctx, app, params)
+		if err != nil {
+			return nil, err
+		}
+		return mustJSON(page), nil
+	}
 	id, _ := params["threadId"].(string)
 	var q *messageQueue
 	if id != "" {
@@ -30,6 +37,12 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 	}
 	if id != "" && (method == "thread/resume" || method == "turn/start") {
 		defer func() {
+			a.textMu.Lock()
+			textApp := a.textApp
+			a.textMu.Unlock()
+			if app == textApp {
+				return
+			}
 			a.queueMu.Lock()
 			lifetime := a.queueCtx
 			a.queueMu.Unlock()
@@ -55,12 +68,22 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 		a.owners[id] = owner
 		a.mu.Unlock()
 	}
+	excludeTurns := params["excludeTurns"]
+	loadHistory := method == "thread/resume" && id != "" && (excludeTurns == nil || excludeTurns == false)
+	if loadHistory {
+		params["excludeTurns"] = true
+	}
 	raw, err := app.Call(ctx, method, params)
+	var historyErr error
+	if err == nil && loadHistory {
+		var hydrated json.RawMessage
+		hydrated, historyErr = hydrateResumedThread(ctx, app, raw)
+		if historyErr == nil {
+			raw = hydrated
+		}
+	}
 	if err == nil {
 		a.recordStartedTurn(method, params, raw)
-		if saveErr := a.rememberThreadModel(method, params, raw); saveErr != nil {
-			log.Printf("unable to save thread model selection: %v", saveErr)
-		}
 		if method == "thread/start" || method == "thread/resume" || method == "thread/fork" {
 			var out struct {
 				Thread struct {
@@ -106,12 +129,15 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 			a.publishThreadState("loaded", id)
 		}
 	}
+	if historyErr != nil {
+		return nil, historyErr
+	}
 	return raw, err
 }
 
 func resumeSettings(params map[string]any) map[string]any {
 	settings := map[string]any{}
-	for _, key := range []string{"model", "codexrmProvider", "serviceTier", "cwd", "runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandbox", "permissions", "config", "baseInstructions", "developerInstructions"} {
+	for _, key := range []string{"serviceTier", "cwd", "runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandbox", "permissions", "config", "baseInstructions", "developerInstructions"} {
 		if value, ok := params[key]; ok {
 			settings[key] = value
 		}
@@ -119,6 +145,13 @@ func resumeSettings(params map[string]any) map[string]any {
 	// Maps such as config will be mutated while preparing a provider.
 	var copy map[string]any
 	_ = json.Unmarshal(mustJSON(settings), &copy)
+	// Model overrides only apply to the caller's request. Automatic resumes
+	// recover the current model settings from Codex, just like a fresh open.
+	if config, ok := copy["config"].(map[string]any); ok {
+		delete(config, "model")
+		delete(config, "model_provider")
+		delete(config, "model_reasoning_effort")
+	}
 	return copy
 }
 

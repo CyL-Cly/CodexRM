@@ -11,17 +11,17 @@
 
 ## 开发环境
 
-- Go 1.22+
+- Go 1.24+
 - Node.js 22+（仅运行前端测试需要）
 - 真实模式需要已安装并配置的 Codex 客户端；普通开发和模拟模式不需要模型凭据
 
 ```powershell
 git clone https://github.com/codexrm/codexrm.git
 cd codexrm
-.\scripts\build.ps1
+.\build\scripts\build.ps1
 ```
 
-也可运行 `scripts/dev-mock.ps1` 启动本地模拟服务。不要依赖私有部署、上游参考源码或未纳入仓库的本地文件。
+也可运行 `build/scripts/dev-mock.ps1` 启动本地模拟服务。不要依赖私有部署、上游参考源码或未纳入仓库的本地文件。
 
 ## 提交代码
 

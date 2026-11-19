@@ -17,7 +17,11 @@ import java.io.IOException
 import java.net.Inet4Address
 import kotlin.math.min
 
+private const val DUAL_UNPREDICTABLE_NAT = "dual_unpredictable_nat"
+
 internal enum class ConnectionState { CONNECTING, ONLINE, OFFLINE }
+internal class RpcOutcomeUnknown(message: String) : IOException(message)
+
 internal fun interface RpcCallback { fun onComplete(result: JSONObject?, error: Exception?) }
 
 internal sealed interface DirectStatus {
@@ -58,9 +62,11 @@ internal class CodexClient(
     var directStatus: DirectStatus = initialDirectStatus()
         private set
     private var startTimeout: Runnable? = null
+    // An available signal may arrive before agent_status. Keep it for this RM socket.
     private var directAvailable = false
     private var directLease = 0L
-    private var nextAttempt = 0L
+    private val directRetry = DirectRetry()
+    private val retryDirect = Runnable { tryDirect() }
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private var defaultNetwork: android.net.Network? = null
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -81,14 +87,12 @@ internal class CodexClient(
             }
         }
     }
-    private val checkDirect = object : Runnable {
+    private val renewDirectLease = object : Runnable {
         override fun run() {
             if (!active) return
-            if (online) {
-                if (directActive) {
-                    if (SystemClock.elapsedRealtime() >= directLease) dropDirect("直连授权续期超时。")
-                    else if (!sendSignal("renew", directId)) dropDirect("无法通过 RM 续期直连授权。")
-                } else tryDirect()
+            if (online && directActive) {
+                if (SystemClock.elapsedRealtime() >= directLease) dropDirect("直连授权续期超时。")
+                else if (!sendSignal("renew", directId)) dropDirect("无法通过 RM 续期直连授权。")
             }
             main.postDelayed(this, 4_000)
         }
@@ -99,14 +103,14 @@ internal class CodexClient(
         active = true
         defaultNetwork = connectivity?.activeNetwork
         runCatching { connectivity?.registerDefaultNetworkCallback(networkCallback) }
-        main.postDelayed(checkDirect, 4_000)
+        main.postDelayed(renewDirectLease, 4_000)
         open()
     }
 
     private fun open() {
         if (!active) return
         directAvailable = false
-        nextAttempt = 0L
+        directRetry.reset()
         resetDirectStatus()
         rejectPending("连接已中断")
         online = false
@@ -163,7 +167,6 @@ internal class CodexClient(
                 if (online) reconnectAttempt = 0
                 listener.onState(if (online) ConnectionState.ONLINE else ConnectionState.OFFLINE, envelope.optJSONObject("agent"))
                 if (!online && wasOnline) {
-                    directAvailable = false
                     dropDirect()
                     resetDirectStatus()
                     rejectPending("远程设备已离线")
@@ -201,7 +204,11 @@ internal class CodexClient(
     private fun sendSignal(kind: String, id: String = ""): Boolean {
         val signal = JSONObject().put("version", 1).put("kind", kind)
         if (id.isNotEmpty()) signal.put("id", id)
-        if (kind == "begin" && localPrefixes().isNotEmpty()) signal.put("lan", true)
+        if (kind == "begin") {
+            signal.put("dualNatPunch", true)
+            signal.put("ipv6", true)
+            if (localPrefixes().isNotEmpty()) signal.put("lan", true)
+        }
         return socket?.send(JSONObject().put("type", "p2p").put("p2p", signal).toString()) == true
     }
 
@@ -217,16 +224,22 @@ internal class CodexClient(
 
     private fun tryDirect() {
         val now = SystemClock.elapsedRealtime()
-        if (!online || !directAvailable || direct != null || now < nextAttempt || !NativeP2P.available) return
-        nextAttempt = now + 45_000
-        if (!sendSignal("begin")) {
-            reportDirectStatus(DirectStatus.Relay("无法通过 RM 发送直连请求。"))
+        if (!active || !online || !directAvailable || direct != null || startTimeout != null || !NativeP2P.available) return
+        main.removeCallbacks(retryDirect)
+        val delay = directRetry.delay(now) ?: return
+        if (delay > 0) {
+            main.postDelayed(retryDirect, delay)
             return
         }
+        if (!sendSignal("begin")) {
+            scheduleReconnect()
+            return
+        }
+        directRetry.requested(now)
         reportDirectStatus(DirectStatus.Negotiating)
         val timeout = Runnable {
             startTimeout = null
-            reportDirectStatus(DirectStatus.Relay("等待 RM 开始直连协商超时。"))
+            retryAfterDirectFailure("等待 RM 开始直连协商超时。")
         }
         startTimeout = timeout
         main.postDelayed(timeout, 8_000)
@@ -234,7 +247,7 @@ internal class CodexClient(
 
     private fun initialDirectStatus() = DirectStatus.Relay(
         if (!NativeP2P.available) "此应用无法加载 P2P 原生库。"
-        else "当前连接未收到 RM 的 P2P 能力通知。请检查 RM 和 Agent 是否支持直连，以及双方是否通过 IPv4 连接 RM。"
+        else "当前连接未收到 RM 的 P2P 能力通知。请检查 RM 和 Agent 是否支持直连，以及 RM 是否正确接收两端的源地址。"
     )
 
     private fun reportDirectStatus(status: DirectStatus) {
@@ -248,15 +261,34 @@ internal class CodexClient(
         startTimeout = null
     }
 
-    private fun resetDirectStatus() {
+    private fun cancelDirectTimers() {
         clearStartTimeout()
+        main.removeCallbacks(retryDirect)
+    }
+
+    private fun resetDirectStatus() {
+        cancelDirectTimers()
         reportDirectStatus(initialDirectStatus())
+    }
+
+    private fun retryAfterDirectFailure(reason: String, wasConnected: Boolean = false) {
+        if (!active || !online) return
+        directRetry.failed(SystemClock.elapsedRealtime(), wasConnected)
+        reportDirectStatus(DirectStatus.Relay("${reason}当前通过 RM 中继，稍后自动重试直连。"))
+        tryDirect()
+    }
+
+    private fun suspendDirectForMapping(signalPeer: Boolean) {
+        directRetry.suspendForMapping()
+        cancelDirectTimers()
+        dropDirect(signalPeer = signalPeer)
+        reportDirectStatus(DirectStatus.Relay("双方的公网 UDP 映射难以预测，本轮未能建立直连。当前使用 RM 中继，网络或 Agent 连接变化后将重新检测。"))
     }
 
     private fun nativeFailure(reason: String): String = when (reason) {
         "prepare" -> "手机无法准备 UDP 直连候选地址。"
         "peer_offer_timeout" -> "等待 Agent 的直连候选地址超时。"
-        "no_peer_candidate" -> "没有可用的 Agent IPv4 直连候选地址。"
+        "no_peer_candidate" -> "没有可用的 Agent UDP 直连候选地址。"
         "punch_timeout" -> "UDP 打洞超时，双方未能建立直连路径。"
         "handshake" -> "直连握手失败或超时。"
         "activation_timeout" -> "等待 Agent 确认启用直连超时。"
@@ -267,19 +299,25 @@ internal class CodexClient(
         if (signal.optInt("version") != 1) return
         val id = signal.string("id")
         when (signal.string("kind")) {
-            "available" -> { directAvailable = true; tryDirect() }
+            "available" -> {
+                directAvailable = true
+                // RM sends this when a P2P-capable Agent connects or when the RM socket is new.
+                directRetry.onAgentAvailable()
+                tryDirect()
+            }
             "busy" -> if (online && startTimeout != null) {
                 clearStartTimeout()
-                reportDirectStatus(DirectStatus.Relay("RM 的直连会话已满，稍后会自动重试。"))
+                retryAfterDirectFailure("RM 的直连会话已满。")
             }
             "start" -> {
                 if (!online || !directAvailable || id.length != 36 || direct != null || !NativeP2P.available) return
-                clearStartTimeout()
+                cancelDirectTimers()
+                directRetry.started(SystemClock.elapsedRealtime())
                 directLan = false
                 signal.put("localPrefixes", JSONArray(if (signal.optBoolean("lan")) localPrefixes() else emptyList<String>()))
                 val transport = DirectTransport.open(signal) ?: run {
                     sendSignal("stop", id)
-                    reportDirectStatus(DirectStatus.Relay("手机无法启动 P2P 直连。"))
+                    retryAfterDirectFailure("手机无法启动 P2P 直连。")
                     return
                 }
                 direct = transport
@@ -290,7 +328,11 @@ internal class CodexClient(
                         val message = runCatching { JSONObject(text) }.getOrNull()
                         val outgoing = message?.optJSONObject("p2p")
                         when {
-                            message?.string("type") == "native_direct_failure" -> dropDirect(nativeFailure(message.string("reason")))
+                            message?.string("type") == "native_direct_failure" -> {
+                                val reason = message.string("reason")
+                                if (reason == DUAL_UNPREDICTABLE_NAT) suspendDirectForMapping(signalPeer = true)
+                                else dropDirect(nativeFailure(reason))
+                            }
                             message?.string("type") == "native_direct_lan" -> directLan = true
                             !directActive && message?.string("type") == "p2p" && outgoing?.string("id") == id -> {
                                 if (socket?.send(text) != true) dropDirect("无法通过 RM 交换直连信令。")
@@ -304,6 +346,7 @@ internal class CodexClient(
             "active" -> if (id == directId && direct != null && !directActive) {
                 directLease = SystemClock.elapsedRealtime() + 12_000
                 directActive = true
+                directRetry.connected()
                 direct?.signal(signal)
                 reportDirectStatus(DirectStatus.Connected(directLan))
                 Log.i("CodexRM-P2P", "Direct transport active (lan=$directLan)")
@@ -311,8 +354,13 @@ internal class CodexClient(
             "lease" -> if (id == directId && directActive && SystemClock.elapsedRealtime() < directLease) {
                 directLease = SystemClock.elapsedRealtime() + 12_000
             }
-            "stop" -> if (id == directId) {
-                val reason = when (signal.string("reason")) {
+            "stop" -> if (direct != null && id == directId) {
+                val code = signal.string("reason")
+                if (!directActive && code == DUAL_UNPREDICTABLE_NAT) {
+                    suspendDirectForMapping(signalPeer = false)
+                    return
+                }
+                val reason = when (code) {
                     "client_candidate_unverified" -> "RM 未能验证手机的 UDP 地址。"
                     "agent_candidate_unverified" -> "RM 未能验证 Agent 的 UDP 地址。"
                     "invalid_offer" -> "RM 拒绝了格式无效的直连候选。"
@@ -331,12 +379,12 @@ internal class CodexClient(
         directId = ""
         direct = null
         previous.close()
-        if (failure != null && online) reportDirectStatus(DirectStatus.Relay(failure))
+        if (failure != null) retryAfterDirectFailure(failure, wasActive)
         val ids = pending.filterValues { it.direct }.keys.toList()
         ids.forEach { id ->
             pending.remove(id)?.let {
                 main.removeCallbacks(it.timeout)
-                it.callback.onComplete(null, IOException("直连已中断，请求结果未知，请先同步状态"))
+                it.callback.onComplete(null, RpcOutcomeUnknown("直连已中断，请求结果未知，请先同步状态"))
             }
         }
         if (wasActive) {
@@ -381,7 +429,7 @@ internal class CodexClient(
         nextId = if (nextId == Int.MAX_VALUE) 1 else nextId + 1
         val id = nextId
         val timeout = Runnable {
-            pending.remove(id)?.callback?.onComplete(null, IOException(if (requireDirect) "P2P 直连请求超时" else "请求超时，请检查本地 Codex 是否正常运行"))
+            pending.remove(id)?.callback?.onComplete(null, RpcOutcomeUnknown(if (requireDirect) "P2P 直连请求超时" else "请求超时，请检查本地 Codex 是否正常运行"))
         }
         val onDirect = directActive
         pending[id] = Pending(callback, timeout, onDirect)
@@ -442,7 +490,7 @@ internal class CodexClient(
         pending.clear()
         requests.forEach {
             main.removeCallbacks(it.timeout)
-            it.callback.onComplete(null, IOException(message))
+            it.callback.onComplete(null, RpcOutcomeUnknown(message))
         }
     }
 
@@ -451,9 +499,9 @@ internal class CodexClient(
         active = false
         online = false
         runCatching { connectivity?.unregisterNetworkCallback(networkCallback) }
-        main.removeCallbacks(checkDirect)
+        main.removeCallbacks(renewDirectLease)
         dropDirect()
-        clearStartTimeout()
+        cancelDirectTimers()
         generation++
         reconnect?.let(main::removeCallbacks)
         reconnect = null

@@ -4,18 +4,10 @@ param(
     [switch]$ValidateOnly
 )
 $ErrorActionPreference = 'Stop'
-$server = ([string]$RM.server).TrimEnd('/')
-$serverUri = $null
-if (-not [Uri]::TryCreate($server, [UriKind]::Absolute, [ref]$serverUri) -or
-    $serverUri.Scheme -notin @('https', 'http') -or $serverUri.UserInfo -or $serverUri.Query -or $serverUri.Fragment) {
-    throw 'rm.server must be the RM HTTP(S) base URL.'
-}
-$sshTarget = [string]$RM.sshTarget
-if ($sshTarget -notmatch '^[A-Za-z0-9_][A-Za-z0-9_.@-]*$') { throw 'rm.sshTarget must be an SSH alias or user@host.' }
-$installDir = if ($RM.installDir) { ([string]$RM.installDir).TrimEnd('/') } else { '/opt/codexrm' }
-if ($installDir -notmatch '^(/[A-Za-z0-9_.-]+)+$' -or @($installDir.Split('/') | Where-Object { $_ -in @('.', '..') }).Count) {
-    throw 'rm.installDir must be an absolute Linux directory without parent traversal.'
-}
+$rmTarget = & (Join-Path $PSScriptRoot 'get-rm-target.ps1') -RM $RM
+$server = $rmTarget.Server
+$sshTarget = $rmTarget.SshTarget
+$installDir = $rmTarget.InstallDir
 foreach ($command in @('ssh', 'scp', 'tar')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "Required frontend deployment command missing: $command" }
 }
@@ -61,6 +53,9 @@ tar --extract --gzip --file "$archive" --directory "$stage" --no-same-owner
 test -f "$stage/index.html"
 test -f "$stage/app.js"
 test -f "$stage/sw.js"
+if test -L "$target/release-history.json"; then
+    cp -P -- "$target/release-history.json" "$stage/release-history.json"
+fi
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -type f -exec chmod 0644 {} +
 if test -e "$target"; then mv "$target" "$backup"; fi

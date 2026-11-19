@@ -1,6 +1,6 @@
 # 客户端更新与发布
 
-客户端固定通过 `https://codexrm.dagongren.tech/update.json` 查询更新，设置页不再显示或允许修改更新服务器。旧配置中的更新服务器及清单覆盖地址会被忽略。清单中的 `downloadUrl` 指向 ZIP 更新包。更换远程 RM URL 不改变更新源。Cloudreve 登录凭据及发布配置仅保存在被 Git 忽略的 `build/publish.config.json`，不会进入安装包。
+Windows Agent 固定通过 `https://codexrm.dagongren.tech/update.json` 查询更新，设置页不再显示或允许修改更新服务器。旧配置中的更新服务器及清单覆盖地址会被忽略。清单中的 `downloadUrl` 指向 ZIP 更新包。更换远程 RM URL 不改变更新源。Cloudreve 登录凭据及发布配置仅保存在被 Git 忽略的 `build/publish.config.json`，不会进入安装包。
 
 ## 原生客户端检查更新
 
@@ -16,7 +16,7 @@ bin\codexrm-agent.exe --check-update --update-dir "D:\Apps\CodexRM"
 
 ## 自动更新
 
-已安装客户端默认启用自动更新。每次启动立即检查，即使上次检查距今不足 20 小时；持续运行期间每 20 小时检查一次。检查时间保存在安装目录的 `.state/update-state.json`，保存连接设置或重连不会重启检查循环。配对命令和模拟模式不自动更新。MSIX 版继续由 Windows 管理更新，不运行 EXE 更新器。
+已安装客户端默认启用自动更新。每次启动立即检查，即使上次成功检查距今不足 20 小时；持续运行期间在成功检查后每 20 小时检查一次。瞬时网络或服务端故障不会消耗 20 小时间隔，而是按 1、5、15、60 分钟有上限退避；设置页可查看最近尝试、最近成功、失败原因及下次重试，也可手动绕过间隔。检查状态保存在安装目录的 `.state/update-state.json`，旧版 `lastCheck` 状态会作为成功检查时间迁移。保存连接设置或重连不会重启检查循环。配对命令和模拟模式不自动更新。MSIX 版继续由 Windows 管理更新，不运行 EXE 更新器。
 
 发现更大的 `versionCode` 时，后台下载 ZIP，校验大小、SHA-256 及包内二进制版本，等待所有对话和排队消息结束后关闭 Codex app-server，由独立更新进程等待旧 Agent 退出、备份替换文件并隐藏启动新 Agent。已暂停的排队消息需恢复执行或移除后才会安装更新，防止重启丢失消息。开始安装与新请求接收共用互斥保护，防止空闲检查后插入新任务。更新辅助进程启动失败时保留待安装包，一分钟后重试。新版本必须在 60 秒内启动 Agent 管理循环；替换或启动失败会回滚文件并尝试启动原版本。服务器暂时不可达或尚未配置 Codex 时，托盘和设置页继续可用。日志写入 `.state/update.log`。
 
@@ -100,13 +100,17 @@ RM 通过 `GET /update.json`、`GET /android-update.json` 和 `GET /linux-update
 
 将各平台的软件包上传到 Cloudreve、OSS、EOS 等外部存储，把客户端可直接访问的完整 HTTP(S) 下载地址填入对应清单的 `downloadUrl`，然后将清单发布到 RM。
 
-## Linux Agent 手动更新
+## Linux Agent 自更新
 
-从 `https://codexrm.dagongren.tech/linux-update.json` 查询 Linux amd64 Agent 版本，按 `downloadUrl` 下载 ZIP，核对 `fileSize` 和 `sha256` 后解压。停止 Agent，替换 `codexrm-agent` 二进制，然后重新启动。
+支持自更新的 Linux amd64 Agent 默认在启动时检查，运行期间每 20 小时检查一次。也可以在局域网设置页点“检查更新”，或通过已配对设备发起检查。更新使用固定的 `/linux-update.json` 清单，下载后校验 ZIP 的大小、SHA-256 及包内 Agent 版本。它会等待进行中的对话、请求和排队消息全部结束，再只替换当前运行的二进制。
+
+自更新要求运行账号拥有该二进制，并且可以写入二进制所在目录。替换后在同一 PID 内重新启动，沿用原命令行参数、工作目录和环境变量，保留配置和设备配对。重启系统调用失败或新 Agent 在启动设置页前报告错误时，会恢复原二进制。若试启动期间进程被强制终止，可在二进制旁的 `.codexrm-agent-update-*/previous` 找到原版本。更新检查时间记录在连接配置所在目录的 `.codexrm-updates/update-state.json`。在连接配置中设置 `"autoUpdate": false` 并重启即可关闭自动检查。
+
+`./codexrm-agent --check-update` 只查询清单并输出 JSON。对于旧版或不可自更新的安装，从 `https://codexrm.dagongren.tech/linux-update.json` 读取 `downloadUrl`，下载并校验 ZIP，停止 Agent 后替换二进制并重新启动。
 
 ## Android 手动检查更新
 
-Android 在“侧栏 → 我的远程工作区 → 检查更新”中手动查询 `https://codexrm.dagongren.tech/android-update.json`。该清单与 Windows 版本号和 ZIP 完全独立，不跟随当前配对服务器变化，只有用户点击“立即更新”后才下载和安装。客户端下载 APK 到应用私有缓存，校验清单大小、SHA-256、APK 包名和版本后通过 `PackageInstaller` 覆盖安装。Android 12+ 在已允许“安装未知应用”、声明 `UPDATE_PACKAGES_WITHOUT_USER_ACTION` 且应用更新自身时，使用 `USER_ACTION_NOT_REQUIRED` 免除系统安装确认；系统不允许免确认的设备仍会显示确认界面。
+Android 在“侧栏 → … → 检查更新”中手动查询 `https://codexrm.dagongren.tech/android-update.json`。该清单与 Windows 版本号和 ZIP 完全独立，不跟随当前配对服务器变化，只有用户点击“立即更新”后才下载和安装。客户端下载 APK 到应用私有缓存，校验清单大小、SHA-256、APK 包名和版本后通过 `PackageInstaller` 覆盖安装。Android 12+ 在已允许“安装未知应用”、声明 `UPDATE_PACKAGES_WITHOUT_USER_ACTION` 且应用更新自身时，使用 `USER_ACTION_NOT_REQUIRED` 免除系统安装确认；系统不允许免确认的设备仍会显示确认界面。
 
 签名 APK 使用独立脚本打包。手动发布到对象存储时，可用 `-DownloadUrl` 指定外部下载地址。
 
@@ -122,3 +126,14 @@ build\scripts\publish-manifest.ps1 -Manifest build\dist\android-update.json -Nam
 ```
 
 发布工具保留上一份 `android-update.json.previous`，不会覆盖 Windows 的 `update.json`。每次发布必须递增 Android `versionCode`，且新 APK 与已安装版本签名一致；Debug 签名只能用于测试。
+
+## 版本更新日志
+
+RM 在 `/release-history.json` 提供 Android、Windows Agent 和 Linux Agent 的版本更新日志。发布时通过 `-ReleaseNotes` 填写用户可读的改动说明。发布脚本在确认更新清单已生效后追加版本记录，重复发布同一平台的相同 `versionCode` 时更新原记录。Android 的“侧栏 → … → 关于”显示已安装版本和 Android 更新记录。
+
+记录保存在 `rm.updateDir`，RM 通过 `rm.installDir/web` 中的链接提供访问。前端部署会保留此链接。RM 服务器需要 Python 3 来写入更新日志。已有部署可从当前在线清单初始化记录。
+
+```powershell
+$publish = Get-Content build/publish.config.json -Raw | ConvertFrom-Json
+build\scripts\publish-manifest.ps1 -RM $publish.rm -SeedHistory
+```

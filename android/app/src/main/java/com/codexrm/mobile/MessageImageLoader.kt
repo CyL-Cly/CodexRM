@@ -34,8 +34,7 @@ internal class MessageImageLoader(context: Context, private val environment: () 
         val env = environment()
         val key = image.cacheKey(env.scope, env.cwd)
         if (image.allowsEarlyCache) memory.get(key)?.let { complete(Result.success(it)); return }
-        // Mutable local paths must not share an earlier read: every load asks the Agent
-        // for a fresh, version-consistent byte sequence. Immutable loads still coalesce.
+        // A bare local path must still be revalidated. History keys are scoped to a message.
         val requestKey = if (image.allowsEarlyCache) key else "$key\nload:${++nextLoadId}"
         if (image.allowsEarlyCache) pending[requestKey]?.let { it += complete; return }
         pending[requestKey] = mutableListOf(complete)
@@ -102,6 +101,8 @@ internal class MessageImageLoader(context: Context, private val environment: () 
                     val image = MessageImage.fromSource(file.string("path"), file.string("name"), file.string("id")) ?: continue
                     val key = image.cacheKey(env.scope, env.cwd)
                     if (disk.read(key) == null) {
+                        // Edited queue entries may reference an Agent upload without a local copy.
+                        if (file.string("localPath").isEmpty() && file.string("path").isNotEmpty()) continue
                         val local = store.localFile(file) ?: throw IOException("图片副本已丢失，请重新选择")
                         disk.write(key) { output -> local.inputStream().use { copyLimited(it, output) } }
                     }
@@ -157,6 +158,25 @@ internal class MessageImageLoader(context: Context, private val environment: () 
         chunk()
     }
 
+    fun originalKey(image: MessageImage): String = environment().let { image.cacheKey(it.scope, it.cwd) }
+
+    fun loadPreview(key: String, complete: (Bitmap) -> Unit) {
+        worker.execute {
+            val bitmap = runCatching { disk.read(key)?.let { decode(it, maxSide = 3200) } }.getOrNull()
+            if (bitmap != null) main.post { if (!closed) complete(bitmap) }
+        }
+    }
+
+    fun saveOriginal(resolver: android.content.ContentResolver, key: String, name: String, complete: (Result<Unit>) -> Unit) {
+        worker.execute {
+            val result = runCatching {
+                val file = disk.read(key) ?: throw IOException("原图缓存已清理，请重新打开图片")
+                saveImageToAlbum(resolver, file, name)
+            }
+            main.post { if (!closed) complete(result) }
+        }
+    }
+
     fun close() { closed = true; pending.clear(); queue.clear(); memory.evictAll() }
 
     companion object {
@@ -174,13 +194,13 @@ internal class MessageImageLoader(context: Context, private val environment: () 
             }
         }
 
-        private fun decode(file: File): Bitmap {
+        private fun decode(file: File, maxSide: Int = 1600): Bitmap {
             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeFile(file.path, options)
             if (options.outWidth <= 0 || options.outHeight <= 0) throw IOException("不支持的图片格式")
             options.inJustDecodeBounds = false
             options.inSampleSize = 1
-            while (maxOf(options.outWidth, options.outHeight) / options.inSampleSize > 1600) options.inSampleSize *= 2
+            while (maxOf(options.outWidth, options.outHeight) / options.inSampleSize > maxSide) options.inSampleSize *= 2
             return BitmapFactory.decodeFile(file.path, options) ?: throw IOException("图片解码失败")
         }
     }

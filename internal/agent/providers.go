@@ -44,15 +44,19 @@ func (a *Agent) modelCatalog(ctx context.Context, app *appserver.Client) (any, e
 		warnings = append(warnings, "当前 Codex 模型列表暂不可用")
 		models = []json.RawMessage{}
 	}
-	groups = append(groups, map[string]any{"id": "", "runtimeId": "", "name": "当前 Codex 配置", "source": "Codex", "models": models})
+	native := map[string]any{"id": "", "runtimeId": "", "name": "当前 Codex 配置", "source": "Codex", "models": models}
+	groups = append(groups, native)
 	if !a.cfg.Mock && a.cfg.AppServerURL == "" {
 		items, err := providers.Load(ctx, a.cfg.CCSwitchDB)
 		if err != nil {
 			warnings = append(warnings, err.Error())
 		} else {
+			if id := providers.CurrentProviderID(items, a.cfg.CCSwitchDB); id != "" {
+				native["aliasOf"] = id
+			}
 			providers.Discover(ctx, items)
 			for _, p := range items {
-				public := map[string]any{"id": p.ID, "runtimeId": p.RuntimeID(), "name": p.Name, "source": p.Source, "models": p.Models, "defaultModel": p.DefaultModel, "warning": p.Warning}
+				public := map[string]any{"id": p.ID, "runtimeId": p.RuntimeID(), "name": p.Name, "notes": p.Notes, "source": p.Source, "models": p.Models, "defaultModel": p.DefaultModel, "warning": p.Warning}
 				if p.Official() {
 					if len(p.Models) == 0 {
 						public["warning"] = "CCSwitch 中没有官方模型缓存，请先在 CCSwitch 中登录并获取模型"
@@ -65,8 +69,8 @@ func (a *Agent) modelCatalog(ctx context.Context, app *appserver.Client) (any, e
 	return map[string]any{"providers": groups, "warnings": warnings}, nil
 }
 
-// A thread's persisted provider ID identifies which local credentials to restore.
-// Nothing writes the active provider in ~/.codex or in the CCSwitch database.
+// Recover the credentials for the thread?s Codex provider. Codex owns the
+// thread?s model and reasoning effort, including changes made by the desktop.
 func (a *Agent) prepareProvider(ctx context.Context, app *appserver.Client, method string, params map[string]any) error {
 	value, supplied := params["codexrmProvider"]
 	delete(params, "codexrmProvider")
@@ -88,7 +92,6 @@ func (a *Agent) prepareProvider(ctx context.Context, app *appserver.Client, meth
 		var result struct {
 			Thread struct {
 				ModelProvider string `json:"modelProvider"`
-				Path          string `json:"path"`
 			} `json:"thread"`
 		}
 		if err := json.Unmarshal(raw, &result); err != nil {
@@ -96,23 +99,6 @@ func (a *Agent) prepareProvider(ctx context.Context, app *appserver.Client, meth
 		}
 		if strings.HasPrefix(result.Thread.ModelProvider, "ccswitch_") {
 			id = result.Thread.ModelProvider
-		}
-		if result.Thread.ModelProvider != "" {
-			threadID, _ := params["threadId"].(string)
-			model := a.restoreThreadModel(threadID, result.Thread.ModelProvider, result.Thread.Path)
-			if params["model"] == nil && model.Model != "" {
-				params["model"] = model.Model
-			}
-			if model.Effort != "" {
-				config, _ := params["config"].(map[string]any)
-				if config == nil {
-					config = map[string]any{}
-				}
-				if config["model_reasoning_effort"] == nil {
-					config["model_reasoning_effort"] = model.Effort
-				}
-				params["config"] = config
-			}
 		}
 	}
 	if id == "" {
@@ -130,7 +116,7 @@ func (a *Agent) prepareProvider(ctx context.Context, app *appserver.Client, meth
 			return fmt.Errorf("%s：%s", p.Name, p.Warning)
 		}
 		params["modelProvider"] = p.RuntimeID()
-		if params["model"] == nil && p.DefaultModel != "" {
+		if method == "thread/start" && params["model"] == nil && p.DefaultModel != "" {
 			params["model"] = p.DefaultModel
 		}
 		if overrides := p.Overrides(); len(overrides) > 0 {

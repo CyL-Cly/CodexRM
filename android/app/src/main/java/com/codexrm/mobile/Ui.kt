@@ -12,7 +12,6 @@ import android.os.Build
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.Button
@@ -133,24 +132,26 @@ internal object Ui {
     fun button(context: Context, value: String, primary: Boolean = false, onClick: (View) -> Unit): Button = Button(context).apply {
         text = value; textSize = 12f; isAllCaps = false
         setTextColor(if (primary) ACCENT_TEXT else TEXT)
-        minHeight = dp(context, 44); minimumHeight = dp(context, 44); minWidth = 0; minimumWidth = 0
+        minHeight = dp(context, 48); minimumHeight = dp(context, 48); minWidth = 0; minimumWidth = 0
         setPadding(dp(context, 14), 0, dp(context, 14), 0)
         background = ripple(if (primary) ACCENT else SURFACE_ALT, dp(context, 8).toFloat())
         setOnClickListener(onClick)
     }
 
-    fun iconButton(context: Context, icon: String, description: String, size: Int = 40, onClick: (View) -> Unit): FrameLayout =
+    fun iconButton(context: Context, icon: String, description: String, size: Int = 48, onClick: (View) -> Unit): FrameLayout =
         FrameLayout(context).apply {
             contentDescription = description; isClickable = true; isFocusable = true
             background = ripple(Color.TRANSPARENT, dp(context, 8).toFloat())
             addView(IconView(context, icon, MUTED), FrameLayout.LayoutParams(dp(context, 20), dp(context, 20), Gravity.CENTER))
             setOnClickListener(onClick)
-            layoutParams = LinearLayout.LayoutParams(dp(context, size), dp(context, size))
+            val target = dp(context, maxOf(48, size))
+            layoutParams = LinearLayout.LayoutParams(target, target)
         }
 
     fun input(context: Context, hint: String, multiLine: Boolean = false): EditText = EditText(context).apply {
         this.hint = hint; setHintTextColor(MUTED); setTextColor(TEXT); textSize = 16f
         backgroundTintList = ColorStateList.valueOf(BORDER)
+        minHeight = dp(context, 48)
         setPadding(dp(context, 4), dp(context, 8), dp(context, 4), dp(context, 8))
         if (multiLine) {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
@@ -174,8 +175,4 @@ internal object Ui {
     fun dot(context: Context, color: Int, size: Int = 6): View = View(context).apply { background = rounded(color, dp(context, size / 2).toFloat()) }
 
     fun params(width: Int, height: Int, weight: Float = 0f): LinearLayout.LayoutParams = LinearLayout.LayoutParams(width, height, weight)
-    fun margins(view: View, left: Int, top: Int, right: Int, bottom: Int) {
-        val params = view.layoutParams as? ViewGroup.MarginLayoutParams ?: return
-        params.setMargins(left, top, right, bottom); view.layoutParams = params
-    }
 }

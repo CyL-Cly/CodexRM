@@ -25,6 +25,7 @@ import (
 
 type Config struct {
 	Addr, DataDir, WebDir, AdminToken, UpdateDir string
+	PublicEnrollment                             bool
 	P2PSTUN, P2PVerifyListen, P2PVerifyPublic    string
 	P2PVerifyMore, P2PVerifyKeyFile              string
 	P2PTrustProxy, P2PLocalTest, P2PLAN          bool
@@ -32,6 +33,7 @@ type Config struct {
 type peer struct {
 	id, agentID, clientID string
 	role                  protocol.Role
+	deviceType            string
 	conn                  *websocket.Conn
 	send                  chan protocol.Envelope
 	closed                chan struct{}
@@ -40,6 +42,8 @@ type peer struct {
 	ip                    string
 	directIP              netip.Addr
 	directCapable         bool
+	dualNATPunchCapable   bool
+	ipv6Capable           bool
 	lanCapable            bool
 	direct                *directPair
 	lastDirect            time.Time
@@ -66,6 +70,9 @@ type Server struct {
 }
 
 func New(cfg Config) (*Server, error) {
+	if cfg.PublicEnrollment && cfg.AdminToken != "" {
+		return nil, errors.New("public enrollment cannot be combined with an enrollment key")
+	}
 	stun, err := stunEndpoints(cfg.P2PSTUN)
 	if err != nil {
 		return nil, err
@@ -126,6 +133,10 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	enrollLimiter := newIPRateLimiter(30, 10)
 	claimLimiter := newIPRateLimiter(10, 5)
+	pair := s.pair
+	if s.cfg.PublicEnrollment {
+		pair = rateLimit(newIPRateLimiter(12, 6), pair)
+	}
 	mux.HandleFunc("GET /update.json", s.updateManifest)
 	mux.HandleFunc("GET /android-update.json", s.androidUpdateManifest)
 	mux.HandleFunc("GET /linux-update.json", s.linuxUpdateManifest)
@@ -134,7 +145,7 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, 200, map[string]any{"ok": true, "service": "codexrm", "version": protocol.Version})
 	})
 	mux.HandleFunc("POST /api/v1/agent/enroll", rateLimit(enrollLimiter, s.enroll))
-	mux.HandleFunc("POST /api/v1/agent/pair", s.pair)
+	mux.HandleFunc("POST /api/v1/agent/pair", pair)
 	mux.HandleFunc("GET /api/v1/agent/pair/status", s.pairStatus)
 	mux.HandleFunc("GET /api/v1/agent/clients", s.listClients)
 	mux.HandleFunc("DELETE /api/v1/agent/clients/{clientID}", s.deleteClient)
@@ -194,12 +205,15 @@ func secureEqual(a, b string) bool {
 	return a != "" && b != "" && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.AdminToken != "" {
+	switch {
+	case s.cfg.PublicEnrollment:
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	case s.cfg.AdminToken != "":
 		if !secureEqual(r.Header.Get("X-Enrollment-Key"), s.cfg.AdminToken) {
 			fail(w, 401, "invalid enrollment key")
 			return
 		}
-	} else {
+	default:
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(host)
 		if ip == nil || !ip.IsLoopback() || r.Header.Get("X-Forwarded-For") != "" {
@@ -255,6 +269,9 @@ func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"claimed": claimed})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.PublicEnrollment {
+		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	}
 	var req protocol.PairClaimRequest
 	if readJSON(w, r, &req) != nil || strings.TrimSpace(req.Code) == "" {
 		fail(w, 400, "pairing code required")
@@ -302,7 +319,8 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) clientProfile(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
-	if _, err := s.store.AuthenticateClient(token); err != nil {
+	current, err := s.store.AuthenticateClient(token)
+	if err != nil {
 		fail(w, 401, "unauthorized")
 		return
 	}
@@ -312,7 +330,8 @@ func (s *Server) clientProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.ClientName, req.DeviceType = strings.TrimSpace(req.ClientName), strings.TrimSpace(req.DeviceType)
-	if req.ClientName == "" || len(req.ClientName) > 1024 || (req.DeviceType != "desktop" && req.DeviceType != "mobile" && req.DeviceType != "browser") {
+	allowed := req.DeviceType == "desktop" || req.DeviceType == "mobile" || req.DeviceType == "browser" || (current.DeviceType == protocol.DeviceTypeRobot && req.DeviceType == protocol.DeviceTypeRobot)
+	if req.ClientName == "" || len(req.ClientName) > 1024 || !allowed || (current.DeviceType == protocol.DeviceTypeRobot) != (req.DeviceType == protocol.DeviceTypeRobot) {
 		fail(w, 400, "clientName and a valid deviceType are required")
 		return
 	}
@@ -391,7 +410,7 @@ func (s *Server) agentWS(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.SetAgentAppVersion(a.AgentID, r.Header.Get(protocol.AppVersionHeader)); err != nil {
 		log.Printf("update agent version: %v", err)
 	}
-	s.upgrade(w, r, protocol.RoleAgent, a.AgentID, "", a.ExpiresAt, token)
+	s.upgrade(w, r, protocol.RoleAgent, a.AgentID, "", a.ExpiresAt, token, "")
 }
 func (s *Server) clientWS(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
@@ -403,15 +422,15 @@ func (s *Server) clientWS(w http.ResponseWriter, r *http.Request) {
 	if s.beforeClientUpgrade != nil {
 		s.beforeClientUpgrade()
 	}
-	s.upgrade(w, r, protocol.RoleClient, c.AgentID, c.ClientID, c.ExpiresAt, token)
+	s.upgrade(w, r, protocol.RoleClient, c.AgentID, c.ClientID, c.ExpiresAt, token, c.DeviceType)
 }
-func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.Role, agentID, clientID string, expires time.Time, token string) {
+func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.Role, agentID, clientID string, expires time.Time, token, deviceType string) {
 	up := websocket.Upgrader{CheckOrigin: sameOrigin, Subprotocols: []string{"codexrm"}}
 	conn, err := up.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, conn: conn, send: make(chan protocol.Envelope, 256), closed: make(chan struct{}), expires: expires}
+	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, deviceType: deviceType, conn: conn, send: make(chan protocol.Envelope, 256), closed: make(chan struct{}), expires: expires}
 	p.ip = clientIP(r)
 	p.directIP = s.directIP(r)
 	s.mu.Lock()
@@ -455,10 +474,12 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.R
 			s.byAgent[agentID] = map[string]*peer{}
 		}
 		s.byAgent[agentID][clientID] = p
-		if a := s.agents[agentID]; a != nil && a.directCapable {
-			s.sendDirect(a, p, protocol.P2P("join", ""))
-			if s.directAvailable(a, p) {
-				s.sendDirect(p, p, protocol.P2P("available", ""))
+		if p.deviceType != protocol.DeviceTypeRobot {
+			if a := s.agents[agentID]; a != nil && a.directCapable {
+				s.sendDirect(a, p, protocol.P2P("join", ""))
+				if s.directAvailable(a, p) {
+					s.sendDirect(p, p, protocol.P2P("available", ""))
+				}
 			}
 		}
 	}
@@ -566,6 +587,9 @@ func (s *Server) readPump(p *peer) {
 			continue
 		}
 		if env.Type == protocol.TypeP2P {
+			if p.deviceType == protocol.DeviceTypeRobot {
+				continue
+			}
 			s.handleDirect(p, env)
 			continue
 		}
@@ -575,7 +599,12 @@ func (s *Server) readPump(p *peer) {
 				continue
 			}
 			var rpc struct{ Method string }
-			if json.Unmarshal(env.Message, &rpc) == nil && strings.HasPrefix(rpc.Method, protocol.DirectFilePrefix) {
+			_ = json.Unmarshal(env.Message, &rpc)
+			if p.deviceType == protocol.DeviceTypeRobot && !protocol.RobotMethodAllowed(rpc.Method) {
+				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "method not allowed", StreamID: env.StreamID})
+				continue
+			}
+			if strings.HasPrefix(rpc.Method, protocol.DirectFilePrefix) {
 				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "文件管理仅支持 P2P 直连", StreamID: env.StreamID})
 				continue
 			}
@@ -587,6 +616,10 @@ func (s *Server) readPump(p *peer) {
 				continue
 			}
 			env.ClientID = p.clientID
+			env.ClientKind = ""
+			if p.deviceType == protocol.DeviceTypeRobot {
+				env.ClientKind = protocol.ClientKindRobot
+			}
 			env.SkipDirect, env.P2P = nil, nil
 			env.SeqID = s.seq.Add(1)
 			s.send(a, env)
@@ -615,9 +648,10 @@ func (s *Server) readPump(p *peer) {
 				}
 			} else {
 				for _, c := range s.byAgent[p.agentID] {
-					if !skip(c) {
-						list = append(list, c)
+					if c.deviceType == protocol.DeviceTypeRobot || skip(c) {
+						continue
 					}
+					list = append(list, c)
 				}
 			}
 			s.mu.RUnlock()

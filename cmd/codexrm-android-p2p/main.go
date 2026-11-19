@@ -95,6 +95,8 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 		switch {
 		case errors.Is(err, p2p.ErrNoPeerCandidate):
 			failure = "no_peer_candidate"
+		case errors.Is(err, p2p.ErrDualUnpredictableNAT):
+			failure = protocol.P2PReasonDualUnpredictableNAT
 		case errors.Is(err, p2p.ErrUDPPunch):
 			failure = "punch_timeout"
 		default:
@@ -104,6 +106,7 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 		return
 	}
 	defer link.Close()
+	log.Printf("CodexRM P2P: QUIC established (lan=%t ipv6=%t)", link.IsLAN(), link.IsIPv6())
 	if link.IsLAN() && !s.emitBytes([]byte(`{"type":"native_direct_lan"}`)) {
 		return
 	}

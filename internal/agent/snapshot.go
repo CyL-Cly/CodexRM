@@ -33,33 +33,11 @@ func (a *Agent) threadSnapshot(ctx context.Context, app *appserver.Client, param
 	if thread == nil {
 		return nil, errors.New("thread/read returned no thread")
 	}
-	var cursor any
-	if thread["historyMode"] == "paginated" {
-		raw, err = app.Call(ctx, "thread/turns/list", map[string]any{"threadId": id, "limit": 30, "sortDirection": "desc", "itemsView": "full"})
-		if err != nil {
-			return nil, err
-		}
-		var page struct {
-			Data       []any `json:"data"`
-			NextCursor any   `json:"nextCursor"`
-		}
-		if err = json.Unmarshal(raw, &page); err != nil {
-			return nil, err
-		}
-		for i, j := 0, len(page.Data)-1; i < j; i, j = i+1, j-1 {
-			page.Data[i], page.Data[j] = page.Data[j], page.Data[i]
-		}
-		thread["turns"], cursor = page.Data, page.NextCursor
-	} else {
-		raw, err = app.Call(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": true})
-		if err != nil {
-			return nil, err
-		}
-		if err = json.Unmarshal(raw, &result); err != nil {
-			return nil, err
-		}
-		thread = result.Thread
+	turns, cursor, err := initialThreadHistory(ctx, app, id, thread["historyMode"] != "paginated")
+	if err != nil {
+		return nil, err
 	}
+	thread["turns"] = turns
 	// Paths from a remote app-server belong to that machine, never the agent.
 	if a.cfg.AppServerURL == "" {
 		path, _ := thread["path"].(string)

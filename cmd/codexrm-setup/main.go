@@ -38,7 +38,7 @@ func main() {
 		return
 	}
 	fmt.Println("CodexRM 原生安装器")
-	fmt.Println("安装后请右键托盘图标打开设置，填写远程服务器和连接授权密钥。")
+	fmt.Println("全新安装会自动连接公共中继。右键托盘图标可打开设置并生成配对码。")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = install(ctx, opts, os.Stdin, os.Stdout, os.Stderr)

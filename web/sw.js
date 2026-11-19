@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "20261118-2";
+const VERSION = "20261119-6";
 const CACHE_PREFIX = "codexrm";
 const SHELL_CACHE = `${CACHE_PREFIX}-shell-${VERSION}`;
 const PAGE_CACHE = `${CACHE_PREFIX}-pages-${VERSION}`;
@@ -33,7 +33,6 @@ self.addEventListener("install", (event) => {
     (async () => {
       const cache = await caches.open(SHELL_CACHE);
       await cache.addAll(SHELL_URLS);
-      await self.skipWaiting();
     })(),
   );
 });
@@ -53,7 +52,9 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("message", (event) => {
-  if (event.data?.type === "SKIP_WAITING") self.skipWaiting();
+  if (event.data?.type !== "SKIP_WAITING") return;
+  const activation = self.skipWaiting();
+  event.waitUntil?.(activation);
 });
 
 self.addEventListener("fetch", (event) => {

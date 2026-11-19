@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gorilla/websocket"
+	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // Client multiplexes RPC calls and server-initiated approvals over stdio or WS.
@@ -25,13 +28,18 @@ type Client struct {
 	writeMu  sync.Mutex
 	once     sync.Once
 	nextID   atomic.Int64
-	pending  map[string]chan json.RawMessage
+	pending  map[string]chan reply
 	notify   func(json.RawMessage)
 	closed   chan struct{}
 	read     func() ([]byte, error)
 	write    func([]byte) error
 	shutdown func() error
 }
+type reply struct {
+	message json.RawMessage
+	err     error
+}
+
 type RPCError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
@@ -40,20 +48,39 @@ type RPCError struct {
 
 func (e *RPCError) Error() string { return e.Message }
 func newClient() *Client {
-	return &Client{pending: map[string]chan json.RawMessage{}, closed: make(chan struct{})}
+	return &Client{pending: map[string]chan reply{}, closed: make(chan struct{})}
 }
 func Dial(ctx context.Context, rawURL string, token ...string) (*Client, error) {
-	headers := map[string][]string{}
-	if len(token) > 0 && token[0] != "" {
-		headers["Authorization"] = []string{"Bearer " + token[0]}
+	var accessToken string
+	if len(token) > 0 {
+		accessToken = token[0]
+	}
+	return dial(ctx, rawURL, accessToken, false)
+}
+
+func DialTextOnly(ctx context.Context, rawURL, token string) (*Client, error) {
+	return dial(ctx, rawURL, token, true)
+}
+
+func dial(ctx context.Context, rawURL, token string, textOnly bool) (*Client, error) {
+	headers := make(http.Header)
+	if token != "" {
+		headers.Set("Authorization", "Bearer "+token)
+	}
+	if textOnly {
+		headers.Set("X-CodexRM-TextOnly", "1")
 	}
 	conn, _, err := (&websocket.Dialer{HandshakeTimeout: 10 * time.Second}).DialContext(ctx, rawURL, headers)
 	if err != nil {
 		return nil, fmt.Errorf("dial app-server: %w", err)
 	}
-	conn.SetReadLimit(32 << 20)
 	c := newClient()
-	c.read = func() ([]byte, error) { _, b, e := conn.ReadMessage(); return b, e }
+	if textOnly {
+		conn.SetReadLimit(maxMessageBytes)
+		c.read = func() ([]byte, error) { _, b, err := conn.ReadMessage(); return b, err }
+	} else {
+		c.read = func() ([]byte, error) { return readWebSocketMessage(conn) }
+	}
 	c.write = func(b []byte) error {
 		_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		return conn.WriteMessage(websocket.TextMessage, b)
@@ -65,14 +92,29 @@ func Dial(ctx context.Context, rawURL string, token ...string) (*Client, error) 
 
 // Launch inherits the local login and config. Relay never receives login secrets.
 func Launch(ctx context.Context, executable, cwd string) (*Client, error) {
+	return launchStdio(ctx, executable, cwd, false)
+}
+
+// LaunchTextOnly starts a separate Codex process with selected tools disabled via process-local overrides.
+func LaunchTextOnly(ctx context.Context, executable, cwd string) (*Client, error) {
+	return launchStdio(ctx, executable, cwd, true)
+}
+
+func launchStdio(ctx context.Context, executable, cwd string, textOnly bool) (*Client, error) {
 	executable, err := resolveCodexExecutable(executable)
 	if err != nil {
 		return nil, err
 	}
-	// Release the durable writer as soon as the Agent unsubscribes an idle
-	// thread, so the desktop app can resume it immediately. This override is
-	// private to this process and does not change the user's Codex config.
-	cmd := exec.CommandContext(ctx, executable, "-c", "thread_unload_delay_secs=0", "app-server", "--listen", "stdio://")
+	// Release the durable writer when the Agent unsubscribes an idle thread.
+	args := []string{"-c", "thread_unload_delay_secs=0"}
+	if textOnly {
+		args = append(args, "-c", `web_search="disabled"`, "-c", "mcp_servers={}")
+		for _, feature := range []string{"shell_tool", "unified_exec", "unified_exec_tty", "browser_use", "computer_use", "view_image", "shell_snapshot", "shell_snapshot_v2"} {
+			args = append(args, "--disable", feature)
+		}
+	}
+	args = append(args, "app-server", "--listen", "stdio://")
+	cmd := exec.CommandContext(ctx, executable, args...)
 	hideChildProcess(cmd)
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Dir = cwd
@@ -90,19 +132,27 @@ func Launch(ctx context.Context, executable, cwd string) (*Client, error) {
 	if err != nil {
 		_ = stdin.Close()
 		_ = stdout.Close()
+		if textOnly {
+			return nil, fmt.Errorf("start text-only Codex: %w", err)
+		}
 		return nil, fmt.Errorf("start Codex (install Codex desktop or pass --codex): %w", err)
 	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 64*1024), 32<<20)
 	c := newClient()
-	c.read = func() ([]byte, error) {
-		if scanner.Scan() {
-			return append([]byte(nil), scanner.Bytes()...), nil
+	if textOnly {
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 64*1024), maxMessageBytes)
+		c.read = func() ([]byte, error) {
+			if scanner.Scan() {
+				return append([]byte(nil), scanner.Bytes()...), nil
+			}
+			if err := scanner.Err(); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("Codex process exited")
 		}
-		if e := scanner.Err(); e != nil {
-			return nil, e
-		}
-		return nil, errors.New("Codex process exited")
+	} else {
+		reader := bufio.NewReaderSize(stdout, 64*1024)
+		c.read = func() ([]byte, error) { return readStdioMessage(reader) }
 	}
 	c.write = func(b []byte) error { _, e := stdin.Write(append(b, '\n')); return e }
 	c.shutdown = func() error { _ = stdin.Close(); return process.Kill() }
@@ -110,6 +160,7 @@ func Launch(ctx context.Context, executable, cwd string) (*Client, error) {
 	go c.readLoop()
 	return c, nil
 }
+
 func (c *Client) Done() <-chan struct{} { return c.closed }
 func (c *Client) Close() error {
 	var err error
@@ -122,7 +173,22 @@ func (c *Client) readLoop() {
 	for {
 		data, err := c.read()
 		if err != nil {
-			return
+			var oversized *oversizedMessage
+			if !errors.As(err, &oversized) {
+				return
+			}
+			c.mu.Lock()
+			ch := c.pending[oversized.responseID]
+			c.mu.Unlock()
+			if ch != nil {
+				select {
+				case ch <- reply{err: ErrResponseTooLarge}:
+				default:
+				}
+			} else if oversized.responseID == "" {
+				log.Print("discarded oversized Codex app-server message without a recognized response ID")
+			}
+			continue
 		}
 		var msg struct {
 			ID     json.RawMessage `json:"id"`
@@ -137,7 +203,7 @@ func (c *Client) readLoop() {
 		c.mu.Unlock()
 		if msg.Method == "" && ch != nil {
 			select {
-			case ch <- json.RawMessage(data):
+			case ch <- reply{message: data}:
 			default:
 			}
 			continue
@@ -166,7 +232,7 @@ func (c *Client) Notify(method string, params any) error {
 }
 func (c *Client) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id := fmt.Sprint(c.nextID.Add(1))
-	ch := make(chan json.RawMessage, 1)
+	ch := make(chan reply, 1)
 	c.mu.Lock()
 	c.pending[id] = ch
 	c.mu.Unlock()
@@ -183,12 +249,15 @@ func (c *Client) Call(ctx context.Context, method string, params any) (json.RawM
 		return nil, ctx.Err()
 	case <-c.closed:
 		return nil, errors.New("app-server connection closed")
-	case raw := <-ch:
+	case response := <-ch:
+		if response.err != nil {
+			return nil, response.err
+		}
 		var msg struct {
 			Result json.RawMessage `json:"result"`
 			Error  *RPCError       `json:"error"`
 		}
-		if err := json.Unmarshal(raw, &msg); err != nil {
+		if err := json.Unmarshal(response.message, &msg); err != nil {
 			return nil, err
 		}
 		if msg.Error != nil {

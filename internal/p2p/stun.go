@@ -35,17 +35,20 @@ func bindingReply(req, buf []byte) netip.AddrPort {
 		if off+padded > end {
 			return netip.AddrPort{}
 		}
-		if (kind == 0x20 || kind == 1) && size == 8 && buf[off+1] == 1 {
+		if (kind == 0x20 || kind == 1) && ((size == 8 && buf[off+1] == 1) || (size == 20 && buf[off+1] == 2)) {
 			port := binary.BigEndian.Uint16(buf[off+2:])
-			addr := [4]byte(buf[off+4 : off+8])
+			var addr [16]byte
+			address := addr[:size-4]
+			copy(address, buf[off+4:off+size])
 			if kind == 0x20 {
 				port ^= 0x2112
-				for j := range addr {
-					addr[j] ^= req[4+j]
+				for j := range address {
+					address[j] ^= req[4+j]
 				}
 			}
+			ip, _ := netip.AddrFromSlice(address)
 			if port != 0 {
-				value := netip.AddrPortFrom(netip.AddrFrom4(addr), port)
+				value := netip.AddrPortFrom(ip.Unmap(), port)
 				if kind == 0x20 {
 					xorMapped = value
 				} else {

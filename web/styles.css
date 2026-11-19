@@ -409,6 +409,20 @@ svg {
   padding-left: 5px;
   border-left: 1px solid var(--border);
 }
+.workspace-older-threads {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  text-align: left;
+  color: var(--muted);
+  font-size: 12px;
+}
+.workspace-older-threads:hover,
+.workspace-older-threads:focus-visible {
+  color: var(--text);
+  background: var(--surface-hover);
+}
 .history-label {
   padding: 8px 10px 2px;
   color: var(--dim);
@@ -755,12 +769,6 @@ svg {
   width: 25px;
   height: 25px;
 }
-.eyebrow {
-  font-size: 11px;
-  letter-spacing: 2px;
-  color: var(--muted);
-  margin-bottom: 15px;
-}
 .welcome h1 {
   font-size: 26px;
   line-height: 32px;
@@ -795,11 +803,17 @@ svg {
   box-shadow: 0 2px 10px #00000008;
   transition: border-color 0.15s;
 }
+html[data-theme="light"] body {
+  --accent: #3568d4;
+  --accent-text: #fff;
+}
 html[data-theme="light"] .composer {
   border-color: var(--border);
 }
 .composer:focus-within {
-  border-color: var(--dsw-alias-border-l4);
+  border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 .composer textarea {
   width: 100%;
@@ -1016,6 +1030,7 @@ html[data-theme="light"] .composer {
 .model-group-label { padding: 8px 10px 4px; font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
 .model-choice > span:first-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .model-check { color: var(--accent); }
+.model-group-notes { margin: 0; padding: 0 10px 4px; font-size: 12px; color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; }
 .model-empty, .model-warning { margin: 0; padding: 8px 10px; font-size: 12px; color: var(--dim); }
 @media (max-width: 560px) {
   .permission-trigger #permission-label, .permission-trigger > [data-icon]:last-child, #model-effort-label { display: none; }
@@ -1876,8 +1891,8 @@ html[data-theme="light"] .composer {
   }
   .thread-row .thread-more {
     opacity: 1;
-    width: 40px;
-    flex-basis: 40px;
+    width: 44px;
+    flex-basis: 44px;
   }
   .sidebar-overlay {
     position: fixed;
@@ -1958,12 +1973,12 @@ html[data-theme="light"] .composer {
     gap: 7px;
   }
   .header-actions .icon-button {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
   }
   .connection-badge {
     max-width: 130px;
-    min-height: 36px;
+    min-height: 44px;
     font-size: 11px;
     padding: 6px 10px;
   }
@@ -1985,9 +2000,6 @@ html[data-theme="light"] .composer {
   }
   .welcome-mark {
     margin-bottom: 0;
-  }
-  .eyebrow {
-    font-size: 10px;
   }
   .home .workspace {
     padding-bottom: 5vh;
@@ -2021,6 +2033,13 @@ html[data-theme="light"] .composer {
     display: flex;
     gap: 4px;
   }
+  .model-trigger,
+  .permission-trigger,
+  .message-tools button,
+  .attachment-card .icon-button {
+    min-width: 44px;
+    min-height: 44px;
+  }
   .composer-options select {
     max-width: 130px;
     min-height: 40px;
@@ -2031,12 +2050,12 @@ html[data-theme="light"] .composer {
     max-width: none;
   }
   .composer-options .icon-button {
-    width: 40px;
-    height: 40px;
+    width: 44px;
+    height: 44px;
   }
   .send-button {
-    width: 36px;
-    height: 36px;
+    width: 44px;
+    height: 44px;
   }
   .running-actions button,
   .message-queue button {
@@ -2099,4 +2118,20 @@ html[data-theme="light"] .composer {
     scroll-behavior: auto !important;
     transition: none !important;
   }
+}
+
+.history-images {
+  display: grid;
+  gap: 8px;
+}
+.history-image {
+  display: block;
+  max-width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  border-radius: 10px;
+}
+.history-image:not([src]) {
+  width: min(240px, 100%);
+  min-height: 64px;
 }

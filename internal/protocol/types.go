@@ -16,6 +16,13 @@ const (
 	RoleClient Role = "client"
 )
 
+const (
+	ClientKindFull  = "full"
+	ClientKindRobot = "robot"
+)
+
+const DeviceTypeRobot = "robot"
+
 // ConnectionStatus mirrors Codex remote-control status values.
 type ConnectionStatus string
 
@@ -112,6 +119,8 @@ type Envelope struct {
 	PingID     string          `json:"pingId,omitempty"`
 	P2P        *P2PSignal      `json:"p2p,omitempty"`
 	SkipDirect []string        `json:"skipDirect,omitempty"`
+	// ClientKind is assigned by the relay. Clients cannot choose it.
+	ClientKind string `json:"clientKind,omitempty"`
 }
 
 const (

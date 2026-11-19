@@ -16,22 +16,30 @@ import (
 )
 
 // Packages cannot replace local connection settings, credentials or startup preferences.
+const linuxBinary = "codexrm-agent"
+
 var managedFiles = []string{
 	"bin/codexrm-agent.exe",
 }
 
 type Plan struct {
-	InstallDir string   `json:"installDir"`
-	StageDir   string   `json:"stageDir"`
-	ParentPID  int      `json:"parentPid"`
-	Args       []string `json:"args"`
-	WorkingDir string   `json:"workingDir"`
-	Manifest   Manifest `json:"manifest"`
+	InstallDir      string `json:"installDir"`
+	stateDir        string
+	linuxExecutable string
+	StageDir        string   `json:"stageDir"`
+	ParentPID       int      `json:"parentPid"`
+	Args            []string `json:"args"`
+	WorkingDir      string   `json:"workingDir"`
+	Manifest        Manifest `json:"manifest"`
 }
 
 func (p *Plan) planPath() string { return filepath.Join(p.StageDir, "plan.json") }
 func (p *Plan) Discard() {
-	if filepath.Dir(p.StageDir) == filepath.Join(p.InstallDir, ".state") && strings.HasPrefix(filepath.Base(p.StageDir), "update-") {
+	stateDir := p.stateDir
+	if stateDir == "" {
+		stateDir = filepath.Join(p.InstallDir, ".state")
+	}
+	if filepath.Dir(p.StageDir) == stateDir && strings.HasPrefix(filepath.Base(p.StageDir), "update-") {
 		_ = os.RemoveAll(p.StageDir)
 	}
 }
@@ -40,25 +48,33 @@ func (p *Plan) payload(relative string) string {
 }
 
 func preparePackage(stage, archive string, cfg Config, m Manifest) (*Plan, error) {
-	if err := extractPackage(archive, filepath.Join(stage, "payload")); err != nil {
+	files := managedFiles
+	if cfg.LinuxExecutable != "" {
+		files = []string{linuxBinary}
+	}
+	if err := extractPackageFiles(archive, filepath.Join(stage, "payload"), files); err != nil {
 		return nil, err
 	}
 	workingDir, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
-	plan := &Plan{InstallDir: cfg.InstallDir, StageDir: stage, ParentPID: os.Getpid(), Args: cfg.Args, WorkingDir: workingDir, Manifest: m}
+	plan := &Plan{InstallDir: cfg.InstallDir, StageDir: stage, ParentPID: os.Getpid(), Args: cfg.Args, WorkingDir: workingDir, Manifest: m, stateDir: cfg.StateDir, linuxExecutable: cfg.LinuxExecutable}
 	return plan, nil
 }
 
 func extractPackage(archive, destination string) error {
+	return extractPackageFiles(archive, destination, managedFiles)
+}
+
+func extractPackageFiles(archive, destination string, files []string) error {
 	r, err := zip.OpenReader(archive)
 	if err != nil {
 		return fmt.Errorf("open update ZIP: %w", err)
 	}
 	defer r.Close()
-	allowed := make(map[string]bool, len(managedFiles))
-	for _, file := range managedFiles {
+	allowed := make(map[string]bool, len(files))
+	for _, file := range files {
 		allowed[file] = true
 	}
 	seen := map[string]bool{}
@@ -77,6 +93,9 @@ func extractPackage(archive, destination string) error {
 		clean = strings.TrimPrefix(clean, "CodexRM/")
 		if !allowed[clean] || entry.FileInfo().IsDir() {
 			continue
+		}
+		if !entry.Mode().IsRegular() {
+			return errors.New("update ZIP contains a non-regular executable")
 		}
 		if seen[clean] {
 			return errors.New("duplicate file in update ZIP")
@@ -112,8 +131,8 @@ func extractPackage(archive, destination string) error {
 			return errors.New("unpacked update size mismatch")
 		}
 	}
-	if len(seen) != len(managedFiles) {
-		return errors.New("update ZIP is missing required Windows client files")
+	if len(seen) != len(files) {
+		return fmt.Errorf("update ZIP is missing required files: %s", strings.Join(files, ", "))
 	}
 	return nil
 }
@@ -122,7 +141,11 @@ func extractPackage(archive, destination string) error {
 func (p *Plan) VerifyBinary(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, p.payload("bin/codexrm-agent.exe"), "--version")
+	binary := managedFiles[0]
+	if p.linuxExecutable != "" {
+		binary = linuxBinary
+	}
+	cmd := exec.CommandContext(ctx, p.payload(binary), "--version")
 	hideProcess(cmd)
 	output, err := cmd.Output()
 	if err != nil {
@@ -133,7 +156,7 @@ func (p *Plan) VerifyBinary(ctx context.Context) error {
 		VersionName string `json:"versionName"`
 	}
 	if json.Unmarshal(output, &version) != nil || version.VersionCode != p.Manifest.VersionCode || version.VersionName != p.Manifest.VersionName {
-		return errors.New("downloaded client version differs from update.json")
+		return errors.New("downloaded client version differs from update manifest")
 	}
 	return nil
 }

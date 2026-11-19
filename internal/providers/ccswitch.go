@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,7 @@ type ReasoningEffort struct {
 type Provider struct {
 	ID           string  `json:"id"`
 	Name         string  `json:"name"`
+	Notes        string  `json:"notes,omitempty"`
 	Source       string  `json:"source"`
 	DefaultModel string  `json:"defaultModel,omitempty"`
 	Models       []Model `json:"models"`
@@ -92,23 +94,23 @@ func Load(ctx context.Context, path string) ([]Provider, error) {
 		return nil, fmt.Errorf("无法打开 CCSwitch 数据库")
 	}
 	defer db.Close()
-	rows, err := db.QueryContext(ctx, "SELECT id, name, settings_config FROM providers WHERE app_type = 'codex' ORDER BY COALESCE(sort_index, 2147483647), rowid")
+	rows, err := db.QueryContext(ctx, "SELECT id, name, settings_config, COALESCE(notes, '') FROM providers WHERE app_type = 'codex' ORDER BY COALESCE(sort_index, 2147483647), rowid")
 	if err != nil {
 		return nil, fmt.Errorf("无法读取 CCSwitch 的 Codex 供应商")
 	}
 	defer rows.Close()
 	out := []Provider{}
 	for rows.Next() {
-		var id, name, settings string
-		if err := rows.Scan(&id, &name, &settings); err != nil {
+		var id, name, settings, notes string
+		if err := rows.Scan(&id, &name, &settings, &notes); err != nil {
 			return nil, fmt.Errorf("无法读取 CCSwitch 供应商记录")
 		}
 		p, err := parse(id, name, settings)
 		if err != nil {
 			// A broken provider must not hide the other providers or expose config values.
-			hash := sha256.Sum256([]byte(id))
-			p = Provider{ID: "ccswitch_" + hex.EncodeToString(hash[:8]), Name: name, Source: "CCSwitch", Models: []Model{}, Warning: "供应商配置无效，请在 CCSwitch 中检查"}
+			p = Provider{ID: providerID(id), Name: name, Source: "CCSwitch", Models: []Model{}, Warning: "供应商配置无效，请在 CCSwitch 中检查"}
 		}
+		p.Notes = strings.TrimSpace(notes)
 		if p.Official() {
 			cached := officialModels(filepath.Join(filepath.Dir(abs), "codex-official-models.json"))
 			if len(cached) > 0 {
@@ -142,25 +144,91 @@ func Load(ctx context.Context, path string) ([]Provider, error) {
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("读取 CCSwitch 供应商失败")
 	}
-	counts := map[string]int{}
-	labels := map[string]int{}
-	for _, p := range out {
-		counts[p.Name]++
-	}
-	for i := range out {
-		if counts[out[i].Name] > 1 {
-			label := out[i].DefaultModel
-			if label == "" {
-				label = out[i].ID[len("ccswitch_"):]
-			}
-			out[i].Name += " · " + label
-		}
-		labels[out[i].Name]++
-		if labels[out[i].Name] > 1 {
-			out[i].Name += " · " + out[i].ID[len("ccswitch_"):len("ccswitch_")+6]
-		}
-	}
 	return out, nil
+}
+
+type codexConfig struct {
+	Model     string                    `toml:"model"`
+	Provider  string                    `toml:"model_provider"`
+	Providers map[string]map[string]any `toml:"model_providers"`
+}
+
+// CurrentProviderID identifies a saved provider whose connection settings match
+// the local Codex configuration. Model names alone do not identify a provider.
+func CurrentProviderID(items []Provider, dbPath string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		home = filepath.Join(userHome, ".codex")
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil && !os.IsNotExist(err) {
+		return ""
+	}
+	var cfg codexConfig
+	if toml.Unmarshal(data, &cfg) != nil {
+		return ""
+	}
+	live := cfg.Providers[cfg.Provider]
+	if len(live) > 0 && live["experimental_bearer_token"] == nil && live["requires_openai_auth"] == true && live["env_key"] == nil {
+		if auth, err := os.ReadFile(filepath.Join(home, "auth.json")); err == nil {
+			var credentials map[string]any
+			if json.Unmarshal(auth, &credentials) == nil {
+				applyAPIKey(live, credentials)
+			}
+		}
+	}
+	if dbPath == "" {
+		dbPath = DefaultPath()
+	}
+	var settings struct {
+		Current string `json:"currentProviderCodex"`
+	}
+	var preferred string
+	if data, err := os.ReadFile(filepath.Join(filepath.Dir(dbPath), "settings.json")); err == nil && json.Unmarshal(data, &settings) == nil && settings.Current != "" {
+		preferred = providerID(settings.Current)
+	}
+	var matched string
+	matches := 0
+	for _, p := range items {
+		if p.Warning != "" {
+			continue
+		}
+		same := p.Official() && (cfg.Provider == "" || cfg.Provider == "openai")
+		if !p.Official() && live != nil {
+			same = reflect.DeepEqual(live, p.config)
+		}
+		if same {
+			if p.ID == preferred {
+				return p.ID
+			}
+			matched = p.ID
+			matches++
+		}
+	}
+	if matches == 1 {
+		return matched
+	}
+	return ""
+}
+
+func providerID(id string) string {
+	hash := sha256.Sum256([]byte(id))
+	return "ccswitch_" + hex.EncodeToString(hash[:8])
+}
+
+func applyAPIKey(config, auth map[string]any) {
+	if key, _ := auth["OPENAI_API_KEY"].(string); key != "" {
+		delete(config, "env_key")
+		config["experimental_bearer_token"] = key
+		config["requires_openai_auth"] = false
+	}
 }
 
 func officialModels(path string) []Model {
@@ -206,8 +274,7 @@ func officialModels(path string) []Model {
 }
 
 func parse(id, name, raw string) (Provider, error) {
-	hash := sha256.Sum256([]byte(id))
-	p := Provider{ID: "ccswitch_" + hex.EncodeToString(hash[:8]), Name: name, Source: "CCSwitch", Models: []Model{}}
+	p := Provider{ID: providerID(id), Name: name, Source: "CCSwitch", Models: []Model{}}
 	var settings struct {
 		Auth    map[string]any `json:"auth"`
 		Config  string         `json:"config"`
@@ -223,11 +290,7 @@ func parse(id, name, raw string) (Provider, error) {
 	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
 		return p, err
 	}
-	var cfg struct {
-		Model     string                    `toml:"model"`
-		Provider  string                    `toml:"model_provider"`
-		Providers map[string]map[string]any `toml:"model_providers"`
-	}
+	var cfg codexConfig
 	if err := toml.Unmarshal([]byte(settings.Config), &cfg); err != nil {
 		return p, err
 	}
@@ -243,12 +306,8 @@ func parse(id, name, raw string) (Provider, error) {
 		if wire != "" && wire != "responses" {
 			return p, fmt.Errorf("unsupported wire API")
 		}
-		if key, _ := settings.Auth["OPENAI_API_KEY"].(string); key != "" {
-			// Each provider owns its bearer token even when CCSwitch calls all of them custom.
-			delete(p.config, "env_key")
-			p.config["experimental_bearer_token"] = key
-			p.config["requires_openai_auth"] = false
-		}
+		// Each provider owns its bearer token even when CCSwitch calls all of them custom.
+		applyAPIKey(p.config, settings.Auth)
 	}
 	seen := map[string]bool{}
 	for _, entry := range settings.Catalog.Models {

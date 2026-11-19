@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/codexrm/codexrm/internal/agent"
@@ -37,12 +38,22 @@ func defaultConfigPath() string {
 	return filepath.Join(dir, "CodexRM", ".state", "connection.json")
 }
 
+func fatal(err any) {
+	log.Print(err)
+	desktop.ShowStartupError(fmt.Sprint(err))
+	if err := updater.RollbackStartup(); err != nil {
+		log.Print(err)
+	}
+	os.Exit(1)
+}
+
 func main() {
 	configPath := flag.String("config", defaultConfigPath(), "local connection settings JSON")
 	serverURL := flag.String("server", "", "CodexRM server URL (overrides saved settings)")
 	appServer := flag.String("appserver", "", "local Codex app-server websocket URL")
 	name := flag.String("name", "", "display name for this host")
-	dataDir := flag.String("data", "", "agent credential directory")
+	dataDir := flag.String("data", "", "root directory for per-server agent credentials")
+	wxLocalRelay := flag.String("wx-local-relay", "", "optional same-host relay for local WeChat robots")
 	mock := flag.Bool("mock", false, "start an in-process mock app-server")
 	mockAddr := flag.String("mock-addr", "127.0.0.1:0", "mock app-server listen address")
 	doPair := flag.Bool("pair", false, "create a pairing code and exit")
@@ -67,7 +78,8 @@ func main() {
 	setupDir := flag.String("setup-dir", "", "internal: installer target directory")
 	setupAutostart := flag.Bool("setup-autostart", false, "internal: record the setup startup preference")
 	restart := flag.Bool("restart", false, "stop the existing agent and restart the service")
-	settings := flag.Bool("settings", false, "open the local settings page")
+	settings := flag.Bool("settings", false, "open the local settings page (Windows/macOS)")
+	lanSettings := flag.Bool("lan-settings", false, "allow LAN access to the settings page (trusted networks only)")
 	uninstall := flag.Bool("uninstall", false, "uninstall this Windows installation")
 	uninstallDir := flag.String("uninstall-dir", "", "internal: uninstall using a temporary helper")
 	flag.Parse()
@@ -81,7 +93,7 @@ func main() {
 		return
 	}
 	if installation.IsPackaged() && (*applyUpdate != "" || *installUpdate || *updateDir != "" || *uninstallDir != "" || *setupAction != "") {
-		log.Fatal("MSIX 版本由 Windows 管理安装和更新，请使用对应的 MSIX 或 App Installer 文件")
+		fatal("MSIX 版本由 Windows 管理安装和更新，请使用对应的 MSIX 或 App Installer 文件")
 	}
 	if *setupAction != "" {
 		if err := installation.SetupAction(*setupAction, *setupDir, *setupAutostart); err != nil {
@@ -93,46 +105,45 @@ func main() {
 	}
 	if *applyUpdate != "" {
 		if err := updater.Apply(*applyUpdate); err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		return
 	}
 	if *uninstallDir != "" {
 		if err := installation.Uninstall(context.Background(), *uninstallDir); err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		return
 	}
 	*configPath, _ = filepath.Abs(*configPath)
+	restoreLog := tray.ConfigureLog(filepath.Join(filepath.Dir(*configPath), "agent.log"))
+	defer restoreLog()
 	root := filepath.Dir(filepath.Dir(*configPath))
 	if *uninstall {
 		if installation.IsPackaged() || installation.UsesSetup(root) {
 			if err := desktop.OpenBrowser("ms-settings:appsfeatures"); err != nil {
-				log.Fatal(err)
+				fatal(err)
 			}
 			return
 		}
 		if err := installation.BeginUninstall(root); err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		return
 	}
 	cfg, err := clientconfig.Load(*configPath)
 	if err != nil {
-		log.Fatal(err)
+		fatal(err)
 	}
 	if *serverURL != "" {
 		normalized, err := clientconfig.ServerURL(*serverURL)
 		if err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		if normalized != cfg.Server {
 			cfg.EnrollmentKey = ""
 		}
 		cfg.Server = normalized
-	}
-	if *enrollKey != "" {
-		cfg.EnrollmentKey = *enrollKey
 	}
 	if *cwd != "" {
 		cfg.Workspace = *cwd
@@ -141,30 +152,41 @@ func main() {
 		cfg.CodexPath = *codexPath
 	}
 	if err := cfg.Normalize(); err != nil {
-		log.Fatal(err)
+		fatal(err)
+	}
+	// The public relay uses keyless enrollment. Keep private relay keys local.
+	if *enrollKey != "" && cfg.Server != clientconfig.DefaultRelayServer {
+		cfg.EnrollmentKey = strings.TrimSpace(*enrollKey)
 	}
 	if cfg.Workspace == "" {
 		cfg.Workspace, _ = os.UserHomeDir()
 	}
 	if *checkUpdate || *installUpdate {
-		if *updateDir == "" {
-			log.Fatal("--update-dir is required")
+		if *updateDir == "" && (runtime.GOOS != "linux" || *installUpdate) {
+			fatal("--update-dir is required")
 		}
-		u, err := updater.New(updater.Config{ServerURL: cfg.UpdateServer, ManifestURL: cfg.ManifestURL(), InstallDir: *updateDir, VersionCode: *currentVersion})
+		manifest := cfg.ManifestURL()
+		if runtime.GOOS == "linux" {
+			if runtime.GOARCH != "amd64" {
+				fatal("the Linux Agent update feed is for amd64")
+			}
+			manifest = clientconfig.LinuxUpdateManifest
+		}
+		u, err := updater.New(updater.Config{ServerURL: cfg.UpdateServer, ManifestURL: manifest, InstallDir: *updateDir, VersionCode: *currentVersion})
 		if err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		if *installUpdate {
 			if runtime.GOOS != "windows" {
-				log.Fatal("manual installation is only supported on Windows")
+				fatal("manual installation is only supported on Windows")
 			}
 			plan, err := u.Prepare(context.Background())
 			if err != nil {
-				log.Fatal(err)
+				fatal(err)
 			}
 			if plan != nil {
 				if err := plan.InstallStopped(context.Background()); err != nil {
-					log.Fatal(err)
+					fatal(err)
 				}
 				plan.Discard()
 				_ = json.NewEncoder(os.Stdout).Encode(plan.Manifest)
@@ -172,7 +194,7 @@ func main() {
 		} else {
 			m, err := u.Inspect(context.Background())
 			if err != nil {
-				log.Fatal(err)
+				fatal(err)
 			}
 			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"updateAvailable": m != nil && m.VersionCode > *currentVersion, "manifest": m})
 		}
@@ -181,31 +203,31 @@ func main() {
 	base := agent.Config{ServerURL: cfg.Server, EnrollmentKey: cfg.EnrollmentKey, AppServerURL: *appServer, AppServerToken: *appToken, Name: *name, DataDir: *dataDir, Mock: *mock, MockAddr: *mockAddr, CodexPath: cfg.CodexPath, Cwd: cfg.Workspace, CCSwitchDB: *ccswitchDB}
 	if *doPair || *listDevices || *removeDevice != "" {
 		if *listDevices && *removeDevice != "" {
-			log.Fatal("--list-devices and --remove-device cannot be used together")
+			fatal("--list-devices and --remove-device cannot be used together")
 		}
-		a, err := agent.New(base)
+		a, err := agent.NewForServer(base)
 		if err != nil {
-			log.Fatal(err)
+			fatal(err)
 		}
 		if *listDevices {
 			devices, err := a.ListDevices(context.Background())
 			if err != nil {
-				log.Fatal(err)
+				fatal(err)
 			}
 			_ = json.NewEncoder(os.Stdout).Encode(devices)
 		} else if *removeDevice != "" {
 			if err := a.RemoveDevice(context.Background(), *removeDevice); err != nil {
-				log.Fatal(err)
+				fatal(err)
 			}
 			fmt.Println("Device authorization removed.")
 		} else {
 			pair, err := a.Pair(context.Background())
 			if err != nil {
-				log.Fatal(err)
+				fatal(err)
 			}
 			instructions, err := a.PairingInstructions(pair)
 			if err != nil {
-				log.Fatal(err)
+				fatal(err)
 			}
 			fmt.Println(instructions)
 		}
@@ -213,7 +235,7 @@ func main() {
 	}
 	instance, err := desktop.Acquire(filepath.Dir(*configPath), *restart)
 	if err != nil {
-		log.Fatal(err)
+		fatal(err)
 	}
 	if instance == nil {
 		return
@@ -223,10 +245,10 @@ func main() {
 		if err == desktop.ErrP2PFirewallRequired {
 			return
 		}
-		log.Fatal(err)
+		fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(*configPath), 0700); err != nil {
-		log.Fatal(err)
+		fatal(err)
 	}
 	installDir := *updateDir
 	if installDir == "" && !installation.IsPackaged() {
@@ -244,19 +266,43 @@ func main() {
 	}
 	host, err := agenthost.New(*configPath, installDir, cfg, base)
 	if err != nil {
-		log.Fatal(err)
+		fatal(err)
 	}
-	host.OpenOnStart = *settings || !host.Configured()
+	if runtime.GOOS == "linux" && *wxLocalRelay != "" {
+		if err := host.SetWXLocalRelay(*wxLocalRelay); err != nil {
+			fatal(err)
+		}
+	}
+	host.LANSettings = *lanSettings
+	host.LinuxUpdateExecutable = updater.LinuxExecutable()
+	host.OpenOnStart = runtime.GOOS != "linux" && (*settings || !host.Configured())
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := tray.Run(ctx, host.StateDir(), host.OpenSettings, func(runCtx context.Context) error {
+	if err := tray.Run(ctx, host.StateDir(), host.OpenSettings, func() string {
+		switch host.Status().State {
+		case agent.Connected:
+			return "CodexRM · 已连接"
+		case agent.Retrying:
+			return "CodexRM · 连接中断，等待重试"
+		case agent.Degraded:
+			return "CodexRM · 功能受限"
+		case agent.Connecting:
+			return "CodexRM · 正在连接"
+		default:
+			return "CodexRM · 未配置服务器"
+		}
+	}, func(runCtx context.Context) error {
+		watchCtx, stopWatch := context.WithCancel(runCtx)
 		watchDone := make(chan struct{})
-		go func() { defer close(watchDone); instance.Watch(runCtx, host.OpenSettings, cancel) }()
+		go func() { defer close(watchDone); instance.Watch(watchCtx, host.OpenSettings, cancel) }()
 		err := host.Run(runCtx)
-		cancel()
+		stopWatch()
 		<-watchDone
 		return err
 	}); err != nil && ctx.Err() == nil {
-		log.Fatal(err)
+		fatal(err)
+	}
+	if err := host.RestartUpdate(ctx); err != nil {
+		fatal(err)
 	}
 }

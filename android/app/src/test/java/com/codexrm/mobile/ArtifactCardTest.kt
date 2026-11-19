@@ -6,7 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class ArtifactCardTest {
-    @Test fun onlyLocalSupportedMarkdownLinksAreCandidates() {
+    @Test fun explicitLocalMarkdownLinksAreCandidates() {
         val text = """
             [构建结果](outputs/test%20build.apk)
             [Windows](C:/project/演示.pptx)
@@ -15,10 +15,21 @@ class ArtifactCardTest {
             [公网](https://example.com/releases/out.apk)
             [远程文件](file://NAS/exports/report.docx)
             [相对网络](//example.com/out.mp4)
-            [代码](src/App.kt)
+            [代码](/E:/code/Go/CodexRM/src/App.kt:42:7)
+            [归档](output/result+notes.zip)
+            [说明](README)
+            [内部锚点](#L12)
+            [目录](outputs/)
+            [网络](https://example.com/src/App.kt#L42)
+            [Android 内容](content://provider/item)
+            [APK](E:/code/Go/CodexRM/android/app/build/outputs/apk/debug/app-debug.apk)
         """.trimIndent()
         val cards = ProtocolFormatter.fromItem(JSONObject().put("type", "agentMessage").put("text", text)).files
-        assertEquals(listOf("outputs/test build.apk", "C:/project/演示.pptx", "C:/project/reports/summary.pdf", "/mnt/data/sample.png"), cards.map { it.path })
+        assertEquals(listOf(
+            "outputs/test build.apk", "C:/project/演示.pptx", "C:/project/reports/summary.pdf", "/mnt/data/sample.png",
+            "E:/code/Go/CodexRM/src/App.kt", "output/result+notes.zip", "README",
+            "E:/code/Go/CodexRM/android/app/build/outputs/apk/debug/app-debug.apk",
+        ), cards.map { it.path })
         assertEquals(true, cards.all { it.linked })
     }
 

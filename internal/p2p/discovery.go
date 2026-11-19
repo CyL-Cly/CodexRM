@@ -37,10 +37,11 @@ func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal
 			}
 		}
 	}
+	ipv6 := start.IPv6 && socket.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Is6()
 	seen := make(map[netip.AddrPort]bool)
 	for _, server := range start.STUN {
 		dst, err := netip.ParseAddrPort(server)
-		if err != nil || !dst.Addr().Is4() || dst.Port() == 0 || seen[dst] {
+		if err != nil || (!dst.Addr().Is4() && !ipv6) || dst.Addr().Zone() != "" || dst.Port() == 0 || seen[dst] {
 			continue
 		}
 		if req := bindingRequest(); req != nil {
@@ -83,6 +84,7 @@ func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal
 			if err != nil {
 				break
 			}
+			from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
 			for i := range queries {
 				q := &queries[i]
 				if from != q.dst || q.mapped.IsValid() {
@@ -91,7 +93,10 @@ func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal
 				if q.verifier {
 					q.mapped, q.proof = verifyReply(q.request, buf[:n])
 				} else {
-					q.mapped = bindingReply(q.request, buf[:n])
+					mapped := bindingReply(q.request, buf[:n])
+					if mapped.IsValid() && mapped.Addr().Is4() == q.dst.Addr().Is4() {
+						q.mapped = mapped
+					}
 				}
 				if q.mapped.IsValid() {
 					pending--
@@ -122,7 +127,7 @@ func classifyMapping(queries []discoveryQuery) (string, int) {
 	var samples []sample
 	seenDst := make(map[netip.AddrPort]struct{})
 	for _, q := range queries {
-		if q.verifier || !q.mapped.IsValid() {
+		if q.verifier || !q.mapped.Addr().Is4() {
 			continue
 		}
 		if _, ok := seenDst[q.dst]; ok {

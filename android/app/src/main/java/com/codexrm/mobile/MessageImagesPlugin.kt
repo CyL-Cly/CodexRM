@@ -1,8 +1,6 @@
 package com.codexrm.mobile
 
-import android.app.AlertDialog
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.ColorFilter
 import android.graphics.Paint
@@ -13,7 +11,6 @@ import android.text.Spanned
 import android.text.TextPaint
 import android.text.style.ClickableSpan
 import android.view.View
-import android.widget.ImageView
 import android.widget.TextView
 import io.noties.markwon.AbstractMarkwonPlugin
 import io.noties.markwon.MarkwonSpansFactory
@@ -26,12 +23,14 @@ import org.commonmark.node.Image
 import java.util.WeakHashMap
 
 internal class MessageImagesPlugin(private val context: Context, private val images: MessageImageLoader) : AbstractMarkwonPlugin() {
+    var messageId = ""
+    private val sources = WeakHashMap<AsyncDrawable, MessageImage>()
     private val requests = WeakHashMap<AsyncDrawable, Any>()
     private val loader = object : AsyncDrawableLoader() {
         override fun load(drawable: AsyncDrawable) {
             val token = Any()
             requests[drawable] = token
-            val image = MessageImage.fromSource(drawable.destination)
+            val image = sources[drawable]
             if (image == null) { drawable.setResult(label("图片地址不支持")); return }
             images.load(image) { result ->
                 if (requests[drawable] !== token || !drawable.isAttached) return@load
@@ -53,12 +52,15 @@ internal class MessageImagesPlugin(private val context: Context, private val ima
         builder.setFactory(Image::class.java) { configuration, props ->
             val source = ImageProps.DESTINATION.require(props)
             val drawable = AsyncDrawable(source, loader, configuration.imageSizeResolver(), ImageProps.IMAGE_SIZE.get(props))
+            val image = MessageImage.fromSource(source)?.copy(messageId = messageId)
+            if (image != null) sources[drawable] = image
             arrayOf<Any>(
                 AsyncDrawableSpan(configuration.theme(), drawable, AsyncDrawableSpan.ALIGN_BOTTOM, false),
                 object : ClickableSpan() {
                     override fun onClick(widget: View) {
                         val bitmap = (drawable.result as? BitmapDrawable)?.bitmap
-                        if (bitmap != null) showImage(context, bitmap, "图片") else loader.load(drawable)
+                        if (bitmap != null && image != null) showImagePreview(widget.context, images, image, bitmap)
+                        else loader.load(drawable)
                     }
                     override fun updateDrawState(ds: TextPaint) { ds.isUnderlineText = false }
                 },
@@ -83,15 +85,4 @@ internal class MessageImagesPlugin(private val context: Context, private val ima
         override fun setColorFilter(colorFilter: ColorFilter?) { paint.colorFilter = colorFilter }
         override fun getOpacity(): Int = PixelFormat.OPAQUE
     }
-}
-
-internal fun showImage(context: Context, bitmap: Bitmap, name: String) {
-    val image = ImageView(context).apply {
-        setImageBitmap(bitmap)
-        scaleType = ImageView.ScaleType.FIT_CENTER
-        adjustViewBounds = true
-        contentDescription = name
-        setPadding(Ui.dp(context, 8), Ui.dp(context, 8), Ui.dp(context, 8), Ui.dp(context, 8))
-    }
-    AlertDialog.Builder(context).setTitle(name).setView(image).setPositiveButton("关闭", null).show()
 }

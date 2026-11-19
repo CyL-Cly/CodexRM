@@ -7,6 +7,7 @@ import (
 	"github.com/gorilla/websocket"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,7 @@ type mockHub struct {
 type mockConn struct {
 	hub       *mockHub
 	conn      *websocket.Conn
+	textOnly  bool
 	mu        sync.Mutex
 	pendingMu sync.Mutex
 	pending   map[string]chan json.RawMessage
@@ -46,7 +48,7 @@ func StartMock(addr string) (*MockServer, error) {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		conn, e := up.Upgrade(w, r, nil)
 		if e == nil {
-			h.serve(conn)
+			h.serve(conn, r.Header.Get("X-CodexRM-TextOnly") == "1")
 		}
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -87,11 +89,11 @@ func (h *mockHub) threadLocked(id string) map[string]any {
 	}
 	return nil
 }
-func (h *mockHub) serve(conn *websocket.Conn) {
+func (h *mockHub) serve(conn *websocket.Conn, textOnly bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer conn.Close()
-	c := &mockConn{hub: h, conn: conn, pending: map[string]chan json.RawMessage{}, ctx: ctx, loaded: map[string]bool{}}
+	c := &mockConn{hub: h, conn: conn, textOnly: textOnly, pending: map[string]chan json.RawMessage{}, ctx: ctx, loaded: map[string]bool{}}
 	h.mu.Lock()
 	h.connections[c] = true
 	h.mu.Unlock()
@@ -124,6 +126,15 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 		switch msg.Method {
 		case "initialize":
 			c.reply(id, map[string]any{"userAgent": "codexrm-mock/0.2.0", "platformFamily": "mock"})
+		case "experimentalFeature/list":
+			enabled := !c.textOnly
+			c.reply(id, map[string]any{"data": []any{
+				map[string]any{"name": "shell_tool", "enabled": enabled, "defaultEnabled": true, "stage": "stable"},
+				map[string]any{"name": "browser_use", "enabled": enabled, "defaultEnabled": true, "stage": "stable"},
+				map[string]any{"name": "computer_use", "enabled": enabled, "defaultEnabled": true, "stage": "stable"},
+				map[string]any{"name": "view_image", "enabled": enabled, "defaultEnabled": true, "stage": "stable"},
+				map[string]any{"name": "shell_snapshot", "enabled": enabled, "defaultEnabled": true, "stage": "stable"},
+			}})
 		case "initialized":
 		case "model/list":
 			c.reply(id, map[string]any{"data": []any{map[string]any{"id": "mock-codex", "model": "mock-codex", "displayName": "Codex · 演示", "isDefault": true, "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "medium", "description": "默认"}}}}, "nextCursor": nil})
@@ -176,7 +187,14 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 			copy := clone(t)
 			h.mu.Unlock()
 			c.loaded[t["id"].(string)] = true
-			c.reply(id, map[string]any{"thread": copy, "model": model, "modelProvider": provider, "cwd": cwd})
+			reply := map[string]any{"thread": copy, "model": model, "modelProvider": provider, "cwd": cwd}
+			if sandbox, ok := p["sandbox"]; ok {
+				reply["sandbox"] = sandbox
+			}
+			if approval, ok := p["approvalPolicy"]; ok {
+				reply["approvalPolicy"] = approval
+			}
+			c.reply(id, reply)
 			c.event("thread/started", map[string]any{"thread": copy})
 		case "thread/resume", "thread/read":
 			h.mu.Lock()
@@ -193,26 +211,37 @@ func (h *mockHub) serve(conn *websocket.Conn) {
 				if msg.Method == "thread/resume" {
 					c.loaded[tid] = true
 				}
-				if msg.Method == "thread/read" && p["includeTurns"] == false {
+				if (msg.Method == "thread/read" && p["includeTurns"] == false) ||
+					(msg.Method == "thread/resume" && p["excludeTurns"] == true) {
 					delete(thread, "turns")
 				}
 				c.reply(id, map[string]any{"thread": thread, "model": thread["model"], "modelProvider": thread["modelProvider"]})
 			}
 		case "thread/turns/list":
+			cursor, _ := p["cursor"].(string)
+			offset, _ := strconv.Atoi(cursor)
+			offset = max(0, offset)
+			limit, _ := p["limit"].(float64)
 			h.mu.Lock()
 			t := h.threadLocked(tid)
 			data := []any{}
+			var nextCursor any
 			if t != nil {
 				turns := t["turns"].([]any)
-				for i := len(turns) - 1; i >= 0; i-- {
-					data = append(data, clone(turns[i]))
-					if limit, ok := p["limit"].(float64); ok && len(data) >= int(limit) {
+				for i := offset; i < len(turns); i++ {
+					if limit > 0 && len(data) >= int(limit) {
+						nextCursor = strconv.Itoa(i)
 						break
 					}
+					index := i
+					if p["sortDirection"] != "asc" {
+						index = len(turns) - 1 - i
+					}
+					data = append(data, clone(turns[index]))
 				}
 			}
 			h.mu.Unlock()
-			c.reply(id, map[string]any{"data": data, "nextCursor": nil})
+			c.reply(id, map[string]any{"data": data, "nextCursor": nextCursor})
 		case "thread/name/set":
 			h.mu.Lock()
 			t := h.threadLocked(tid)

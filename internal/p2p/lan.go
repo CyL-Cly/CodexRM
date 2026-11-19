@@ -6,6 +6,12 @@ import (
 	"net/netip"
 )
 
+var globalIPv6 = netip.MustParsePrefix("2000::/3")
+
+func IsPublicIPv6(ip netip.Addr) bool {
+	return ip.Zone() == "" && globalIPv6.Contains(ip)
+}
+
 func IsLANIPv4(ip netip.Addr) bool {
 	return ip.Is4() && ip.IsPrivate() && ip.IsGlobalUnicast()
 }

@@ -20,9 +20,9 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
                 }
                 if (confirmation != null) {
                     runCatching { context.startActivity(confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
-                        .onFailure { toast(context, "无法打开系统安装确认界面") }
+                        .onFailure { reportFailure(context, intent, "无法打开系统安装确认界面") }
                 } else {
-                    toast(context, "系统安装器未提供确认界面")
+                    reportFailure(context, intent, "系统安装器未提供确认界面")
                 }
             }
             PackageInstaller.STATUS_SUCCESS -> {
@@ -33,13 +33,24 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
                     runCatching { context.startActivity(launch) }
                 }
             }
-            PackageInstaller.STATUS_FAILURE_ABORTED -> toast(context, "已取消安装更新")
+            PackageInstaller.STATUS_FAILURE_ABORTED -> reportFailure(context, intent, "已取消安装更新")
             else -> {
                 val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
                     ?.takeIf { it.isNotBlank() } ?: "未知错误"
-                toast(context, "更新安装失败：$message")
+                reportFailure(context, intent, "更新安装失败：$message")
             }
         }
+    }
+
+    private fun reportFailure(context: Context, status: Intent, message: String) {
+        val requestId = status.getStringExtra(EXTRA_REQUEST_ID)
+        if (requestId != null) {
+            val failure = Intent(ACTION_INSTALL_FAILED)
+                .setPackage(context.packageName)
+                .putExtra(EXTRA_REQUEST_ID, requestId)
+            context.sendBroadcast(failure)
+        }
+        toast(context, message)
     }
 
     private fun toast(context: Context, message: String) {
@@ -48,5 +59,7 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
 
     companion object {
         const val ACTION_INSTALL_STATUS = "com.codexrm.mobile.action.UPDATE_INSTALL_STATUS"
+        const val ACTION_INSTALL_FAILED = "com.codexrm.mobile.action.UPDATE_INSTALL_FAILED"
+        const val EXTRA_REQUEST_ID = "com.codexrm.mobile.extra.UPDATE_REQUEST_ID"
     }
 }

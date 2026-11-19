@@ -23,11 +23,15 @@ func database(t *testing.T, entries ...[]string) string {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err = db.Exec("CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, sort_index INTEGER)"); err != nil {
+	if _, err = db.Exec("CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, sort_index INTEGER, notes TEXT)"); err != nil {
 		t.Fatal(err)
 	}
 	for i, entry := range entries {
-		if _, err = db.Exec("INSERT INTO providers VALUES (?, ?, ?, ?, ?)", entry[0], entry[1], entry[2], entry[3], i); err != nil {
+		var notes any
+		if len(entry) > 4 {
+			notes = entry[4]
+		}
+		if _, err = db.Exec("INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)", entry[0], entry[1], entry[2], entry[3], i, notes); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -48,7 +52,7 @@ func settings(base, key, model string) string {
 
 func TestCCSwitchReadOnlyAndCredentialIsolation(t *testing.T) {
 	path := database(t,
-		[]string{"a", "codex", "Same", settings("https://one.example/v1", "secret-one", "shared-model")},
+		[]string{"a", "codex", "Same", settings("https://one.example/v1", "secret-one", "shared-model"), "  备用账号  "},
 		[]string{"b", "codex", "Same", settings("https://two.example/v1", "secret-two", "other-model")},
 		[]string{"claude", "claude", "Ignore", `{}`},
 		[]string{"broken", "codex", "Broken", `{"config":"secret-do-not-expose"}`},
@@ -58,8 +62,11 @@ func TestCCSwitchReadOnlyAndCredentialIsolation(t *testing.T) {
 	if err != nil || len(items) != 3 {
 		t.Fatalf("load: %v, count=%d", err, len(items))
 	}
-	if items[0].ID == items[1].ID || items[0].Name == items[1].Name {
-		t.Fatal("providers sharing a name/custom ID were merged")
+	if items[0].ID == items[1].ID || items[0].Name != "Same" || items[1].Name != "Same" {
+		t.Fatal("same-named providers must retain their title and distinct IDs")
+	}
+	if items[0].Notes != "备用账号" || items[1].Notes != "" {
+		t.Fatal("provider notes were not read correctly")
 	}
 	if len(items[0].Models) != 1 || len(items[0].Models[0].SupportedReasoningEfforts) != 2 {
 		t.Fatal("duplicate models or reasoning metadata lost")
@@ -84,6 +91,51 @@ func TestCCSwitchReadOnlyAndCredentialIsolation(t *testing.T) {
 	again, err := Load(context.Background(), path)
 	if err != nil || again[0].ID != items[0].ID {
 		t.Fatal("provider IDs are not stable")
+	}
+}
+
+func TestCurrentProviderUsesConnectionSettings(t *testing.T) {
+	path := database(t,
+		[]string{"a", "codex", "Same", settings("https://example.test/v1", "one", "shared")},
+		[]string{"b", "codex", "Same", settings("https://example.test/v1", "two", "shared")},
+		[]string{"c", "codex", "Same", settings("https://example.test/v1", "two", "alternate")},
+	)
+	items, err := Load(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexDir := t.TempDir()
+	t.Setenv("CODEX_HOME", codexDir)
+	write := func(path, data string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(codexDir, "config.toml"), `model = 'different-live-model'
+model_provider = 'custom'
+[model_providers.custom]
+name = 'shared'
+base_url = 'https://example.test/v1'
+wire_api = 'responses'
+requires_openai_auth = true
+`)
+	auth := filepath.Join(codexDir, "auth.json")
+	write(auth, `{"OPENAI_API_KEY":"one"}`)
+	if id := CurrentProviderID(items, path); id != items[0].ID {
+		t.Fatal("matching connection lost when using a different default model")
+	}
+	write(auth, `{"OPENAI_API_KEY":"unrelated"}`)
+	if CurrentProviderID(items, path) != "" {
+		t.Fatal("merged an unrelated connection with a saved provider")
+	}
+	write(auth, `{"OPENAI_API_KEY":"two"}`)
+	if CurrentProviderID(items, path) != "" {
+		t.Fatal("merged an ambiguous match without an active CC Switch selection")
+	}
+	write(filepath.Join(filepath.Dir(path), "settings.json"), `{"currentProviderCodex":"c"}`)
+	if id := CurrentProviderID(items, path); id != items[2].ID {
+		t.Fatal("did not prefer the active CC Switch entry among matching connections")
 	}
 }
 

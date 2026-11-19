@@ -12,6 +12,8 @@ import android.util.TypedValue
 import android.view.ViewGroup
 import android.widget.TextView
 import io.noties.markwon.AbstractMarkwonPlugin
+import io.noties.markwon.LinkResolverDef
+import io.noties.markwon.MarkwonConfiguration
 import io.noties.markwon.Markwon
 import io.noties.markwon.MarkwonVisitor
 import io.noties.markwon.SpannableBuilder
@@ -28,9 +30,14 @@ import io.noties.markwon.image.AsyncDrawableSpan
 import org.commonmark.node.Link
 import org.commonmark.node.Text
 
-internal class Markdown(context: Context, images: MessageImageLoader) {
+internal class Markdown(
+    context: Context,
+    images: MessageImageLoader,
+    download: (ArtifactCard) -> Unit = {},
+) {
+    private val imagePlugin = MessageImagesPlugin(context, images)
     private val markwon = Markwon.builder(context)
-        .usePlugin(MessageImagesPlugin(context, images))
+        .usePlugin(imagePlugin)
         .usePlugin(MarkwonInlineParserPlugin.create(MathParser.inlineFactory()))
         .usePlugin(MathParser())
         .usePlugin(JLatexMathPlugin.create(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 14f, context.resources.displayMetrics)) { builder ->
@@ -47,6 +54,19 @@ internal class Markdown(context: Context, images: MessageImageLoader) {
         .usePlugin(StrikethroughPlugin.create())
         .usePlugin(TaskListPlugin.create(Ui.GREEN, Ui.MUTED, Ui.BACKGROUND))
         .usePlugin(object : AbstractMarkwonPlugin() {
+            override fun configureConfiguration(builder: MarkwonConfiguration.Builder) {
+                val externalLinks = LinkResolverDef()
+                builder.linkResolver { view, destination ->
+                    val file = ArtifactCard.fromLink(destination)
+                    if (file != null) {
+                        download(file)
+                    } else if (!destination.startsWith("file:", ignoreCase = true) &&
+                        !destination.startsWith("sandbox:", ignoreCase = true)) {
+                        externalLinks.resolve(view, destination)
+                    }
+                }
+            }
+
             override fun configureTheme(builder: MarkwonTheme.Builder) {
                 builder.linkColor(Ui.GREEN)
                     .blockQuoteColor(Ui.MUTED)
@@ -84,7 +104,7 @@ internal class Markdown(context: Context, images: MessageImageLoader) {
     fun bind(view: TextView, message: ChatMessage) {
         val rendered = message.rendered as? Spanned ?: when (message.kind) {
             MessageKind.TOOL, MessageKind.ERROR, MessageKind.STATUS -> SpannedString(message.body)
-            else -> render(message.body)
+            else -> render(message.body, message.id)
         }.also { message.rendered = it }
         val wide = message.kind != MessageKind.USER ||
             rendered.getSpans(0, rendered.length, TableSpan::class.java).isNotEmpty() ||
@@ -97,8 +117,9 @@ internal class Markdown(context: Context, images: MessageImageLoader) {
 
     fun clear(view: TextView) = markwon.setParsedMarkdown(view, SpannedString(""))
 
-    private fun render(source: String): Spanned {
-        val text = markwon.toMarkdown(source)
+    private fun render(source: String, messageId: String): Spanned {
+        imagePlugin.messageId = messageId
+        val text = try { markwon.toMarkdown(source) } finally { imagePlugin.messageId = "" }
         if (text is Spannable) {
             for (span in text.getSpans(0, text.length, JLatexAsyncDrawableSpan::class.java)) {
                 // The plugin uses the base span for blocks and a subclass for inline math.

@@ -19,7 +19,7 @@ internal class MessageAdapter(
 ) : BaseAdapter() {
     private val messages = ArrayList<ChatMessage>()
     private val expanded = HashSet<String>()
-    private val markdown by lazy { Markdown(context, images) }
+    private val markdown by lazy { Markdown(context, images, download) }
     var showFileCards = false
         set(value) {
             if (field == value) return
@@ -71,7 +71,8 @@ internal class MessageAdapter(
         holder.body.visibility = if ((collapsible && !open) || message.body.isEmpty()) View.GONE else View.VISIBLE
         holder.images.removeAllViews()
         holder.images.visibility = if (message.images.isEmpty() && (!showFileCards || message.files.isEmpty())) View.GONE else View.VISIBLE
-        if (holder.images.visibility == View.VISIBLE) for (image in message.images) {
+        if (holder.images.visibility == View.VISIBLE) for (source in message.images) {
+            val image = source.copy(messageId = message.id)
             val card = Ui.column(context).apply {
                 background = Ui.rounded(Ui.SURFACE_ALT, Ui.dp(context, 12).toFloat(), Ui.BORDER)
                 setPadding(Ui.dp(context, 6), Ui.dp(context, 6), Ui.dp(context, 6), Ui.dp(context, 6))
@@ -97,7 +98,7 @@ internal class MessageAdapter(
                         preview.setImageBitmap(bitmap)
                         preview.visibility = View.VISIBLE
                         caption.text = "${image.name} · 点击查看"
-                        card.setOnClickListener { showImage(context, bitmap, image.name) }
+                        card.setOnClickListener { showImagePreview(context, images, image, bitmap) }
                     }, onFailure = { error ->
                         caption.text = "${image.name} · ${error.message.orEmpty()} · 点击重试"
                         card.setOnClickListener { load() }

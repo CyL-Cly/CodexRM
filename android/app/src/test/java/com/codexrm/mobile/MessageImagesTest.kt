@@ -91,6 +91,14 @@ class MessageImagesTest {
         assertEquals(upload.cacheKey("agent-a", "/one"), upload.cacheKey("agent-a", "/two"))
     }
 
+    @Test fun localHistoryImagesCacheByMessageWithoutChangingAttachmentIdentity() {
+        val image = MessageImage("/tmp/preview.png", messageId = "first")
+        assertTrue(image.allowsEarlyCache)
+        assertNotEquals(image.cacheKey("agent", "/project"), image.copy(messageId = "second").cacheKey("agent", "/project"))
+        val upload = image.copy(attachmentId = "file-id")
+        assertEquals(upload.cacheKey("agent", "/project"), upload.copy(messageId = "second").cacheKey("agent", "/project"))
+    }
+
     @Test fun mutableAgentPathsAlwaysBypassEarlyMemoryAndDiskHits() {
         assertFalse(MessageImage("preview.png").allowsEarlyCache)
         assertFalse(MessageImage("/tmp/preview.png").allowsEarlyCache)

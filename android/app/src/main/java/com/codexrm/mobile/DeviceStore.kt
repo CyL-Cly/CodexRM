@@ -106,6 +106,28 @@ internal class DeviceStore(context: Context) {
         editor.apply()
     }
 
+    fun pendingSends(agentId: String): List<PendingSend> {
+        if (agentId.isEmpty()) return emptyList()
+        return try {
+            val array = JSONArray(uiPrefs.getString("outbox.$agentId", "[]"))
+            (0 until array.length()).mapNotNull { index ->
+                array.optJSONObject(index)?.let(PendingSend::fromJson)
+            }
+        } catch (_: Exception) {
+            // Keep malformed data for diagnosis; an unreadable record must not trigger a resend.
+            emptyList()
+        }
+    }
+
+    fun savePendingSends(agentId: String, values: List<PendingSend>) {
+        if (agentId.isEmpty()) return
+        val editor = uiPrefs.edit()
+        if (values.isEmpty()) editor.remove("outbox.$agentId")
+        else editor.putString("outbox.$agentId", JSONArray(values.map(PendingSend::toJson)).toString())
+        // The outbox is the durability boundary before the visible draft is cleared.
+        editor.commit()
+    }
+
     private object Crypto {
         private const val KEY_ALIAS = "codexrm.device.tokens.v1"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"

@@ -21,6 +21,7 @@ const paths = {
   spark: "m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3z",
   lock: "M6 10h12v11H6zM8 10V6a4 4 0 0 1 8 0v4",
   stop: "M7 7h10v10H7z",
+  play: "M8 5l12 7-12 7z",
   download: "M12 3v12m-5-5 5 5 5-5M5 17v4h14v-4",
   attach: "m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7l9-9",
   file: "M5 3h9l5 5v13H5zM14 3v6h5M8 13h8m-8 4h6",
@@ -66,6 +67,7 @@ const state = {
   socket: null,
   generation: 0,
   online: false,
+  browserOnline: globalThis.navigator?.onLine !== false,
   reconnecting: false,
   pairingExpired: false,
   backgroundSuspended: false,
@@ -104,6 +106,7 @@ const state = {
   workspaceViews: readStorage("codexrm.workspaceViews", {}),
   workspaceSectionCollapsed: readStorage("codexrm.workspaceSectionCollapsed", false) === true,
   drafts: readStorage("codexrm.drafts.v1", {}),
+  outbox: readStorage("codexrm.outbox.v1", []),
   attachmentDrafts: readStorage("codexrm.attachments.v1", {}),
   attachmentCache: new Map(),
   workspaces: [],
@@ -112,7 +115,6 @@ const state = {
   archivingThreads: new Set(),
   archivedThreads: new Set(),
   snapshotTimer: null,
-  snapshotOlder: false,
   directory: null,
   directoryVersion: 0,
   refreshTimer: null,
@@ -168,9 +170,125 @@ function restoreDraft() {
   renderAttachments();
   resizePrompt();
 }
+if (!Array.isArray(state.outbox)) state.outbox = [];
+function makeOutboxEntry({ id, createdAt, agentId, threadId = null, cwd = "", draftKey, text, files = [], mode = "auto", afterTurnId }) {
+  return {
+    id, createdAt, agentId, threadId, cwd, draftKey, text, mode,
+    ...(afterTurnId ? { afterTurnId } : {}),
+    files: files.map(({ id, name, path, size, mimeType }) => ({ id, name, path, size, mimeType })),
+  };
+}
+function persistOutbox() {
+  try { localStorage.setItem("codexrm.outbox.v1", JSON.stringify(state.outbox)); }
+  catch { toast("浏览器存储不可用，无法在刷新后确认发送状态"); }
+}
+function stageOutbox(text, files, mode, afterTurnId) {
+  const entry = makeOutboxEntry({
+    id: globalThis.crypto?.randomUUID?.() || `outbox-${Date.now()}-${++state.nextID}`,
+    createdAt: new Date().toISOString(), agentId: state.selected,
+    threadId: state.current?.id || null, cwd: state.current?.cwd || selectedCwd(),
+    draftKey: draftKey(), text, files, mode, afterTurnId,
+  });
+  state.outbox.push(entry);
+  persistOutbox();
+  return entry;
+}
+function bindOutbox(entry, threadId) {
+  if (!entry) return;
+  entry.threadId = threadId;
+  entry.draftKey = `${entry.agentId}:thread:${threadId}`;
+  persistOutbox();
+}
+function clearOutbox(entry) {
+  const index = state.outbox.indexOf(entry);
+  if (index >= 0) state.outbox.splice(index, 1);
+  else state.outbox = state.outbox.filter((item) => item.id !== entry?.id);
+  persistOutbox();
+}
 
 const attachmentMarker = "[CodexRM attachment] ";
 const visionMimeTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const cachedImageTypes = new Set([...visionMimeTypes, "image/bmp", "image/x-icon", "image/vnd.microsoft.icon", "image/avif"]);
+const maxHistoryImageBytes = 20 * 1024 * 1024;
+const historyImageDisk = {
+  database: null,
+  open() {
+    if (typeof indexedDB === "undefined") return Promise.resolve(null);
+    this.database ||= new Promise((resolve) => {
+      const request = indexedDB.open("codexrm-history-images", 1);
+      request.onupgradeneeded = () => request.result.createObjectStore("images", { keyPath: "key" });
+      request.onerror = request.onblocked = () => resolve(null);
+      request.onsuccess = () => resolve(request.result);
+    }).catch(() => null);
+    return this.database;
+  },
+  async transaction(operation) {
+    const database = await this.open();
+    if (!database) return null;
+    return new Promise((resolve) => {
+      const tx = database.transaction("images", "readwrite");
+      const result = operation(tx.objectStore("images"));
+      tx.oncomplete = () => resolve(result());
+      tx.onabort = tx.onerror = () => resolve(null);
+    }).catch(() => null);
+  },
+  get(key) {
+    return this.transaction((store) => {
+      let entry = null;
+      const request = store.get(key);
+      request.onsuccess = () => {
+        if (!request.result) return;
+        entry = request.result;
+        store.put({ ...entry, used: Date.now() });
+      };
+      return () => entry;
+    });
+  },
+  put(key, scope, blob, file) {
+    if (!scope || !cachedImageTypes.has(blob.type) || !blob.size || blob.size > maxHistoryImageBytes) return;
+    return this.transaction((store) => {
+      store.put({ key, scope, blob, file, used: Date.now() });
+      const request = store.getAll();
+      request.onsuccess = () => {
+        const entries = request.result.sort((a, b) => a.used - b.used);
+        let bytes = entries.reduce((total, item) => total + item.blob.size, 0);
+        let count = entries.length;
+        for (const entry of entries) {
+          if (bytes <= 128 * 1024 * 1024 && count <= 256) break;
+          store.delete(entry.key);
+          bytes -= entry.blob.size;
+          count--;
+        }
+      };
+      return () => null;
+    });
+  },
+  removeScope(scope) {
+    if (!scope) return;
+    return this.transaction((store) => {
+      const request = store.openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        if (cursor.value.scope === scope) cursor.delete();
+        cursor.continue();
+      };
+      return () => null;
+    });
+  },
+};
+const imageScope = (device = currentDevice()) => device?.clientId || "";
+const attachmentCacheKey = (id) => JSON.stringify([imageScope() || state.selected, "attachment", id]);
+function clearImageScope(device) {
+  const scope = imageScope(device);
+  const memoryScope = scope || device.agent.agentId;
+  for (const [key, entry] of state.attachmentCache) {
+    if (JSON.parse(key)[0] !== memoryScope) continue;
+    if (entry.url) URL.revokeObjectURL(entry.url);
+    state.attachmentCache.delete(key);
+  }
+  void historyImageDisk.removeScope(scope);
+}
 function currentAttachments() {
   return state.attachmentDrafts[draftKey()] || [];
 }
@@ -194,7 +312,7 @@ function renderAttachments() {
   for (const file of files) {
     const card = document.createElement("div");
     card.className = `attachment-card${file.error ? " attachment-error" : ""}`;
-    const preview = state.attachmentCache.get(`${state.selected}:${file.id}`)?.url;
+    const preview = state.attachmentCache.get(attachmentCacheKey(file.id))?.url;
     const image = visionMimeTypes.has(file.mimeType);
     card.innerHTML = `${image && file.id ? `<img data-attachment-image="${escapeHTML(file.id)}" ${preview ? `src="${escapeHTML(preview)}"` : ""} alt="" />` : `<span class="attachment-icon">${icon("file")}</span>`}<span class="attachment-info"><strong>${escapeHTML(file.name)}</strong><small>${escapeHTML(file.error || (file.uploading ? `上传中 ${file.progress || 0}%` : fileSize(file.size)))}</small></span>`;
     if (file.error && file.file) {
@@ -305,7 +423,13 @@ async function uploadAttachment(file, key) {
     const result = await rpc("codexrm/attachment/finish", { id });
     if (!active()) throw new Error("上传已中断，请重试");
     Object.assign(file, result);
-    if (visionMimeTypes.has(file.mimeType)) cacheAttachment(`${device}:${file.id}`, { url: URL.createObjectURL(file.file), size: file.size });
+    if (visionMimeTypes.has(file.mimeType)) {
+      const blob = file.file;
+      const metadata = { id: file.id, name: file.name, size: file.size, path: file.path, mimeType: file.mimeType };
+      const key = attachmentCacheKey(file.id);
+      cacheAttachment(key, { blob, file: metadata, url: URL.createObjectURL(blob) });
+      void historyImageDisk.put(key, imageScope(), blob, metadata);
+    }
     delete file.file;
   } catch (error) {
     file.error = error.message;
@@ -368,7 +492,7 @@ function cancelThreadCreation() {
   if (!operation) return;
   operation.cancelled = true;
   state.creating = null;
-  restoreCreatingDraft(operation);
+  if (!state.outbox.includes(operation.pendingSend)) restoreCreatingDraft(operation);
   state.sending = false;
 }
 function userContent(content = []) {
@@ -387,39 +511,33 @@ function userContent(content = []) {
       }
     }
   }
-  for (const c of content) {
-    if ((c.type === "localImage" || c.type === "image") && !files.some((f) => f.path === c.path)) text.push("[图片]");
-  }
   return { text: text.join("\n").trim(), files };
 }
 function attachmentHTML(file) {
-  const cached = state.attachmentCache.get(`${state.selected}:${file.id}`);
+  const cached = state.attachmentCache.get(attachmentCacheKey(file.id));
   const image = visionMimeTypes.has(file.mimeType);
-  return `<button type="button" class="message-attachment${image ? " image-attachment" : ""}" data-attachment="${escapeHTML(file.id)}" title="下载 ${escapeHTML(file.name)}">${image ? `<img data-attachment-image="${escapeHTML(file.id)}" ${cached?.url ? `src="${escapeHTML(cached.url)}"` : ""} alt="${escapeHTML(file.name)}" loading="lazy" />` : icon("file")}<span><strong>${escapeHTML(file.name)}</strong><small>${fileSize(file.size)} · 下载</small></span></button>`;
+  return `<button type="button" class="message-attachment${image ? " image-attachment" : ""}" data-attachment="${escapeHTML(file.id)}" data-focus-id="attachment:${escapeHTML(file.id)}" title="下载 ${escapeHTML(file.name)}">${image ? `<img data-attachment-image="${escapeHTML(file.id)}" ${cached?.url ? `src="${escapeHTML(cached.url)}"` : ""} alt="${escapeHTML(file.name)}" loading="lazy" />` : icon("file")}<span><strong>${escapeHTML(file.name)}</strong><small>${fileSize(file.size)} · 下载</small></span></button>`;
 }
-async function readAttachment(id) {
+function readAttachment(id) {
+  return readCachedImage(attachmentCacheKey(id), () => readImageChunks("codexrm/attachment/read", { id }));
+}
+async function readCachedImage(key, fetchImage) {
   const generation = state.generation;
-  const key = `${state.selected}:${id}`;
+  const scope = imageScope();
   const cached = state.attachmentCache.get(key);
-  if (cached?.blob) return cached;
+  if (cached?.blob) {
+    cacheAttachment(key, cached);
+    return cached;
+  }
   if (cached?.pending) return cached.pending;
   const pending = (async () => {
-    const chunks = [];
-    let offset = 0;
-    let file;
-    do {
-      const result = await rpc("codexrm/attachment/read", { id, offset });
-      if (generation !== state.generation) throw new Error("连接已切换，请重试");
-      file = result.file;
-      if (file.size > 20 * 1024 * 1024 || result.offset > file.size || result.offset < offset || (result.offset === offset && offset < file.size)) throw new Error("附件内容不完整");
-      const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
-      if (result.offset !== offset + bytes.length) throw new Error("附件内容不完整");
-      chunks.push(bytes);
-      offset = result.offset;
-    } while (offset < file.size);
-    const blob = new Blob(chunks, { type: file.mimeType });
+    const stored = scope ? await historyImageDisk.get(key) : null;
+    if (generation !== state.generation) throw new Error("连接已切换，请重试");
+    const { blob, file } = stored || await fetchImage();
+    if (generation !== state.generation) throw new Error("连接已切换，请重试");
     const entry = { blob, file, url: URL.createObjectURL(blob) };
     cacheAttachment(key, entry);
+    if (!stored) void historyImageDisk.put(key, scope, blob, file);
     return entry;
   })();
   cacheAttachment(key, { ...cached, pending });
@@ -432,21 +550,134 @@ async function readAttachment(id) {
     throw error;
   }
 }
+async function readImageChunks(method, params) {
+  const generation = state.generation;
+  const chunks = [];
+  let offset = 0;
+  let file;
+  do {
+    const result = await rpc(method, { ...params, offset, ...(file?.version ? { version: file.version } : {}) });
+    if (generation !== state.generation) throw new Error("连接已切换，请重试");
+    const metadata = result?.file;
+    if (!Number.isSafeInteger(metadata?.size) || metadata.size < 0 || metadata.size > maxHistoryImageBytes ||
+        (file && (file.size !== metadata.size || file.version !== metadata.version)) ||
+        (params.id && params.id !== metadata.id) || (params.path && !cachedImageTypes.has(metadata.mimeType)) ||
+        typeof result.data !== "string" || result.data.length > 360 * 1024) throw new Error("图片或附件内容无效");
+    const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
+    if (result.offset !== offset + bytes.length || result.offset > metadata.size || (!bytes.length && offset < metadata.size))
+      throw new Error("附件内容不完整");
+    file = metadata;
+    chunks.push(bytes);
+    offset = result.offset;
+  } while (offset < file.size);
+  return { blob: new Blob(chunks, { type: file.mimeType }), file };
+}
+function historyImageSource(value) {
+  if (typeof value !== "string") return "";
+  let source = value.trim().replace(/^sandbox:/i, "");
+  if (/^https?:\/\//i.test(source)) {
+    try {
+      const url = new URL(source);
+      return url.origin === location.origin && !url.username && !url.password ? url.href : "";
+    } catch { return ""; }
+  }
+  if (/^data:/i.test(source)) {
+    const mime = /^data:([^;,]+);base64,/i.exec(source)?.[1]?.toLowerCase();
+    return cachedImageTypes.has(mime) && source.length <= 28 * 1024 * 1024 ? source : "";
+  }
+  if (/^file:/i.test(source)) {
+    try {
+      const url = new URL(source);
+      if (url.hostname) return "";
+      source = url.pathname.replace(/^\/([a-z]:\/)/i, "$1");
+    } catch { return ""; }
+  }
+  if (/^[a-z][a-z+.-]*:/i.test(source) && !/^[a-z]:[/\\]/i.test(source)) return "";
+  if (/^[/\\]{2}/.test(source)) return "";
+  try { return decodeURIComponent(source); } catch { return source; }
+}
+function historyImageHTML(source, name, itemId) {
+  const safe = historyImageSource(source);
+  if (!safe) return "";
+  const label = escapeHTML(name || "图片");
+  if (/^data:/i.test(safe)) return `<img class="history-image" src="${escapeHTML(safe)}" alt="${label}" loading="lazy" decoding="async" />`;
+  return `<img class="history-image" data-history-image="${escapeHTML(safe)}" data-image-item="${escapeHTML(itemId || "")}" alt="${label}" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`;
+}
+function readHistoryImage(source, itemId, cwd) {
+  const remote = /^https?:\/\//i.test(source);
+  const key = JSON.stringify([imageScope() || state.selected, "history", ...(remote ? [source] : [itemId, cwd, source])]);
+  return readCachedImage(key, async () => {
+    if (!remote) return readImageChunks("codexrm/image/read", { path: source, cwd });
+    const response = await fetch(source, { credentials: "omit", referrerPolicy: "no-referrer" });
+    const type = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
+    if (!response.ok || !cachedImageTypes.has(type) || Number(response.headers.get("content-length")) > maxHistoryImageBytes)
+      throw new Error("图片无法缓存");
+    const stream = response.body?.getReader();
+    if (!stream) throw new Error("图片内容为空");
+    const chunks = [];
+    let size = 0;
+    while (true) {
+      const { done, value } = await stream.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxHistoryImageBytes) {
+        await stream.cancel();
+        throw new Error("图片超过 20 MB");
+      }
+      chunks.push(value);
+    }
+    if (!size) throw new Error("图片内容为空");
+    return { blob: new Blob(chunks, { type }), file: { mimeType: type, size } };
+  });
+}
+function historyItemImages(item, initialSources = []) {
+  const seen = new Set(initialSources.map(historyImageSource));
+  const previews = [];
+  const add = (source, name) => {
+    const normalized = historyImageSource(source);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    previews.push(historyImageHTML(source, name, item.id));
+  };
+  const inlineData = (value, mimeType) => cachedImageTypes.has(mimeType) && typeof value === "string" && value.length <= 28 * 1024 * 1024
+    ? "data:" + mimeType + ";base64," + value : "";
+  for (const list of [item.content, item.result?.content, item.contentItems]) {
+    if (!Array.isArray(list)) continue;
+    for (const value of list) {
+      if (["image", "inputImage", "input_image", "output_image", "image_url", "localImage"].includes(value?.type)) {
+        add(value.url || value.path || value.imageUrl || value.image_url?.url || value.image_url || inlineData(value.data, value.mimeType), value.name);
+      } else if (value?.type === "resource") {
+        add(inlineData(value.resource?.blob, value.resource?.mimeType));
+      }
+    }
+  }
+  if (item.type === "imageView" || item.type === "imageGeneration") {
+    add(item.path || item.savedPath || item.outputPath || item.imageUrl || item.url ||
+      (item.type === "imageGeneration" && typeof item.result === "string" &&
+        (/^data:/i.test(item.result) ? item.result : inlineData(item.result, "image/png"))), item.name);
+  }
+  return previews.length ? `<div class="history-images">${previews.join("")}</div>` : "";
+}
 function hydrateAttachmentImages() {
-  if (!state.online || !state.info?.attachments || typeof IntersectionObserver === "undefined") return;
+  if (typeof IntersectionObserver === "undefined") return;
   attachmentImageObserver ||= new IntersectionObserver((entries) => {
     for (const entry of entries) if (entry.isIntersecting) {
       const img = entry.target;
       attachmentImageObserver.unobserve(img);
       const generation = state.generation;
-      readAttachment(img.dataset.attachmentImage).then((file) => {
-        if (img.isConnected && generation === state.generation) img.src = file.url;
-      }).catch(() => { img.alt = "图片暂时无法加载，点击重试下载"; });
+      const { attachmentImage, historyImage, imageItem } = img.dataset;
+      const valid = () => img.isConnected && generation === state.generation;
+      const load = attachmentImage ? readAttachment(attachmentImage) : readHistoryImage(historyImage, imageItem, state.current?.cwd || selectedCwd());
+      load.then((file) => { if (valid()) img.src = file.url; }).catch(() => {
+        if (!valid()) return;
+        if (/^https?:\/\//i.test(historyImage || "")) img.src = historyImage;
+        else img.alt = "图片暂时无法加载";
+      });
     }
   });
   attachmentImageObserver.disconnect();
   for (const root of [$("messages"), $("attachments")])
-    root.querySelectorAll("img[data-attachment-image]:not([src])").forEach((img) => attachmentImageObserver.observe(img));
+    root.querySelectorAll("img[data-attachment-image]:not([src]), img[data-history-image]:not([src])").forEach((img) => attachmentImageObserver.observe(img));
 }
 let attachmentImageObserver;
 function saveWorkspaceView() {
@@ -627,6 +858,16 @@ function openWorkspacePicker() {
   $("workspace-dialog").showModal();
   browseDirectory(selectedCwd() || state.info.cwd);
 }
+function captureFocus(root) {
+  const active = document.activeElement;
+  return active && root.contains(active) ? active.dataset.focusId || "" : "";
+}
+function restoreFocus(root, focusId) {
+  if (!focusId) return;
+  const target = [...root.querySelectorAll("[data-focus-id]")]
+    .find((node) => node.dataset.focusId === focusId && !node.disabled);
+  target?.focus({ preventScroll: true });
+}
 function toast(message) {
   $("toast").textContent = message;
   $("toast").hidden = false;
@@ -635,21 +876,107 @@ function toast(message) {
     $("toast").hidden = true;
   }, 4500);
 }
+function announceTurn(message) {
+  // The message log is aria-live="off" to avoid reading every streamed delta.
+  // Announce only durable lifecycle transitions through a dedicated region.
+  const region = $("turn-status");
+  region.textContent = "";
+  region.textContent = message;
+}
 function connectionNotice(status = "") {
   state.reconnecting = status === "reconnecting";
   clearTimeout(state.connectionNoticeTimer);
+  renderPersistentNotice(status);
+  if (status === "success" && !document.hidden) {
+    state.connectionNoticeTimer = setTimeout(() => connectionNotice(), 4500);
+  }
+}
+function renderPersistentNotice(status = $("connection-notice").dataset.status || "") {
   const notice = $("connection-notice");
+  const text = $("connection-notice-text");
+  const entry = state.outbox.find((item) => item.agentId === state.selected) || state.outbox[0];
+  const actions = state.noticeActions ||= document.createElement("span");
+  if (!notice.contains(actions)) notice.append(actions);
+  actions.replaceChildren();
+  if (entry) {
+    notice.dataset.status = "outbox";
+    notice.hidden = false;
+    text.textContent = "发送状态未确认，请先同步会话确认，不会自动重发";
+    const sync = document.createElement("button");
+    sync.type = "button";
+    sync.textContent = "同步会话";
+    sync.onclick = () => syncOutbox(entry);
+    const confirm = document.createElement("button");
+    confirm.type = "button";
+    confirm.textContent = "确认已发送";
+    confirm.onclick = () => confirmOutbox(entry);
+    const keep = document.createElement("button");
+    keep.type = "button";
+    keep.textContent = "保留为新草稿";
+    keep.onclick = () => keepOutboxDraft(entry);
+    actions.append(sync, confirm, keep);
+    return;
+  }
+  if (state.pairingExpired) {
+    notice.dataset.status = "pairing-expired";
+    notice.hidden = false;
+    text.textContent = "配对已失效，请重新配对；草稿会保留";
+    const pair = document.createElement("button");
+    pair.type = "button";
+    pair.textContent = "重新配对";
+    pair.onclick = () => openPair();
+    actions.append(pair);
+    return;
+  }
   notice.dataset.status = status;
   notice.hidden = !status;
-  $("connection-notice-text").textContent = state.reconnecting
-    ? "连接被断开，重连中"
+  text.textContent = status === "offline" ? "浏览器已离线，请检查网络连接"
+    : status === "reconnecting" ? "连接被断开，重连中"
     : status === "success" ? "重连成功" : "";
-  if (status === "success" && !document.hidden) {
-    state.connectionNoticeTimer = setTimeout(() => {
-      notice.hidden = true;
-      notice.dataset.status = "";
-    }, 4500);
+}
+async function syncOutbox(entry) {
+  if (entry.agentId !== state.selected) {
+    const device = state.devices.find((item) => item.agent.agentId === entry.agentId);
+    if (device) selectDevice(device);
+    return toast("已选择对应设备，连接后请再次同步会话");
   }
+  if (!state.online || !state.loaded) return toast("设备尚未连接，请连接后同步会话");
+  if (entry.threadId) {
+    await openThread(entry.threadId);
+    if (state.current?.id === entry.threadId && outboxMatchesTurns(entry, state.turns)) {
+      clearOutbox(entry);
+      renderConnection();
+      toast("已在会话中找到完全匹配的消息，确认发送成功");
+    } else toast("未找到完全匹配的消息，发送状态仍未确认；请目视核对或保留为新草稿");
+  } else {
+    await loadThreads();
+    toast("会话列表已同步，请目视核对；不会自动确认或重发");
+  }
+}
+function outboxMatchesTurns(entry, turns) {
+  if (entry.afterTurnId) {
+    const interrupted = turns.findIndex((turn) => turn.id === entry.afterTurnId);
+    if (interrupted < 0) return false;
+    turns = turns.slice(interrupted + 1);
+  }
+  const expected = JSON.stringify(entry.files || []);
+  return turns.some((turn) => turn.items?.some((item) => {
+    if (item.type !== "userMessage") return false;
+    const content = userContent(item.content);
+    return content.text === entry.text && JSON.stringify(content.files) === expected;
+  }));
+}
+function confirmOutbox(entry) {
+  if (!window.confirm("请确认已在会话中看到这条完整消息。确认后仅清除待确认记录，不会再次发送。")) return;
+  clearOutbox(entry);
+  renderConnection();
+  toast("已按你的确认清除待发送记录");
+}
+function keepOutboxDraft(entry) {
+  clearOutbox(entry);
+  restoreSentDraft(entry.draftKey, entry.text, entry.files || []);
+  renderPersistentNotice();
+  toast("已保留为新草稿，请确认后手动发送");
 }
 function showError(error) {
   toast(error?.message || String(error));
@@ -738,7 +1065,9 @@ function disconnectSocket({ preservePairingExpired = false } = {}) {
   }
   for (const p of state.pending.values()) {
     clearTimeout(p.timer);
-    p.reject(new Error("连接已断开"));
+    const error = new Error("连接已断开");
+    error.uncertain = true;
+    p.reject(error);
   }
   state.pending.clear();
   state.online = false;
@@ -758,7 +1087,9 @@ function rpc(method, params = {}, timeoutMs = 120000) {
     const id = ++state.nextID;
     const timer = setTimeout(() => {
       state.pending.delete(id);
-      reject(new Error("请求超时，请检查本地 Codex 是否正常运行"));
+      const error = new Error("请求超时，请检查本地 Codex 是否正常运行");
+      error.uncertain = true;
+      reject(error);
     }, timeoutMs);
     state.pending.set(id, { resolve, reject, timer });
     state.socket.send(
@@ -794,7 +1125,7 @@ function pingSocket() {
   socket.send(JSON.stringify({ type: "ping", pingId: state.pingID }));
 }
 function resumeConnection() {
-  if (document.hidden || !currentDevice() || state.pairingExpired) return;
+  if (!state.browserOnline || document.hidden || !currentDevice() || state.pairingExpired) return;
   if ($("connection-notice").dataset.status === "success") connectionNotice("success");
   if (state.socket?.readyState === WebSocket.OPEN) {
     pingSocket();
@@ -930,7 +1261,7 @@ function connect({ reconnect = false } = {}) {
         state.pairingExpired = true;
         connectionNotice();
         renderConnection();
-        toast("此浏览器的配对已失效，请解除后重新配对");
+        toast("此浏览器的配对已失效，请重新配对；草稿会保留");
         return;
       }
     }
@@ -940,7 +1271,9 @@ function connect({ reconnect = false } = {}) {
 function rejectPending(message) {
   for (const p of state.pending.values()) {
     clearTimeout(p.timer);
-    p.reject(new Error(message));
+    const error = new Error(message);
+    error.uncertain = true;
+    p.reject(error);
   }
   state.pending.clear();
 }
@@ -1020,10 +1353,12 @@ async function bootstrap(generation) {
 }
 function renderConnection() {
   const device = currentDevice();
-  const connected = state.online;
+  const connected = state.online && state.browserOnline;
   $("connection-button").classList.toggle("online", connected);
-  $("connection-label").textContent = connected
-    ? device?.agent.serverName || "已连接"
+  $("connection-label").textContent = !state.browserOnline
+    ? "浏览器离线"
+    : connected
+      ? device?.agent.serverName || "已连接"
     : state.pairingExpired
       ? "配对已过期"
       : state.reconnecting
@@ -1031,18 +1366,21 @@ function renderConnection() {
         : device
           ? "设备离线"
           : "连接设备";
-  $("sidebar-status").textContent = connected
-    ? "设备已连接 · 任务在本地运行"
-    : device
-      ? "等待本地连接器上线"
-      : "尚未连接设备";
+  $("sidebar-status").textContent = !state.browserOnline
+    ? "网络已离线，草稿会保留"
+    : connected
+      ? "设备已连接 · 任务在本地运行"
+      : device
+        ? "等待本地连接器上线"
+        : "尚未连接设备";
   renderComposerControls();
   renderWorkspacePath();
   renderMessageQueue();
+  renderPersistentNotice();
 }
 function renderComposerControls() {
   const running = isRunning();
-  const unavailable = state.readOnly || state.loading || state.sending || !state.online || !state.loaded;
+  const unavailable = state.readOnly || state.loading || state.sending || !state.browserOnline || !state.online || !state.loaded;
   const files = currentAttachments();
   const attachmentPending = files.some((f) => f.uploading || f.error);
   const queue = state.messageQueues.get(state.current?.id);
@@ -1052,7 +1390,10 @@ function renderComposerControls() {
   $("attach-files").title = state.info?.attachments ? "添加文件或图片（每个最大 20 MB）" : "请更新本地 Agent 以支持文件和图片";
   const sendLabel = hasQueue ? "排队发送" : "发送消息";
   $("send").disabled = unavailable || !hasText || (hasQueue && !state.info?.messageQueue);
-  $("send").hidden = running;
+  const continuation = continuationTurn();
+  $("send").hidden = running || !!continuation;
+  $("continue-turn").hidden = !continuation;
+  $("continue-turn").disabled = unavailable || hasUnconfirmedThreadSend();
   $("send").title = sendLabel;
   $("send").setAttribute("aria-label", sendLabel);
   $("stop").hidden = !running;
@@ -1304,10 +1645,17 @@ async function confirmThreadDeletion() {
     }
   }
 }
+const workspaceThreadFoldThreshold = 15;
+const workspaceRecentThreadLimit = 10;
+const expandedWorkspaceThreads = new Map();
+
 function renderThreads() {
   const root = $("workspaces");
+  const focusId = captureFocus(root);
   root.replaceChildren();
   const query = $("search").value.trim().toLowerCase();
+  const device = state.selected;
+  const expandedPaths = expandedWorkspaceThreads.get(device);
   let count = 0;
   for (const w of workspaceGroups()) {
     const threads = w.threads.filter((t) => `${title(t)} ${t.cwd || ""}`.toLowerCase().includes(query));
@@ -1322,6 +1670,7 @@ function renderThreads() {
     heading.className = `workspace-row ${expanded ? "expanded" : ""}`;
     const toggle = document.createElement("button");
     toggle.className = "workspace-button";
+    toggle.dataset.focusId = `workspace:${key}`;
     toggle.title = w.path || w.name;
     toggle.setAttribute("aria-expanded", String(expanded));
     toggle.innerHTML = `<span class="workspace-caret">${icon("chevron")}</span>${icon("folder")}<span>${escapeHTML(w.name)} (${w.threads.length})</span>`;
@@ -1334,6 +1683,7 @@ function renderThreads() {
     if (w.path) {
       const start = document.createElement("button");
       start.className = "icon-button workspace-action";
+      start.dataset.focusId = `workspace-new:${key}`;
       start.title = `在 ${w.name} 新建会话`;
       start.setAttribute("aria-label", start.title);
       start.innerHTML = icon("plus");
@@ -1342,6 +1692,7 @@ function renderThreads() {
       if (w.pinned) {
         const remove = document.createElement("button");
         remove.className = "icon-button workspace-action";
+        remove.dataset.focusId = `workspace-remove:${key}`;
         remove.title = `取消固定 ${w.name}（保留文件和会话）`;
         remove.setAttribute("aria-label", remove.title);
         remove.innerHTML = icon("close");
@@ -1354,11 +1705,15 @@ function renderThreads() {
     const history = document.createElement("div");
     history.className = "workspace-history thread-list";
     history.hidden = !expanded;
-    for (const t of threads) {
+    const canShowOlder = !query && threads.length > workspaceThreadFoldThreshold;
+    const showOlder = canShowOlder && expandedPaths?.has(key);
+    const visibleThreads = canShowOlder && !showOlder ? threads.slice(0, workspaceRecentThreadLimit) : threads;
+    for (const [index, t] of visibleThreads.entries()) {
       const row = document.createElement("div");
       row.dataset.threadId = t.id;
       row.className = `thread-row ${t.id === state.current?.id ? "active" : ""}`;
       const button = document.createElement("button");
+      button.dataset.focusId = `thread:${t.id}`;
       const running = t.status?.type === "active";
       if (running) {
         const spinner = document.createElement("span");
@@ -1382,6 +1737,7 @@ function renderThreads() {
       const more = document.createElement("button");
       more.type = "button";
       more.className = "thread-more icon-button";
+      more.dataset.focusId = `thread-actions:${t.id}`;
       more.innerHTML = icon("more");
       more.setAttribute("aria-label", `对话操作：${title(t)}`);
       more.setAttribute("aria-haspopup", "menu");
@@ -1404,6 +1760,22 @@ function renderThreads() {
       };
       row.append(more);
       history.append(row);
+      if (canShowOlder && index + 1 === workspaceRecentThreadLimit) {
+        const older = document.createElement("button");
+        older.type = "button";
+        older.className = "workspace-older-threads";
+        older.dataset.focusId = `workspace-older:${key}`;
+        older.setAttribute("aria-expanded", String(!!showOlder));
+        older.textContent = showOlder ? "收起旧对话" : `展开其余 ${threads.length - workspaceRecentThreadLimit} 条对话`;
+        older.onclick = () => {
+          const paths = expandedPaths || new Set();
+          if (showOlder) paths.delete(key);
+          else paths.add(key);
+          expandedWorkspaceThreads.set(device, paths);
+          renderThreads();
+        };
+        history.append(older);
+      }
     }
     if (!threads.length) {
       const hint = document.createElement("p");
@@ -1426,6 +1798,7 @@ function renderThreads() {
   }
   $("history-label").textContent = state.threadListLoading ? "正在加载全部会话…" : "所有文件夹 · 最近更新优先";
   $("load-more").hidden = state.threadListLoading || !state.cursor;
+  restoreFocus(root, focusId);
 }
 function upsertThread(thread) {
   if (state.archivedThreads.has(thread.id)) return;
@@ -1564,7 +1937,6 @@ function newChat(saveCurrent = true, force = false) {
   state.loading = false;
   state.readOnly = false;
   state.detached = false;
-  state.snapshotOlder = false;
   state.started = 0;
   const preference = defaultModelPreference();
   renderModels(preference.model || "");
@@ -1638,7 +2010,6 @@ async function openThread(id, silent = false) {
     }
     state.readOnly = readOnly;
     state.detached = false;
-    state.snapshotOlder = false;
     state.turns = thread.turns || [];
     state.historyCursor = cursor;
     state.started = isRunning() ? Date.now() : 0;
@@ -1682,10 +2053,8 @@ function scheduleSnapshot() {
       }
       const incoming = result.thread.turns || [];
       const boundary = state.turns.findIndex((t) => t.id === incoming[0]?.id);
-      state.turns = state.snapshotOlder && boundary >= 0
-        ? [...state.turns.slice(0, boundary), ...incoming]
-        : incoming;
-      if (!state.snapshotOlder) state.historyCursor = result.nextCursor || null;
+      state.turns = boundary > 0 ? [...state.turns.slice(0, boundary), ...incoming] : incoming;
+      if (boundary <= 0) state.historyCursor = result.nextCursor || null;
       state.current = { ...state.current, ...result.thread };
       upsertThread(state.current);
       scheduleRender();
@@ -1709,7 +2078,6 @@ async function olderTurns() {
   const cursor = state.historyCursor;
   const request = {};
   state.olderTurnsRequest = request;
-  const before = $("scroll-area").scrollHeight;
   try {
     const page = await rpc("thread/turns/list", {
       threadId: id,
@@ -1728,11 +2096,12 @@ async function olderTurns() {
       added.add(turn.id);
       older.push(turn);
     }
+    const area = $("scroll-area");
+    const { scrollTop, scrollHeight } = area;
     state.turns = [...older, ...state.turns];
-    state.snapshotOlder = state.readOnly || state.detached;
     state.historyCursor = page.nextCursor || null;
     renderMessages();
-    $("scroll-area").scrollTop = $("scroll-area").scrollHeight - before;
+    area.scrollTop = scrollTop + area.scrollHeight - scrollHeight;
   } finally {
     if (state.olderTurnsRequest === request) state.olderTurnsRequest = null;
   }
@@ -1778,8 +2147,9 @@ async function loadModels(refresh = false) {
     const previous = $("model").value;
     const previousEffort = $("effort").value;
     state.providers = result.providers || [];
+    const { native, active } = activeModelProvider();
     state.models = state.providers.flatMap((p) => (p.models || []).filter((m) => !m.hidden).map((m) => ({
-      ...m, model: m.model || m.id, providerId: p.id, providerName: p.name,
+      ...m, model: m.model || m.id, providerId: p.id, providerName: p === native && active ? active.name : p.name,
       key: modelKey(p.id, m.model || m.id),
     })));
     if (state.current) {
@@ -1794,8 +2164,11 @@ async function loadModels(refresh = false) {
     }
     const warnings = [...(result.warnings || []), ...state.providers.filter((p) => p.warning).map((p) => `${p.name}：${p.warning}`)];
     $("refresh-models").title = warnings.length ? warnings.join("\n") : "刷新所有供应商的模型";
-    if (refresh) toast(`已加载 ${state.providers.length} 组供应商、${state.models.length} 个模型${warnings.length ? `；${warnings.length} 组列表使用缓存或暂不可用` : ""}`);
-    else if (result.warnings?.length) toast(result.warnings.join("；"));
+    if (refresh) {
+      const groups = modelGroups();
+      const modelCount = groups.reduce((count, group) => count + group.models.length, 0);
+      toast(`已加载 ${groups.length} 组供应商、${modelCount} 个模型${warnings.length ? `；${warnings.length} 组列表使用缓存或暂不可用` : ""}`);
+    } else if (result.warnings?.length) toast(result.warnings.join("；"));
   } finally {
     if (generation === state.generation && version === state.modelListVersion) {
       state.modelsLoading = false;
@@ -1844,7 +2217,7 @@ function selectThreadModel(result, preferred = "", effort = result.reasoningEffo
   if (model && !state.models.some((m) => m.key === modelKey(providerId, model))) {
     const provider = state.providers.find((p) => p.id === providerId);
     if (provider) {
-      state.models.push({ model, displayName: model, providerId, providerName: provider.name, key: modelKey(providerId, model), supportedReasoningEfforts: [] });
+      state.models.push({ model, displayName: model, providerId, providerName: provider.id ? provider.name : activeModelProvider().active?.name || provider.name, key: modelKey(providerId, model), supportedReasoningEfforts: [] });
       renderModels();
     }
   }
@@ -1910,30 +2283,82 @@ function modelMenuPane(pane = "root") {
   else if (pane === "root") $("choose-model").focus();
   else $("effort-choices").querySelector("[aria-checked='true']")?.focus();
 }
+function activeModelProvider() {
+  const native = state.providers.find((provider) => provider.id === "");
+  const active = state.providers.find((provider) => provider.id && provider.id === native?.aliasOf && !provider.unavailable);
+  return { native, active };
+}
+function modelGroups() {
+  const { native, active } = activeModelProvider();
+  return state.providers.filter((provider) => !active || provider !== active).map((provider) => {
+    if (!active || provider !== native) {
+      return { provider, models: state.models.filter((model) => model.providerId === provider.id) };
+    }
+    // When both routes offer the model, preserve the thread's provider ID.
+    const useNative = state.current ? threadProviderId() === "" : selectedModel()?.providerId === "";
+    const models = new Map();
+    const orderedIds = useNative ? [active.id, native.id] : [native.id, active.id];
+    for (const id of orderedIds) {
+      for (const model of state.models.filter((model) => model.providerId === id)) models.set(model.model, model);
+    }
+    return { provider: active, models: [...models.values()] };
+  });
+}
+function syncRadioGroup(group) {
+  const radios = [...group.querySelectorAll("[role='radio']")].filter((radio) => !radio.disabled);
+  const selected = radios.find((radio) => radio.getAttribute("aria-checked") === "true") || radios[0];
+  for (const radio of radios) radio.tabIndex = radio === selected ? 0 : -1;
+}
+function radioGroupKeydown(event) {
+  if (!["ArrowDown", "ArrowRight", "ArrowUp", "ArrowLeft", "Home", "End"].includes(event.key)) return;
+  const group = event.currentTarget;
+  const radio = event.target.closest("[role='radio']");
+  if (!radio || !group.contains(radio)) return;
+  const radios = [...group.querySelectorAll("[role='radio']")].filter((node) => !node.disabled);
+  const current = radios.indexOf(radio);
+  if (current < 0 || !radios.length) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const next = event.key === "Home" ? radios[0]
+    : event.key === "End" ? radios.at(-1)
+    : radios[(current + (["ArrowDown", "ArrowRight"].includes(event.key) ? 1 : -1) + radios.length) % radios.length];
+  for (const node of radios) node.tabIndex = node === next ? 0 : -1;
+  next.focus();
+}
 function renderModelChoices() {
   const root = $("model-choices");
+  const focusId = captureFocus(root);
+  const effortFocusId = captureFocus($("effort-choices"));
   root.replaceChildren();
   const query = $("model-search").value.trim().toLocaleLowerCase();
-  for (const provider of state.providers) {
-    const models = state.models.filter((m) => m.providerId === provider.id &&
-      `${provider.name} ${m.displayName || ""} ${m.model}`.toLocaleLowerCase().includes(query));
-    if (!models.length && (query || !provider.warning)) continue;
+  for (const { provider, models } of modelGroups()) {
+    const providerMatch = `${provider.name} ${provider.notes || ""}`.toLocaleLowerCase().includes(query);
+    const matches = models.filter((model) => providerMatch ||
+      `${model.displayName || ""} ${model.model}`.toLocaleLowerCase().includes(query));
+    if (!matches.length && !(providerMatch && provider.warning)) continue;
     const group = document.createElement("div");
     group.className = "model-group";
     const label = document.createElement("div");
     label.className = "model-group-label";
     label.textContent = provider.name;
     group.append(label);
+    if (provider.notes) {
+      const notes = document.createElement("p");
+      notes.className = "model-group-notes";
+      notes.textContent = provider.notes;
+      group.append(notes);
+    }
     if (provider.warning) {
       const warning = document.createElement("p");
       warning.className = "model-warning";
       warning.textContent = provider.warning;
       group.append(warning);
     }
-    for (const model of models) {
+    for (const model of matches) {
       const option = document.createElement("button");
       option.type = "button";
       option.className = "model-choice";
+      option.dataset.focusId = `model:${model.key}`;
       option.setAttribute("role", "radio");
       option.setAttribute("aria-checked", String(model.key === $("model").value));
       option.disabled = !!provider.unavailable;
@@ -1965,6 +2390,7 @@ function renderModelChoices() {
     const option = document.createElement("button");
     option.type = "button";
     option.className = "model-choice";
+    option.dataset.focusId = `effort:${effort.value}`;
     option.setAttribute("role", "radio");
     option.setAttribute("aria-checked", String(effort.value === $("effort").value));
     option.textContent = `${effort.textContent}${effort.value === $("effort").value ? "　✓" : ""}`;
@@ -1976,6 +2402,10 @@ function renderModelChoices() {
     };
     efforts.append(option);
   }
+  syncRadioGroup(root);
+  syncRadioGroup(efforts);
+  restoreFocus(root, focusId);
+  restoreFocus(efforts, effortFocusId);
 }
 function positionModelMenu() {
   const menu = $("model-menu");
@@ -2008,6 +2438,18 @@ function openModelMenu() {
 function isRunning() {
   if (state.readOnly) return false;
   return state.turns.some((t) => t.status === "inProgress");
+}
+const continuationPrompt = "请从中断处继续完成上一项任务。先核对已完成的工作和当前状态，再处理剩余步骤。";
+
+function continuationTurn() {
+  if (!state.current || state.readOnly || isRunning() || $("prompt").value.trim() || currentAttachments().length) return null;
+  const queue = state.messageQueues.get(state.current.id);
+  if (queue?.dispatching || (queue?.entries?.length && !queue.paused)) return null;
+  const latest = state.turns.filter((turn) => turn.id && turn.id !== "error").at(-1);
+  return ["failed", "interrupted"].includes(latest?.status) ? latest : null;
+}
+function hasUnconfirmedThreadSend() {
+  return !!state.current && state.outbox.some((entry) => entry.agentId === state.selected && entry.threadId === state.current.id);
 }
 function turnFor(id) {
   let t = state.turns.find((t) => t.id === id);
@@ -2095,7 +2537,6 @@ function onEvent(msg) {
     } else {
       state.detached = false;
       state.readOnly = false;
-      state.snapshotOlder = false;
     }
     renderConnection();
     scheduleRender();
@@ -2127,11 +2568,15 @@ function onEvent(msg) {
       });
     else state.turns.push({ ...p.turn, items: p.turn.items || [] });
     state.started = Date.now();
+    announceTurn("Codex 已开始处理任务");
   } else if (method === "turn/completed") {
     const turn = turnFor(p.turn.id);
     turn.status = p.turn.status;
     for (const item of p.turn.items || []) upsertItem(turn, item);
     if (p.turn.error) turn.error = p.turn.error;
+    announceTurn(p.turn.error?.message ? `任务失败：${p.turn.error.message}`
+      : p.turn.status === "interrupted" ? "任务已停止"
+        : "任务已完成");
   } else if (method === "item/started" || method === "item/completed") {
     if (p.item) {
       const t = turnFor(p.turnId);
@@ -2162,6 +2607,7 @@ function onEvent(msg) {
     const t = turnFor(p.turnId || "error");
     t.error = p.error || { message: "Codex 发生错误" };
     if (!p.willRetry) t.status = "failed";
+    if (!p.willRetry) announceTurn(`任务失败：${t.error.message || "Codex 发生错误"}`);
   }
   scheduleRender();
   if (["turn/started", "turn/completed", "error"].includes(method))
@@ -2188,13 +2634,20 @@ function scrollBottom() {
 
 // A deliberately small renderer: escape first, allow only known Markdown tags
 // and http(s) links. No upstream HTML is inserted into the document.
-function inline(text) {
+function inline(text, itemId) {
   const stash = [];
-  let s = escapeHTML(text);
-  s = s.replace(/`([^`]+)`/g, (_, v) => {
-    stash.push(`<code>${v}</code>`);
+  const keep = (html) => {
+    stash.push(html);
     return `\u0000${stash.length - 1}\u0000`;
-  });
+  };
+  let s = escapeHTML(String(text).replace(/\u0000/g, "").replace(
+    /\x60([^\x60]+)\x60|!\[([^\]]*)\]\((<[^>\n]+>|[^)\n]+)\)/g,
+    (match, code, label, source) => {
+      if (code !== undefined) return keep(`<code>${escapeHTML(code)}</code>`);
+      const image = historyImageHTML(source.replace(/^<|>$/g, ""), label, itemId);
+      return image ? keep(image) : match;
+    },
+  ));
   s = s.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
     (_, label, url) =>
@@ -2205,7 +2658,7 @@ function inline(text) {
     .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, "<em>$1</em>");
   return s.replace(/\u0000(\d+)\u0000/g, (_, n) => stash[Number(n)]);
 }
-function markdown(text = "") {
+function markdown(text = "", itemId = "") {
   let html = "";
   // Fence parsing also handles a partially streamed, unclosed code block.
   const lines = String(text).split("\n");
@@ -2215,7 +2668,7 @@ function markdown(text = "") {
     list = null;
   const flush = () => {
     if (paragraph.length) {
-      html += `<p>${paragraph.map(inline).join("<br>")}</p>`;
+      html += `<p>${paragraph.map((line) => inline(line, itemId)).join("<br>")}</p>`;
       paragraph = [];
     }
   };
@@ -2249,7 +2702,7 @@ function markdown(text = "") {
     if (heading) {
       flush();
       closeList();
-      html += `<h${heading[1].length}>${inline(heading[2])}</h${heading[1].length}>`;
+      html += `<h${heading[1].length}>${inline(heading[2], itemId)}</h${heading[1].length}>`;
       continue;
     }
     const li = line.match(/^\s*(?:([-*])|\d+[.)])\s+(.*)/);
@@ -2261,13 +2714,13 @@ function markdown(text = "") {
         html += `<${tag}>`;
         list = tag;
       }
-      html += `<li>${inline(li[2])}</li>`;
+      html += `<li>${inline(li[2], itemId)}</li>`;
       continue;
     }
     if (line.startsWith("> ")) {
       flush();
       closeList();
-      html += `<blockquote>${inline(line.slice(2))}</blockquote>`;
+      html += `<blockquote>${inline(line.slice(2), itemId)}</blockquote>`;
       continue;
     }
     closeList();
@@ -2282,10 +2735,11 @@ function itemHTML(item) {
   const type = item.type;
   if (type === "userMessage") {
     const content = userContent(item.content);
-    return `<div class="message user"><div class="user-bubble">${content.text ? `<div>${escapeHTML(content.text)}</div>` : ""}${content.files.length ? `<div class="message-attachments">${content.files.map(attachmentHTML).join("")}</div>` : ""}</div></div>`;
+    const images = historyItemImages(item, content.files.filter((file) => visionMimeTypes.has(file.mimeType)).map((file) => file.path));
+    return `<div class="message user"><div class="user-bubble">${content.text ? `<div>${escapeHTML(content.text)}</div>` : ""}${content.files.length ? `<div class="message-attachments">${content.files.map(attachmentHTML).join("")}</div>` : ""}${images}</div></div>`;
   }
   if (type === "agentMessage")
-    return `<article class="message assistant"><div class="message-label"><span class="mini-mark">${icon("terminal")}</span>Codex</div><div class="markdown">${markdown(item.text || "")}</div><div class="message-tools"><button data-copy="${escapeHTML(item.id)}" aria-label="复制回复">复制回复</button></div></article>`;
+    return `<article class="message assistant"><div class="message-label"><span class="mini-mark">${icon("terminal")}</span>Codex</div><div class="markdown">${markdown(item.text || "", item.id)}</div><div class="message-tools"><button data-copy="${escapeHTML(item.id)}" data-focus-id="copy:${escapeHTML(item.id)}" aria-label="复制回复">复制回复</button></div></article>`;
   if (type === "reasoning") {
     const text =
       item.reasoningText ||
@@ -2293,7 +2747,7 @@ function itemHTML(item) {
         .map((x) => (typeof x === "string" ? x : x.text || ""))
         .join("\n");
     return text
-      ? `<details class="reasoning" data-detail="${escapeHTML(item.id)}"><summary>思考过程</summary><div class="markdown">${markdown(text)}</div></details>`
+      ? `<details class="reasoning" data-detail="${escapeHTML(item.id)}"><summary data-focus-id="detail:${escapeHTML(item.id)}">思考过程</summary><div class="markdown">${markdown(text, item.id)}</div></details>`
       : "";
   }
   if (type === "commandExecution")
@@ -2334,13 +2788,24 @@ function itemHTML(item) {
         "",
       "",
     );
-  if (type === "mcpToolCall")
-    return toolHTML(
+  if (type === "imageView" || type === "imageGeneration") {
+    const images = historyItemImages(item);
+    if (images) return images;
+  }
+  if (type === "mcpToolCall" || type === "dynamicToolCall") {
+    const images = historyItemImages(item);
+    const details = item.result || item.contentItems || item.arguments || {};
+    return images + toolHTML(
       item.id,
       `${item.server || "MCP"} / ${item.tool || "工具"}`,
-      JSON.stringify(item.result || item.arguments || {}, null, 2),
+      JSON.stringify(details, function (key, value) {
+        if (typeof value !== "string") return value;
+        const encodedImage = (key === "blob" || key === "data") && cachedImageTypes.has(this.mimeType);
+        return encodedImage || /^data:image\//i.test(value) ? "[图片]" : value;
+      }, 2),
       item.status || "",
     );
+  }
   if (type === "webSearch")
     return toolHTML(
       item.id,
@@ -2351,7 +2816,7 @@ function itemHTML(item) {
   if (type === "contextCompaction")
     return '<div class="turn-status">上下文已压缩</div>';
   if (type === "planMessage")
-    return `<div class="message markdown">${markdown(item.text || "")}</div>`;
+    return `<div class="message markdown">${markdown(item.text || "", item.id)}</div>`;
   return toolHTML(
     item.id,
     type || "执行事件",
@@ -2360,12 +2825,13 @@ function itemHTML(item) {
   );
 }
 function toolHTML(id, title, text, status) {
-  return `<details class="tool-card" data-detail="${escapeHTML(id)}"><summary>${escapeHTML(title)}<span>${escapeHTML(status)}</span></summary><pre class="tool-output">${escapeHTML(text)}</pre></details>`;
+  return `<details class="tool-card" data-detail="${escapeHTML(id)}"><summary data-focus-id="detail:${escapeHTML(id)}">${escapeHTML(title)}<span>${escapeHTML(status)}</span></summary><pre class="tool-output">${escapeHTML(text)}</pre></details>`;
 }
 const dirtyMessageItems = new Set();
 const messageRender = { layout: "", items: new Map() };
 function renderMessages() {
   const root = $("messages");
+  const focusId = captureFocus(root);
   const items = state.turns.flatMap((turn) => turn.items || []);
   const layout = JSON.stringify([
     !!state.historyCursor,
@@ -2374,6 +2840,7 @@ function renderMessages() {
     state.turns.map((turn) => [
       (turn.items || []).map((item) => item.id),
       turn.error || null,
+      !!turn.codexrmHistoryOmitted,
       displayedTurnStatus(turn),
     ]),
   ]);
@@ -2395,6 +2862,7 @@ function renderMessages() {
     if (incremental) {
       dirtyMessageItems.clear();
       hydrateAttachmentImages();
+      restoreFocus(root, focusId);
       return;
     }
   }
@@ -2403,7 +2871,7 @@ function renderMessages() {
     [...root.querySelectorAll("details[open]")].map((n) => n.dataset.detail),
   );
   let html = state.historyCursor
-    ? '<button class="text-button" id="older-turns">加载更早的消息</button>'
+    ? '<button class="text-button" id="older-turns" data-focus-id="older-turns">加载更早的消息</button>'
     : "";
   if (state.readOnly)
     html +=
@@ -2416,6 +2884,8 @@ function renderMessages() {
       html += `<div class="message-item" data-item-id="${escapeHTML(item.id)}">${itemHTML(item)}</div>`;
       rendered.set(item.id, { source: item, node: null });
     }
+    if (turn.codexrmHistoryOmitted)
+      html += '<div class="turn-status">这一轮内容过大，请在 Codex 桌面端查看完整内容。</div>';
     if (turn.error)
       html += `<div class="error-message">${escapeHTML(turn.error.message || JSON.stringify(turn.error))}</div>`;
     const status = displayedTurnStatus(turn);
@@ -2438,11 +2908,11 @@ function renderMessages() {
   messageRender.items = rendered;
   dirtyMessageItems.clear();
   hydrateAttachmentImages();
+  restoreFocus(root, focusId);
 }
 $("messages").addEventListener("click", async (event) => {
   const attachmentButton = event.target.closest("[data-attachment]");
   if (attachmentButton) {
-    if (!state.online) return toast("请连接设备后再下载附件");
     attachmentButton.disabled = true;
     try {
       const file = await readAttachment(attachmentButton.dataset.attachment);
@@ -2774,15 +3244,15 @@ function renderMessageQueue() {
     root.append(error);
   }
 }
-async function changeMessageQueue(action, id) {
+async function runThreadAction(method, params, onSuccess) {
   if (state.sending || state.loading || state.readOnly || !state.current) return;
   const generation = state.generation;
   const threadId = state.current.id;
   state.sending = true;
   renderConnection();
   try {
-    const result = await rpc(`codexrm/queue/${action}`, { threadId, ...(id ? { id } : {}) });
-    if (generation === state.generation) acceptMessageQueue(result);
+    const result = await rpc(method, { threadId, ...params });
+    if (generation === state.generation) onSuccess(result);
   } catch (e) {
     if (generation === state.generation) showError(e);
   } finally {
@@ -2792,23 +3262,13 @@ async function changeMessageQueue(action, id) {
     }
   }
 }
-async function stopTurn() {
+function changeMessageQueue(action, id) {
+  return runThreadAction(`codexrm/queue/${action}`, id ? { id } : {}, acceptMessageQueue);
+}
+function stopTurn() {
   const turn = state.turns.find((t) => t.status === "inProgress");
-  if (!turn || state.sending || state.loading || state.readOnly) return;
-  const generation = state.generation;
-  state.sending = true;
-  renderConnection();
-  try {
-    await rpc("turn/interrupt", { threadId: state.current.id, turnId: turn.id });
-    if (generation === state.generation) toast("已请求停止任务，排队消息将保留");
-  } catch (e) {
-    if (generation === state.generation) showError(e);
-  } finally {
-    if (generation === state.generation) {
-      state.sending = false;
-      renderConnection();
-    }
-  }
+  if (!turn) return;
+  return runThreadAction("turn/interrupt", { turnId: turn.id }, () => toast("已请求停止任务，排队消息将保留"));
 }
 async function sendFollowup(text, mode) {
   const generation = state.generation;
@@ -2826,6 +3286,7 @@ async function sendFollowup(text, mode) {
     type: "userMessage", content: params.input,
   } : null;
   if (optimistic) turn.items.push(optimistic);
+  const pendingSend = stageOutbox(original, files, mode);
   state.sending = true;
   clearSentDraft(key, files);
   renderMessages();
@@ -2838,12 +3299,15 @@ async function sendFollowup(text, mode) {
       const result = await rpc("codexrm/queue/add", params);
       if (generation === state.generation) acceptMessageQueue(result);
     }
+    clearOutbox(pendingSend);
     if (generation === state.generation && state.current?.id === threadId) saveModelPreference();
   } catch (e) {
-    if (optimistic) turn.items = turn.items.filter((i) => i !== optimistic);
-    restoreSentDraft(key, original, files);
-    if (generation === state.generation && state.current?.id === threadId) {
-      renderMessages();
+    if (e.uncertain) renderPersistentNotice();
+    else {
+      clearOutbox(pendingSend);
+      if (optimistic) turn.items = turn.items.filter((i) => i !== optimistic);
+      restoreSentDraft(key, original, files);
+      if (generation === state.generation && state.current?.id === threadId) renderMessages();
     }
     if (generation === state.generation) showError(e);
   } finally {
@@ -2861,7 +3325,10 @@ async function submit(event, mode = "auto") {
     toast("此会话由另一个 Codex 实例运行，请先结束原会话或新建会话");
     return;
   }
-  const text = $("prompt").value.trim();
+  const continuing = mode === "continue";
+  const interrupted = continuing ? continuationTurn() : null;
+  if (continuing && (!interrupted || !state.browserOnline || hasUnconfirmedThreadSend())) return;
+  const text = continuing ? continuationPrompt : $("prompt").value.trim();
   const files = [...currentAttachments()];
   if ((!text && !files.length) || state.sending) return;
   if (files.some((f) => f.uploading || f.error)) return toast("请等待附件上传完成，或重试失败的附件");
@@ -2874,13 +3341,14 @@ async function submit(event, mode = "auto") {
     toast("设备离线，请先启动本地 Agent");
     return;
   }
-  if (mode === "steer" || mode === "queue" || isRunning() || state.messageQueues.get(state.current?.id)?.entries?.length)
+  if (!continuing && (mode === "steer" || mode === "queue" || isRunning() || state.messageQueues.get(state.current?.id)?.entries?.length))
     return sendFollowup(text, mode);
   const generation = state.generation;
   const originalKey = draftKey();
-  const original = $("prompt").value;
+  const original = continuing ? text : $("prompt").value;
   const creating = !state.current;
   const operation = creating ? { originalKey, original, files, cancelled: false, restored: false, turnStarted: false } : null;
+  const pendingSend = stageOutbox(original, files, mode, interrupted?.id);
   state.sending = true;
   if (creating) {
     state.creating = operation;
@@ -2898,9 +3366,12 @@ async function submit(event, mode = "auto") {
           approvalPolicy: state.settings.approvalPolicy || "never",
         });
       } catch (error) {
-        restoreCreatingDraft(operation);
+        // A timeout or disconnect may still have reached the Agent. Keep the
+        // outbox record instead of restoring an ambiguous draft into the composer.
+        if (!error.uncertain) restoreCreatingDraft(operation);
         throw error;
       }
+      bindOutbox(pendingSend, result.thread.id);
       if (generation !== state.generation || operation.cancelled || state.creating !== operation) return;
       operation.turnStarted = true;
       state.creating = null;
@@ -2932,9 +3403,10 @@ async function submit(event, mode = "auto") {
     state.turns.push(optimistic);
     renderMessages();
     scrollBottom();
-    if (!creating) clearSentDraft(originalKey, files);
+    if (!creating && !continuing) clearSentDraft(originalKey, files);
     try {
       const result = await rpc("turn/start", params);
+      clearOutbox(pendingSend);
       if (generation !== state.generation || state.current?.id !== threadId)
         return;
       if (selectedModel()) state.current.model = selectedModel().model;
@@ -2958,8 +3430,10 @@ async function submit(event, mode = "auto") {
         rpc("thread/name/set", { threadId, name }).catch(() => {});
       }
     } catch (error) {
-      restoreSentDraft(key, original, files);
-      if (creating) operation.restored = true;
+      if (!error.uncertain) {
+        if (!continuing) restoreSentDraft(key, original, files);
+        if (creating) operation.restored = true;
+      }
       if (generation === state.generation && state.current?.id === threadId) {
         state.turns = state.turns.filter((t) => t !== optimistic);
         renderMessages();
@@ -2967,7 +3441,15 @@ async function submit(event, mode = "auto") {
       throw error;
     }
   } catch (error) {
-    if (creating) restoreCreatingDraft(operation);
+    if (operation?.cancelled) {
+      clearOutbox(pendingSend);
+      restoreCreatingDraft(operation);
+    } else if (error.uncertain) {
+      renderPersistentNotice();
+    } else {
+      clearOutbox(pendingSend);
+      if (creating) restoreCreatingDraft(operation);
+    }
     if (generation === state.generation && !operation?.cancelled) showError(error);
   } finally {
     const ownsSend = !creating || (!operation.cancelled && (operation.turnStarted || state.creating === operation));
@@ -3065,15 +3547,67 @@ function sidebarResizeKey(event) {
   const step = event.shiftKey ? 50 : 10;
   setSidebarWidth(event.key === "Home" ? min : event.key === "End" ? max : width + (event.key === "ArrowRight" ? step : -step));
 }
+let sidebarReturnFocus = null;
+function syncSidebarAccessibility() {
+  const mobile = isMobileLayout();
+  const drawerOpen = mobile && document.body.classList.contains("sidebar-open");
+  const visible = mobile ? drawerOpen : !document.body.classList.contains("sidebar-collapsed");
+  const sidebar = $("sidebar");
+  sidebar.inert = !visible;
+  sidebar.setAttribute("aria-hidden", String(!visible));
+  $("main").inert = drawerOpen;
+  $("toggle-sidebar").setAttribute("aria-expanded", String(visible));
+  if (drawerOpen) {
+    sidebar.setAttribute("role", "dialog");
+    sidebar.setAttribute("aria-modal", "true");
+  } else {
+    sidebar.removeAttribute("role");
+    sidebar.removeAttribute("aria-modal");
+  }
+  if (!visible && sidebar.contains(document.activeElement)) $("toggle-sidebar").focus();
+}
 function openSidebar() {
   if (!isMobileLayout()) return;
+  if (!document.body.classList.contains("sidebar-open"))
+    sidebarReturnFocus = document.activeElement;
   document.body.classList.add("sidebar-open");
   $("sidebar-overlay").hidden = false;
+  syncSidebarAccessibility();
+  $("close-sidebar").focus();
 }
-function closeSidebar() {
+function closeSidebar(restore = true) {
   closeThreadMenu();
+  const drawerOpen = document.body.classList.contains("sidebar-open");
   document.body.classList.remove("sidebar-open");
   $("sidebar-overlay").hidden = true;
+  syncSidebarAccessibility();
+  if (drawerOpen && restore) {
+    const target = sidebarReturnFocus?.isConnected ? sidebarReturnFocus : $("toggle-sidebar");
+    target.focus();
+  }
+  sidebarReturnFocus = null;
+}
+function sidebarKeydown(event) {
+  if (!isMobileLayout() || !document.body.classList.contains("sidebar-open")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeSidebar();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const controls = [...$("sidebar").querySelectorAll("a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])")]
+    .filter((node) => !node.closest("[hidden], [inert]"));
+  if (!controls.length) return;
+  const first = controls[0];
+  const last = controls.at(-1);
+  if (event.shiftKey && (document.activeElement === first || !$("sidebar").contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 let sidebarTouch = null;
 const sidebarGestureExcluded = [
@@ -3220,7 +3754,10 @@ $("pair-form").onsubmit = async (event) => {
     connect();
     $("pair-dialog").close();
     toast(`已配对 ${result.agent.serverName}`);
-    if (old) api("/api/v1/client/revoke", {}, old.token).catch(() => {});
+    if (old) {
+      clearImageScope(old);
+      api("/api/v1/client/revoke", {}, old.token).catch(() => {});
+    }
   } catch (error) {
     $("pair-error").textContent =
       {
@@ -3261,6 +3798,7 @@ $("disconnect").onclick = async () => {
     }
   }
   disconnectSocket();
+  clearImageScope(d);
   state.devices = state.devices.filter((x) => x !== d);
   state.selected = state.devices[0]?.agent.agentId || null;
   persist();
@@ -3441,6 +3979,8 @@ $("choose-effort").onclick = () => modelMenuPane("effort");
 $("model-menu-back").onclick = () => modelMenuPane();
 $("close-model-menu").onclick = () => closeModelMenu(true);
 $("model-search").oninput = renderModelChoices;
+for (const group of [$("model-choices"), $("effort-choices")])
+  group.addEventListener("keydown", radioGroupKeydown);
 $("model-menu").addEventListener("toggle", (event) => {
   if (event.newState === "closed") {
     $("model-menu").hidden = true;
@@ -3477,6 +4017,7 @@ document.addEventListener("pointerdown", (event) => {
 window.addEventListener("resize", () => {
   if (isMobileLayout()) finishSidebarResize();
   syncSidebarWidth();
+  syncSidebarAccessibility();
   closeThreadMenu();
   positionModelMenu();
 });
@@ -3489,6 +4030,7 @@ $("composer").onsubmit = submit;
 $("queue-send").onclick = () => submit(null, "queue");
 $("steer").onclick = () => submit(null, "steer");
 $("stop").onclick = stopTurn;
+$("continue-turn").onclick = () => submit(null, "continue");
 $("attach-files").onclick = () => $("file-input").click();
 $("file-input").onchange = (event) => {
   const files = [...event.target.files];
@@ -3523,7 +4065,10 @@ $("toggle-sidebar").onclick = () => {
   if (isMobileLayout()) {
     if (document.body.classList.contains("sidebar-open")) closeSidebar();
     else openSidebar();
-  } else document.body.classList.toggle("sidebar-collapsed");
+  } else {
+    document.body.classList.toggle("sidebar-collapsed");
+    syncSidebarAccessibility();
+  }
 };
 $("close-sidebar").onclick = closeSidebar;
 $("sidebar-overlay").onclick = closeSidebar;
@@ -3554,8 +4099,10 @@ $("theme-toggle").onclick = () => {
 };
 document.documentElement.dataset.theme = readStorage("codexrm.theme", "dark");
 syncSidebarWidth();
+syncSidebarAccessibility();
 document.addEventListener("keydown", (e) => {
-  if (document.querySelector("dialog[open]")) return;
+  sidebarKeydown(e);
+  if (e.defaultPrevented || document.querySelector("dialog[open]")) return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
     e.preventDefault();
     newChat();
@@ -3580,13 +4127,35 @@ setInterval(() => {
   if (!state.online || !state.loaded || state.threadListLoading || document.hidden) return;
   loadThreads().catch((error) => toast(`会话列表同步失败：${error.message}`));
 }, 15000);
+function handleOffline() {
+  state.browserOnline = false;
+  saveDraft();
+  connectionNotice("offline");
+  renderConnection();
+}
+function handleOnline() {
+  state.browserOnline = true;
+  connectionNotice(state.reconnecting ? "reconnecting" : "");
+  renderConnection();
+  resumeConnection();
+}
+window.addEventListener("codexrm:pwa-reload", (event) => {
+  if (isRunning() || state.sending) {
+    event.preventDefault();
+    toast("任务正在运行或消息正在发送，已暂缓应用更新");
+    return;
+  }
+  saveDraft();
+});
 document.addEventListener("visibilitychange", handleVisibilityChange);
 window.addEventListener("pageshow", resumeConnection);
-window.addEventListener("online", resumeConnection);
+window.addEventListener("offline", handleOffline);
+window.addEventListener("online", handleOnline);
 renderDevices();
 renderWorkspaces();
 renderThreads();
 renderConnection();
+if (!state.browserOnline) connectionNotice("offline");
 const linkedPairCode = pairCodeFromLink();
 if (linkedPairCode) {
   openPair(linkedPairCode);

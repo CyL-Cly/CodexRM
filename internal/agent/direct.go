@@ -163,6 +163,7 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	signal := func(sig *protocol.P2PSignal) error {
 		return a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, ClientID: d.client, P2P: sig})
 	}
+	stop := protocol.P2P("stop", d.id)
 	defer func() {
 		d.cancel()
 		d.files.close()
@@ -170,7 +171,7 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 		defer a.eventMu.Unlock()
 		if a.direct[d.client] == d {
 			delete(a.direct, d.client)
-			_ = signal(protocol.P2P("stop", d.id))
+			_ = signal(stop)
 		}
 	}()
 	attempt, cancel := context.WithTimeout(d.ctx, protocol.P2PAttempt)
@@ -192,6 +193,9 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	}
 	link, err := prepared.Connect(attempt, remote, d.ready, func() error { return signal(protocol.P2P("ready", d.id)) })
 	if err != nil {
+		if errors.Is(err, p2p.ErrDualUnpredictableNAT) {
+			stop.Reason = protocol.P2PReasonDualUnpredictableNAT
+		}
 		log.Printf("p2p negotiate: %v", err)
 		return
 	}
@@ -209,7 +213,7 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	d.active, d.lease = true, time.Now().Add(protocol.P2PLease)
 	a.eventMu.Unlock()
 	cancel()
-	log.Printf("p2p direct active (lan=%t)", link.IsLAN())
+	log.Printf("p2p direct active (lan=%t ipv6=%t)", link.IsLAN(), link.IsIPv6())
 	go func() {
 		<-d.ctx.Done()
 		link.Close()

@@ -18,6 +18,12 @@ internal data class ArtifactCard(val path: String, val name: String, val type: S
         private val drive = Regex("^[A-Za-z]:[/\\\\]")
         private val scheme = Regex("^[A-Za-z][A-Za-z0-9+.-]*:")
 
+        private val lineAnchor = Regex("#L\\d+(?:C\\d+)?(?:-L\\d+(?:C\\d+)?)?$")
+        private val windowsLine = Regex(":\\d+(?::\\d+)?$")
+
+        fun fromLink(destination: String): ArtifactCard? =
+            linkPath(destination)?.let { card(it, "产物", linked = true) }
+
         fun fromItem(item: JSONObject): List<ArtifactCard> {
             if (item.string("type") == "agentMessage") return fromLinks(item.string("text"))
             if (item.string("type") != "fileChange" || item.string("status") != "completed") return emptyList()
@@ -41,34 +47,37 @@ internal data class ArtifactCard(val path: String, val name: String, val type: S
             markdown.parse(value.take(65_536)).accept(object : AbstractVisitor() {
                 override fun visit(link: Link) {
                     if (files.size >= 8) return
-                    val path = linkPath(link.destination) ?: return
-                    val artifact = card(path, "产物", linked = true) ?: return
-                    files.putIfAbsent(path, artifact)
+                    val artifact = fromLink(link.destination) ?: return
+                    files.putIfAbsent(artifact.path, artifact)
                 }
             })
             return files.values.toList()
         }
 
-        private fun linkPath(raw: String): String? {
-            val path = runCatching {
+        private fun linkPath(destination: String): String? {
+            val raw = destination.replace(lineAnchor, "")
+            val decoded = runCatching {
                 if (raw.startsWith("file:", ignoreCase = true)) {
                     val uri = URI(raw)
                     if (uri.rawAuthority != null || uri.rawQuery != null || uri.rawFragment != null) return null
-                    val local = uri.path ?: return null
-                    if (drive.containsMatchIn(local.removePrefix("/"))) local.removePrefix("/") else local
+                    uri.path ?: return null
                 } else {
                     val local = raw.removePrefix("sandbox:")
                     if ('#' in local || '?' in local) return null
                     URLDecoder.decode(local.replace("+", "%2B"), "UTF-8")
                 }
             }.getOrNull() ?: return null
-            if (path.startsWith("//") || path.startsWith('\\') || path.any { it.isISOControl() }) return null
-            if (!drive.containsMatchIn(path) && scheme.containsMatchIn(path)) return null
-            return path
+            if (decoded.startsWith("//") || decoded.startsWith('\\') || decoded.any { it.isISOControl() }) return null
+            val withoutLeadingSlash = decoded.removePrefix("/")
+            val windows = drive.containsMatchIn(withoutLeadingSlash)
+            if (!windows && scheme.containsMatchIn(decoded)) return null
+            val path = if (windows) withoutLeadingSlash.replace(windowsLine, "") else decoded
+            return path.takeIf { it.isNotBlank() && !it.endsWith('/') && !it.endsWith('\\') }
         }
 
         private fun card(path: String, operation: String, linked: Boolean = false): ArtifactCard? {
             val name = path.substringAfterLast('/').substringAfterLast('\\')
+            if (name.isBlank() || name == "." || name == "..") return null
             val ext = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
             val type = when (ext) {
                 in office -> if (ext == "pdf") "PDF" else "Office 文档"
@@ -76,7 +85,7 @@ internal data class ArtifactCard(val path: String, val name: String, val type: S
                 in audio -> "音频"
                 in video -> "视频"
                 "apk" -> "APK"
-                else -> return null
+                else -> if (linked) "文件" else return null
             }
             return ArtifactCard(path, name, type, operation, linked)
         }

@@ -1,12 +1,12 @@
 package com.codexrm.mobile
 
-import android.annotation.TargetApi
 import android.app.Activity
 import android.os.Build
 import android.window.BackEvent
 import android.window.OnBackAnimationCallback
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import androidx.annotation.RequiresApi
 
 /**
  * Predictive-back helper that keeps the platform callback types out of
@@ -20,7 +20,7 @@ import android.window.OnBackInvokedDispatcher
  */
 internal object SystemBackCompat {
     fun createCallback(
-        onStarted: (Float) -> Unit,
+        onStarted: (Float, Boolean) -> Unit,
         onProgressed: (Float) -> Unit,
         onCancelled: () -> Unit,
         onBack: () -> Unit,
@@ -38,7 +38,7 @@ internal object SystemBackCompat {
         if (Build.VERSION.SDK_INT >= 33 && callback != null) Api33.unregister(activity, callback)
     }
 
-    @TargetApi(33)
+    @RequiresApi(33)
     private object Api33 {
         fun createCallback(onBack: () -> Unit): Any = OnBackInvokedCallback { onBack() }
 
@@ -54,15 +54,16 @@ internal object SystemBackCompat {
         }
     }
 
-    @TargetApi(34)
+    @RequiresApi(34)
     private object Api34 {
         fun createCallback(
-            onStarted: (Float) -> Unit,
+            onStarted: (Float, Boolean) -> Unit,
             onProgressed: (Float) -> Unit,
             onCancelled: () -> Unit,
             onBack: () -> Unit,
         ): Any = object : OnBackAnimationCallback {
-            override fun onBackStarted(backEvent: BackEvent) = onStarted(backEvent.progress)
+            override fun onBackStarted(backEvent: BackEvent) =
+                onStarted(backEvent.progress, backEvent.swipeEdge == BackEvent.EDGE_RIGHT)
             override fun onBackProgressed(backEvent: BackEvent) = onProgressed(backEvent.progress)
             override fun onBackCancelled() = onCancelled()
             override fun onBackInvoked() = onBack()

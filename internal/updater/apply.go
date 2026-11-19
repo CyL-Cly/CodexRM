@@ -15,6 +15,7 @@ import (
 )
 
 const readyEnv = "CODEXRM_UPDATE_READY"
+const rollbackEnv = "CODEXRM_UPDATE_ROLLED_BACK"
 
 // StartHelper copies the running executable away from its replacement target.
 // The detached helper waits for the original agent to close Codex and exit.
@@ -39,16 +40,10 @@ func (p *Plan) StartHelper() error {
 	}
 	cmd := exec.Command(helper, "--apply-update", p.planPath())
 	hideProcess(cmd)
-	logFile, err := openUpdateLog(p.InstallDir)
-	if err != nil {
+	if err := p.startLoggedProcess(cmd); err != nil {
 		return err
 	}
-	defer logFile.Close()
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	if err = cmd.Start(); err != nil {
-		return err
-	}
-	if err = os.WriteFile(filepath.Join(p.StageDir, "helper.pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(p.StageDir, "helper.pid"), []byte(strconv.Itoa(cmd.Process.Pid)), 0600); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return err
@@ -57,8 +52,14 @@ func (p *Plan) StartHelper() error {
 	return nil
 }
 
-func openUpdateLog(root string) (*os.File, error) {
-	return os.OpenFile(filepath.Join(root, ".state", "update.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+func (p *Plan) startLoggedProcess(cmd *exec.Cmd) error {
+	logFile, err := os.OpenFile(filepath.Join(p.InstallDir, ".state", "update.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	return cmd.Start()
 }
 
 // InstallStopped is called by a temporary copy of the agent while the installed connector is stopped.
@@ -219,13 +220,7 @@ func (p *Plan) restart(expectReady bool) error {
 		_ = os.Remove(marker)
 		cmd.Env = append(cmd.Env, readyEnv+"="+marker)
 	}
-	logFile, err := openUpdateLog(p.InstallDir)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	if err = cmd.Start(); err != nil {
+	if err := p.startLoggedProcess(cmd); err != nil {
 		return err
 	}
 	if !expectReady {
@@ -263,8 +258,9 @@ func withoutReadyEnv(env []string) []string {
 	return result
 }
 
-// SignalReady is called only after Codex initialized and the connector can serve requests.
+// SignalReady confirms that the agent host and settings listener can start.
 func SignalReady() {
+	signalLinuxReady()
 	path := os.Getenv(readyEnv)
 	_ = os.Unsetenv(readyEnv)
 	if path != "" {

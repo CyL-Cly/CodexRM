@@ -20,12 +20,12 @@ func providerFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err = db.Exec("CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, sort_index INTEGER)"); err != nil {
+	if _, err = db.Exec("CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, settings_config TEXT, sort_index INTEGER, notes TEXT)"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 2; i++ {
 		raw := mustJSON(map[string]any{"auth": map[string]any{"OPENAI_API_KEY": fmt.Sprintf("secret-%d", i)}, "config": fmt.Sprintf("model = 'same-model'\nmodel_provider = 'custom'\n[model_providers.custom]\nname = 'Same'\nbase_url = 'https://example.test/v1'\nwire_api = 'responses'\n")})
-		if _, err = db.Exec("INSERT INTO providers VALUES (?, 'codex', 'Same', ?, ?)", fmt.Sprint(i), string(raw), i); err != nil {
+		if _, err = db.Exec("INSERT INTO providers VALUES (?, 'codex', 'Same', ?, ?, NULL)", fmt.Sprint(i), string(raw), i); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -72,12 +72,6 @@ func TestThreadProviderIsolationAndResume(t *testing.T) {
 		if err := json.Unmarshal(raw, &result); err != nil {
 			t.Fatal(err)
 		}
-		if err := a.rememberThreadModel("thread/start", params, raw); err != nil {
-			t.Fatal(err)
-		}
-		if err := a.rememberThreadModel("turn/start", map[string]any{"threadId": result.Thread.ID, "model": "alternate-model", "effort": "max"}, mustJSON(map[string]any{"turn": map[string]any{"id": "turn"}})); err != nil {
-			t.Fatal(err)
-		}
 		// Simulate a fresh agent: the rollout provider ID must restore the correct key.
 		b := &Agent{cfg: a.cfg}
 		resume := map[string]any{"threadId": result.Thread.ID}
@@ -88,8 +82,8 @@ func TestThreadProviderIsolationAndResume(t *testing.T) {
 		if restored["experimental_bearer_token"] != connection["experimental_bearer_token"] || resume["modelProvider"] != provider.ID {
 			t.Fatal("resume changed provider credentials")
 		}
-		if resume["model"] != "alternate-model" || resume["config"].(map[string]any)["model_reasoning_effort"] != "max" {
-			t.Fatal("resume lost the session model or reasoning effort")
+		if resume["model"] != nil || resume["config"].(map[string]any)["model_reasoning_effort"] != nil {
+			t.Fatal("provider preparation overrode Codex thread settings")
 		}
 	}
 	if err := a.prepareProvider(ctx, app, "thread/start", map[string]any{"codexrmProvider": "ccswitch_removed"}); err == nil {

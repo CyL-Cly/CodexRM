@@ -19,6 +19,7 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
     append(...nodes) { this.children.push(...nodes); }
     replaceChildren(...nodes) { this.children = nodes; }
     setAttribute(name, value) { this[name] = value; }
+    removeAttribute(name) { delete this[name]; }
     getAttribute(name) { return this[name] ?? null; }
     addEventListener(type, listener) { (this.listeners ||= new Map()).set(type, listener); }
     closest() { return null; }
@@ -102,7 +103,7 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
   return { context, elements, claims, profiles, contextRequests, history, document, documentListeners, windowListeners, timers,
     advance,
     profile: vm.runInContext("({browserClientProfile, syncClientProfile})", context),
-    app: vm.runInContext("({state, workspaceGroups, renderThreads, setHome, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, closeCodexDesktop, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams, addAttachments, currentAttachments, userContent, messageInput, readAttachment, itemHTML, requestThreadDeletion, archiveThread, openThread, olderTurns, scheduleSnapshot, bootstrap, resetView, selectDevice, settings, updateAgent, createDeviceButton})", context) };
+    app: vm.runInContext("({state, workspaceGroups, renderThreads, setHome, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, closeCodexDesktop, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams, makeOutboxEntry, stageOutbox, bindOutbox, clearOutbox, syncOutbox, keepOutboxDraft, renderPersistentNotice, addAttachments, currentAttachments, userContent, messageInput, readAttachment, itemHTML, requestThreadDeletion, archiveThread, openThread, olderTurns, scheduleSnapshot, bootstrap, resetView, selectDevice, settings, updateAgent, createDeviceButton})", context) };
 }
 
 const deferred = () => {
@@ -119,6 +120,66 @@ function newThreadApp(storage = new Map()) {
   });
   return harness;
 }
+
+test("429 exhaustion enables Continue in the same thread and suppresses duplicate clicks", async () => {
+  const { app, context, elements } = newThreadApp();
+  const thread = { id: "existing-thread", cwd: "/project", turns: [{ id: "original-turn", status: "inProgress", items: [] }] };
+  context.rpc = async () => ({ thread });
+  await app.openThread(thread.id);
+  const button = elements.get("continue-turn");
+  const reportError = (willRetry) => app.onEvent({ method: "error", params: {
+    threadId: thread.id, turnId: "original-turn", willRetry, error: { message: "429 Too Many Requests" },
+  } });
+  reportError(true);
+  assert.equal(button.hidden, true);
+  reportError(false);
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+  const started = deferred();
+  const calls = [];
+  context.rpc = (method, params) => { calls.push({ method, params }); return started.promise; };
+  const click = button.onclick();
+  await button.onclick();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "turn/start");
+  assert.equal(calls[0].params.threadId, thread.id);
+  assert.match(calls[0].params.input[0].text, /请从中断处继续/);
+  assert.equal(app.state.outbox[0].afterTurnId, "original-turn");
+  elements.get("prompt").value = "new draft";
+  started.resolve({ turn: { id: "new-turn", status: "inProgress", items: [] } });
+  await click;
+  assert.equal(elements.get("prompt").value, "new draft");
+  assert.equal(button.hidden, true);
+  assert.equal(app.state.outbox.length, 0);
+});
+
+test("reopening a stopped thread restores Continue and preserves its paused queue", async () => {
+  const storage = new Map();
+  const { app, context, elements } = newThreadApp(storage);
+  const thread = { id: "existing-thread", cwd: "/project", turns: [{ id: "stopped", status: "interrupted", items: [] }] };
+  context.rpc = async () => ({ thread });
+  await app.openThread(thread.id);
+  const button = elements.get("continue-turn");
+  assert.equal(button.hidden, false);
+  app.acceptMessageQueue({ threadId: thread.id, entries: [{ id: "queued", input: [] }], paused: true });
+  context.rpc = async (method) => {
+    assert.equal(method, "turn/start");
+    throw new Error("device rejected continuation");
+  };
+  await button.onclick();
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+  assert.equal(elements.get("prompt").value, "");
+  assert.equal(app.state.messageQueues.get(thread.id).entries.length, 1);
+  context.rpc = async () => { throw Object.assign(new Error("connection closed"), { uncertain: true }); };
+  await button.onclick();
+  assert.equal(button.disabled, true);
+  assert.equal(app.state.outbox.length, 1);
+  const reloaded = newThreadApp(storage);
+  reloaded.context.rpc = async () => ({ thread });
+  await reloaded.app.openThread(thread.id);
+  assert.equal(reloaded.elements.get("continue-turn").disabled, true);
+});
 
 const gpuRenderer = "ANGLE (AMD, AMD Radeon 780M Graphics (0x00001900) Direct3D11 vs_5_0 ps_5_0, D3D11)";
 test("mobile device settings show the Agent version and request a remote update", async () => {
@@ -237,6 +298,26 @@ function providerApp(storage) {
   loaded.context.rpc = async () => ({ providers });
   return { ...loaded, providers };
 }
+
+test("the model menu combines the active catalog and searches CC Switch notes", async () => {
+  const { app, elements, providers } = providerApp();
+  providers[0].aliasOf = "ccswitch_a";
+  providers[1].name = providers[2].name = "Sub2API";
+  providers[1].notes = "日常使用";
+  providers[2].notes = "备用账号";
+  app.state.current = { id: "native", modelProvider: "custom", model: "shared" };
+  await app.loadModels();
+  elements.get("choose-model").onclick();
+  const groups = () => elements.get("model-choices").children;
+  const labels = (group) => group.children.map((child) => child.textContent || child.children[0]?.textContent);
+  assert.equal(groups().length, 2);
+  assert.deepEqual(labels(groups()[0]), ["Sub2API", "日常使用", "shared", "alternate"]);
+  assert.deepEqual(labels(groups()[1]), ["Sub2API", "备用账号", "shared"]);
+  assert.equal(groups()[0].children[2].getAttribute("aria-checked"), "true");
+  elements.get("model-search").value = "备用账号";
+  elements.get("model-search").oninput();
+  assert.deepEqual(groups().map(labels), [["Sub2API", "备用账号", "shared"]]);
+});
 
 test("provider changes create a new thread while model changes retain the current supplier", async () => {
   const { app, elements } = providerApp();
@@ -527,8 +608,13 @@ test("retries continue when the auth check stalls; expired pairings stop retryin
   await sockets[1].close();
   assert.equal(app.state.pairingExpired, true);
   assert.equal(timers.has(app.state.reconnectTimer), false);
-  assert.equal(elements.get("connection-notice").hidden, true);
+  assert.equal(elements.get("connection-notice").hidden, false);
   assert.equal(elements.get("connection-label").textContent, "配对已过期");
+  assert.match(elements.get("connection-notice-text").textContent, /草稿会保留/);
+  const repair = elements.get("connection-notice").querySelectorAll("button")[0];
+  assert.equal(repair.textContent, "重新配对");
+  repair.onclick();
+  assert.equal(elements.get("pair-dialog").open, true);
   documentListeners.get("visibilitychange")();
   assert.equal(sockets.length, 2);
 });
@@ -965,6 +1051,50 @@ test("discover every cwd, merge Windows aliases, sort folders and chats by updat
   assert.deepEqual(Array.from(groups[0].threads, (t) => t.id), ["new", "old"]);
 });
 
+test("folders over 15 show their 10 most recently active chats and reveal older chats independently", () => {
+  const { app, elements } = loadApp();
+  app.state.selected = "device-a";
+  app.state.threads = [["large", 16], ["other", 17], ["small", 15]].flatMap(([folder, size]) =>
+    Array.from({ length: size }, (_, index) => ({
+      id: `${folder}-${index + 1}`,
+      name: `${folder} chat ${index + 1}`,
+      cwd: `/${folder}`,
+      updatedAt: index + 1,
+    })),
+  );
+  const history = (folder) => elements.get("workspaces").children.find((g) => g.dataset.path === `/${folder}`)?.children[1];
+  const ids = (folder) => history(folder).children.flatMap((row) => row.dataset.threadId ? [row.dataset.threadId] : []);
+  const older = (folder) => history(folder).children.find((row) => row.className === "workspace-older-threads");
+  app.renderThreads();
+  assert.deepEqual(ids("large"), Array.from({ length: 10 }, (_, i) => `large-${16 - i}`));
+  assert.equal(ids("small").length, 15);
+  assert.equal(older("small"), undefined);
+  assert.equal(older("large").textContent, "展开其余 6 条对话");
+  assert.equal(older("large").getAttribute("aria-expanded"), "false");
+
+  older("large").onclick();
+  assert.equal(ids("large").length, 16);
+  assert.equal(older("large").getAttribute("aria-expanded"), "true");
+  assert.equal(ids("other").length, 10);
+  app.state.selected = "device-b";
+  app.renderThreads();
+  assert.equal(ids("large").length, 10);
+  app.state.selected = "device-a";
+  app.renderThreads();
+  assert.equal(ids("large").length, 16);
+  older("large").onclick();
+  assert.equal(ids("large").length, 10);
+
+  elements.get("search").value = "large chat 2";
+  app.renderThreads();
+  assert.deepEqual(ids("large"), ["large-2"]);
+  assert.equal(older("large"), undefined);
+  elements.get("search").value = "";
+  app.onEvent({ method: "turn/started", params: { threadId: "large-1", turn: { id: "turn" } } });
+  assert.equal(ids("large")[0], "large-1");
+  assert.equal(ids("large").length, 10);
+});
+
 test("running conversations show a spinner before the title and clear it on completion", () => {
   const { app, elements } = loadApp();
   app.state.current = { id: "thread", name: "运行任务", cwd: "/project" };
@@ -984,6 +1114,25 @@ test("running conversations show a spinner before the title and clear it on comp
   } });
   assert.equal(button().children.length, 1);
   assert.equal(button().children[0].className, "thread-name");
+});
+
+test("streaming lifecycle is announced once without flooding the message log", () => {
+  const { app, elements } = loadApp();
+  app.state.current = { id: "thread", name: "任务", cwd: "/project" };
+  app.onEvent({ method: "turn/started", params: {
+    threadId: "thread", turn: { id: "turn", status: "inProgress", items: [] },
+  } });
+  assert.match(elements.get("turn-status").textContent, /开始处理/);
+  app.onEvent({ method: "item/agentMessage/delta", params: { threadId: "thread", turnId: "turn", itemId: "reply", delta: "chunk" } });
+  assert.match(elements.get("turn-status").textContent, /开始处理/, "deltas must not re-announce");
+  app.onEvent({ method: "turn/completed", params: {
+    threadId: "thread", turn: { id: "turn", status: "completed", items: [] },
+  } });
+  assert.match(elements.get("turn-status").textContent, /已完成/);
+  app.onEvent({ method: "turn/completed", params: {
+    threadId: "thread", turn: { id: "turn2", status: "completed", error: { message: "boom" }, items: [] },
+  } });
+  assert.match(elements.get("turn-status").textContent, /失败：boom/);
 });
 
 test("conversation title edits inline and retains the dialog rename entry", async () => {
@@ -1289,6 +1438,107 @@ test("failed sends restore drafts and successful sends clear them", async () => 
   assert.equal(JSON.parse(storage.get("codexrm.drafts.v1"))["device:thread:thread-one"], undefined);
 });
 
+test("an uncertain send keeps the outbox record and never restores an ambiguous draft", async () => {
+  const storage = new Map();
+  const { app, context, elements } = loadApp(storage);
+  app.state.selected = "device";
+  app.state.devices = [{ token: "token", agent: { agentId: "device" } }];
+  app.state.online = true;
+  app.state.loaded = true;
+  app.state.current = { id: "thread-one", cwd: "/project" };
+  const prompt = elements.get("prompt");
+  prompt.value = "maybe delivered";
+  app.resizePrompt();
+
+  context.rpc = async () => {
+    const error = new Error("请求超时，请检查本地 Codex 是否正常运行");
+    error.uncertain = true;
+    throw error;
+  };
+  await app.submit();
+  assert.equal(JSON.parse(storage.get("codexrm.outbox.v1")).length, 1, "an unknown outcome must keep the pending record");
+  assert.equal(prompt.value, "", "ambiguous text must not be restored into the composer");
+  assert.equal(elements.get("connection-notice").hidden, false);
+  assert.match(elements.get("connection-notice-text").textContent, /发送状态未确认/);
+});
+
+test("outbox persists complete send context until explicit RPC success and preserves newer edits", async () => {
+  const storage = new Map();
+  const { app, context, elements } = runningApp(storage);
+  app.state.turns = [];
+  app.state.info.attachments = { maxSize: 20 * 1024 * 1024 };
+  const file = { ...readyAttachment(), file: new File(["secret"], "报告.txt") };
+  app.state.attachmentDrafts["device:thread:thread"] = [file];
+  elements.get("prompt").value = "message";
+  const turn = deferred();
+  context.rpc = () => turn.promise;
+  const sending = app.submit();
+  const stored = JSON.parse(storage.get("codexrm.outbox.v1"));
+  assert.equal(stored.length, 1);
+  assert.ok(stored[0].id);
+  assert.ok(stored[0].createdAt);
+  assert.equal(stored[0].agentId, "device");
+  assert.equal(stored[0].threadId, "thread");
+  assert.equal(stored[0].cwd, "/project");
+  assert.equal(stored[0].text, "message");
+  assert.equal(stored[0].files[0].path, file.path);
+  assert.equal(stored[0].files[0].file, undefined);
+  elements.get("prompt").value = "new edit";
+  app.resizePrompt();
+  turn.resolve({ turn: { id: "turn", status: "inProgress", items: [] } });
+  await sending;
+  assert.deepEqual(JSON.parse(storage.get("codexrm.outbox.v1")), []);
+  assert.equal(elements.get("prompt").value, "new edit");
+});
+
+test("an interrupted first turn reloads bound to its new thread without resending", async () => {
+  const storage = new Map();
+  const { app, context, elements } = newThreadApp(storage);
+  const started = deferred();
+  const turn = deferred();
+  context.rpc = (method) => method === "thread/start" ? started.promise : turn.promise;
+  elements.get("prompt").value = "possibly sent";
+  const sending = app.submit();
+  started.resolve({ thread: { id: "created", cwd: "/project", turns: [] } });
+  await flush();
+  const entry = JSON.parse(storage.get("codexrm.outbox.v1"))[0];
+  assert.equal(entry.threadId, "created");
+  assert.equal(entry.draftKey, "device:thread:created");
+
+  const reloaded = loadApp(storage);
+  Object.assign(reloaded.app.state, {
+    selected: "device", devices: [{ token: "token", agent: { agentId: "device" } }],
+    online: true, loaded: true, current: { id: "created", cwd: "/project" }, info: { cwd: "/project" },
+  });
+  reloaded.context.rpc = async () => { assert.fail("recovery must not resend automatically"); };
+  reloaded.app.renderPersistentNotice();
+  const notice = reloaded.elements.get("connection-notice");
+  assert.equal(notice.hidden, false);
+  assert.match(reloaded.elements.get("connection-notice-text").textContent, /发送状态未确认.*不会自动重发/);
+  const buttons = notice.querySelectorAll("button");
+  assert.deepEqual(buttons.map((button) => button.textContent), ["同步会话", "确认已发送", "保留为新草稿"]);
+  let synced;
+  reloaded.context.openThread = async (id) => { synced = id; };
+  await buttons[0].onclick();
+  assert.equal(synced, "created");
+  assert.equal(JSON.parse(storage.get("codexrm.outbox.v1")).length, 1, "sync alone does not assume failure");
+  reloaded.elements.get("prompt").value = "new edit";
+  buttons[2].onclick();
+  assert.equal(reloaded.elements.get("prompt").value, "possibly sent\n\nnew edit");
+  assert.deepEqual(JSON.parse(storage.get("codexrm.outbox.v1")), []);
+  void sending;
+});
+
+test("outbox entries persist only attachment metadata", () => {
+  const { app } = loadApp();
+  const entry = app.makeOutboxEntry({
+    id: "id", createdAt: "now", agentId: "agent", threadId: "thread", cwd: "/cwd",
+    draftKey: "agent:thread:thread", text: "text",
+    files: [{ id: "file", name: "a.txt", path: "/a", size: 1, mimeType: "text/plain", file: "bytes", uploading: true }],
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(entry.files)), [{ id: "file", name: "a.txt", path: "/a", size: 1, mimeType: "text/plain" }]);
+});
+
 test("turn completion clears only that thread's requests, including background threads", () => {
   const { app } = loadApp();
   app.state.current = { id: "foreground" };
@@ -1301,8 +1551,8 @@ test("turn completion clears only that thread's requests, including background t
   assert.equal(app.state.requests.size, 0);
 });
 
-function runningApp() {
-  const loaded = loadApp();
+function runningApp(storage) {
+  const loaded = loadApp(storage);
   Object.assign(loaded.app.state, {
     selected: "device", devices: [{ token: "token", agent: { agentId: "device" } }],
     online: true, loaded: true, info: { messageQueue: true },
@@ -1494,6 +1744,54 @@ test("attachment rendering restores merged history and escapes filenames", () =>
   assert.ok(html.includes("&lt;img"));
   assert.equal(html.includes('<img src=x onerror="alert(1)">'), false);
   assert.equal(html.includes("/agent/attachments/file-report.txt"), false);
+});
+
+test("history images reuse disk bytes and stay scoped to the pairing and message", async () => {
+  const stored = new Map();
+  const creates = () => {
+    const harness = newThreadApp();
+    const { app, context } = harness;
+    app.state.devices[0].clientId = "paired-client";
+    const disk = vm.runInContext("historyImageDisk", context);
+    disk.get = async (key) => stored.get(key);
+    disk.put = async (key, _scope, blob, file) => { stored.set(key, { blob, file }); };
+    return harness;
+  };
+  const before = creates();
+  let calls = 0;
+  before.context.rpc = async (method, params) => {
+    assert.equal(method, "codexrm/attachment/read");
+    calls++;
+    return { file: { id: params.id, mimeType: "image/png", size: 1 }, offset: 1, data: "YQ==" };
+  };
+  const results = await Promise.all([before.app.readAttachment("image"), before.app.readAttachment("image")]);
+  assert.equal(calls, 1);
+  assert.equal(results[0].url, results[1].url);
+  const after = creates();
+  after.context.rpc = async () => { throw new Error("cache miss"); };
+  assert.equal(await (await after.app.readAttachment("image")).blob.text(), "a");
+  after.app.state.devices[0].clientId = "different-pairing";
+  await assert.rejects(after.app.readAttachment("image"), /cache miss/);
+});
+
+test("local history previews resolve the path and keep separate message cache identities", async () => {
+  const { app, context } = newThreadApp();
+  const html = app.itemHTML({ id: "old", type: "agentMessage", text: "![图](file:///E:/a%20b.png)" });
+  assert.match(html, /data-history-image="E:\/a b\.png" data-image-item="old"/);
+  assert.doesNotMatch(app.itemHTML({ id: "old", type: "agentMessage", text: "![图](javascript:alert(1))" }), /<img/);
+  const readHistoryImage = vm.runInContext("readHistoryImage", context);
+  let calls = 0;
+  context.rpc = async (method, params) => {
+    assert.equal(method, "codexrm/image/read");
+    assert.equal(params.path, "E:/a b.png");
+    calls++;
+    return { file: { mimeType: "image/png", size: 1, version: "v1" }, offset: 1, data: "YQ==" };
+  };
+  await readHistoryImage("E:/a b.png", "old", "/project");
+  await readHistoryImage("E:/a b.png", "old", "/project");
+  assert.equal(calls, 1);
+  await readHistoryImage("E:/a b.png", "new", "/project");
+  assert.equal(calls, 2);
 });
 
 test("attachment drafts survive reload without storing file bytes", async () => {
@@ -1794,6 +2092,33 @@ test("detached snapshots enter read-only on active and loaded restores normal cl
   assert.equal(snapshots, 3);
 });
 
+test("shrinking snapshots retain previous pages and disjoint snapshots reset the cursor", async () => {
+  const { app, context, advance } = loadApp();
+  const turn = (id) => ({ id, items: [] });
+  Object.assign(app.state, {
+    online: true, loaded: true, info: { threadSnapshots: true },
+    current: { id: "thread" }, turns: [turn("one"), turn("two"), turn("three")],
+    historyCursor: "before-one",
+  });
+  const replies = [
+    { thread: { id: "thread", turns: [turn("three"), turn("four")] }, nextCursor: "before-three" },
+    { thread: { id: "thread", turns: [turn("eight")] }, nextCursor: "before-eight" },
+  ];
+  context.rpc = async (method) => {
+    assert.equal(method, "codexrm/thread/snapshot");
+    return replies.shift();
+  };
+  app.onEvent({ method: "codexrm/thread/detached", params: { threadId: "thread" } });
+  advance(3000);
+  await flush();
+  assert.deepEqual(Array.from(app.state.turns, (item) => item.id), ["one", "two", "three", "four"]);
+  assert.equal(app.state.historyCursor, "before-one");
+  advance(3000);
+  await flush();
+  assert.deepEqual(Array.from(app.state.turns, (item) => item.id), ["eight"]);
+  assert.equal(app.state.historyCursor, "before-eight");
+});
+
 test("open, new chat, device switch and reset clear detached polling", async () => {
   for (const action of ["open", "new", "device", "reset"]) {
     const { app, context, advance } = loadApp();
@@ -1843,6 +2168,7 @@ test("loading dragover and drop both reject files with a visible reason", async 
 function loadAgenthost() {
   class Element {
     constructor() { this.children = []; this.dataset = {}; this.value = ""; this.hidden = false; }
+    get childElementCount() { return this.children.length; }
     append(...nodes) { this.children.push(...nodes); }
     replaceChildren(...nodes) { this.children = nodes; }
     addEventListener(type, listener) { (this.listeners ||= new Map()).set(type, listener); }
@@ -1859,6 +2185,7 @@ function loadAgenthost() {
   const settings = { server: "https://server.example", status: "已连接", version: "1.2.3", packaged: false };
   const context = vm.createContext({
     document, location: { hash: "#token" }, console, URL, Date, JSON, Error, Promise,
+    Option: class Option { constructor(text, value) { this.text = text; this.value = value; } },
     navigator: { clipboard: { writeText: async () => {} } }, confirm: () => true,
     setInterval(callback) { interval = callback; },
     fetch: async (path) => {
@@ -1867,6 +2194,7 @@ function loadAgenthost() {
         if (settingsCalls === 1) throw new Error("temporarily unavailable");
         return { ok: true, text: async () => JSON.stringify(settings) };
       }
+      if (path === "/api/wx/accounts") return { ok: true, text: async () => "[]" };
       if (path === "/api/devices") {
         deviceCalls++;
         return { ok: true, text: async () => JSON.stringify([{ clientId: "browser", clientName: "Browser", deviceType: "desktop" }]) };
@@ -1874,6 +2202,7 @@ function loadAgenthost() {
       throw new Error(`unexpected ${path}`);
     },
   });
+  document.getElementById("login-form").hidden = true;
   for (const id of ["server", "version", "status", "devices"]) document.getElementById(id);
   vm.runInContext(readFileSync(new URL("../internal/agenthost/web/app.js", import.meta.url), "utf8"), context);
   return { context, elements, settings, poll: () => interval(), counts: () => ({ settingsCalls, deviceCalls }) };

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,11 +17,11 @@ import (
 	"github.com/gorilla/websocket"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -29,6 +31,57 @@ import (
 type UpdateResult struct {
 	UpdateAvailable bool `json:"updateAvailable"`
 	UpdatePending   bool `json:"updatePending"`
+}
+
+type ConnectionState string
+
+const (
+	Connecting ConnectionState = "connecting"
+	Connected  ConnectionState = "connected"
+	Retrying   ConnectionState = "retrying"
+	Degraded   ConnectionState = "degraded"
+)
+
+type ConnectionSnapshot struct {
+	State           ConnectionState `json:"state"`
+	Error           string          `json:"error,omitempty"`
+	LastConnectedAt *time.Time      `json:"lastConnectedAt,omitempty"`
+	NextRetryAt     *time.Time      `json:"nextRetryAt,omitempty"`
+}
+
+type httpStatusError struct{ status int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("HTTP %d", e.status) }
+
+func connectionAdvice(err error) string {
+	var status *httpStatusError
+	if errors.As(err, &status) {
+		switch {
+		case status.status == http.StatusUnauthorized || status.status == http.StatusForbidden:
+			return "服务器拒绝了授权；请重新获取连接授权密钥，或重新配对设备"
+		case status.status >= 500:
+			return "远程服务器暂时不可用；请稍后重试，或联系服务器管理员检查服务状态"
+		}
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "无法解析服务器域名；请检查服务器地址、DNS 设置和网络连接"
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	var certificateInvalid x509.CertificateInvalidError
+	var hostname x509.HostnameError
+	var recordHeader tls.RecordHeaderError
+	if errors.As(err, &unknownAuthority) || errors.As(err, &certificateInvalid) || errors.As(err, &hostname) || errors.As(err, &recordHeader) {
+		return "服务器 TLS 证书校验失败；请检查证书链、域名和系统时间，不要在公共终端跳过证书校验"
+	}
+	var network net.Error
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) || (errors.As(err, &network) && network.Timeout()) {
+		return "连接服务器超时；请检查网络、防火墙和代理设置，稍后重试"
+	}
+	if err != nil && (strings.Contains(strings.ToLower(err.Error()), "tls") || strings.Contains(strings.ToLower(err.Error()), "x509")) {
+		return "服务器 TLS 握手失败；请检查 HTTPS 配置、证书和系统时间"
+	}
+	return "无法连接远程服务器；请检查服务器地址、网络和服务状态，稍后重试"
 }
 
 type Config struct {
@@ -77,6 +130,14 @@ type Agent struct {
 	updating     bool
 	attachmentMu sync.Mutex
 	uploads      map[string]*attachmentUpload
+	textMu       sync.Mutex
+	textApp      *appserver.Client
+	textVerified bool
+	wxMu         sync.Mutex
+	wxPolicy     map[string]wxPolicy
+	wxThreads    map[string]wxThread
+	connectionMu sync.RWMutex
+	connection   ConnectionSnapshot
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -112,7 +173,7 @@ func New(cfg Config) (*Agent, error) {
 	if e = os.MkdirAll(cfg.DataDir, 0700); e != nil {
 		return nil, e
 	}
-	a := &Agent{cfg: cfg, owners: map[string]string{}, approvals: map[string]approval{}}
+	a := &Agent{cfg: cfg, owners: map[string]string{}, approvals: map[string]approval{}, connection: ConnectionSnapshot{State: Connecting}}
 	data, e := os.ReadFile(filepath.Join(cfg.DataDir, "agent.json"))
 	if e == nil {
 		if e = json.Unmarshal(data, &a.creds); e != nil {
@@ -140,6 +201,35 @@ func (a *Agent) Connected() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.relay != nil
+}
+
+func (a *Agent) ConnectionSnapshot() ConnectionSnapshot {
+	a.connectionMu.RLock()
+	defer a.connectionMu.RUnlock()
+	snapshot := a.connection
+	if snapshot.State == "" {
+		snapshot.State = Connecting
+	}
+	return snapshot
+}
+
+func (a *Agent) setConnection(state ConnectionState, err error, retryAt time.Time) {
+	a.connectionMu.Lock()
+	defer a.connectionMu.Unlock()
+	a.connection.State = state
+	a.connection.Error = ""
+	if err != nil {
+		a.connection.Error = connectionAdvice(err)
+	}
+	a.connection.NextRetryAt = nil
+	if !retryAt.IsZero() {
+		retryAt = retryAt.UTC()
+		a.connection.NextRetryAt = &retryAt
+	}
+	if state == Connected {
+		now := time.Now().UTC()
+		a.connection.LastConnectedAt = &now
+	}
 }
 
 func (a *Agent) credentials() (creds, bool) {
@@ -192,7 +282,7 @@ func (a *Agent) requestMethod(ctx context.Context, method, path string, input, o
 		return e
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("%s: HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(data)))
+		return &httpStatusError{status: resp.StatusCode}
 	}
 	if output == nil {
 		return nil
@@ -255,6 +345,7 @@ func (a *Agent) RemoveDevice(ctx context.Context, clientID string) error {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
+	a.setConnection(Connecting, nil, time.Time{})
 	for {
 		e := a.ensureEnrolled(ctx)
 		if e == nil {
@@ -264,6 +355,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			return e
 		}
 		log.Printf("save renewed agent credentials: %v; retrying", e)
+		a.setConnection(Retrying, e, time.Now().Add(3*time.Second))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -298,13 +390,17 @@ func (a *Agent) Run(ctx context.Context) error {
 			app, e = appserver.Launch(ctx, a.cfg.CodexPath, a.cfg.Cwd)
 		}
 		if e != nil {
+			a.setConnection(Degraded, errors.New("Codex app-server unavailable"), time.Time{})
 			return e
 		}
 		initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		_, e = app.Initialize(initCtx, "codexrm-agent", protocol.Version)
 		cancel()
 		if e != nil {
+			a.closeTextApp()
+			a.closeTextApp()
 			_ = app.Close()
+			a.setConnection(Degraded, errors.New("Codex initialization failed"), time.Time{})
 			return fmt.Errorf("initialize Codex: %w", e)
 		}
 		log.Printf("Codex ready; workspace: %s; mock=%v", a.cfg.Cwd, a.cfg.Mock)
@@ -333,6 +429,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		for appCtx.Err() == nil {
 			if e = a.ensureEnrolled(appCtx); e != nil {
 				log.Printf("renew agent registration: %v", e)
+				a.setConnection(Retrying, e, time.Now().Add(3*time.Second))
 				select {
 				case <-appCtx.Done():
 				case <-time.After(3 * time.Second):
@@ -344,6 +441,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				break
 			}
 			log.Printf("relay disconnected: %v; retry in 3s", e)
+			a.setConnection(Retrying, e, time.Now().Add(3*time.Second))
 			select {
 			case <-appCtx.Done():
 			case <-time.After(3 * time.Second):
@@ -353,6 +451,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		_ = app.Close()
 		if ctx.Err() == nil {
 			log.Printf("Codex exited; restarting in 3s")
+			a.setConnection(Degraded, errors.New("Codex app-server exited"), time.Now().Add(3*time.Second))
 			select {
 			case <-ctx.Done():
 			case <-time.After(3 * time.Second):
@@ -371,29 +470,7 @@ func (a *Agent) write(conn *websocket.Conn, env protocol.Envelope) error {
 	return conn.WriteJSON(env)
 }
 
-// The provider gateway reports upstream 429 rate limits as a generic
-// "503 Service temporarily unavailable", which Codex surfaces as an
-// unexpected-status error. Rewrite it to the standard retry-limit hint so
-// clients see the quota exhaustion instead of a service outage.
-var maskedRateLimitPattern = regexp.MustCompile(`unexpected status 503 Service Unavailable: Service temporarily unavailable[^"\\]*`)
-var maskedRateLimitRequestID = regexp.MustCompile(`, request id: ([^"\\,]+)`)
-
-func rewriteMaskedRateLimit(raw json.RawMessage) json.RawMessage {
-	if !bytes.Contains(raw, []byte("unexpected status 503 Service Unavailable: Service temporarily unavailable")) {
-		return raw
-	}
-	return maskedRateLimitPattern.ReplaceAllFunc(raw, func(match []byte) []byte {
-		hint := []byte("exceeded retry limit, last status: 429 Too Many Requests")
-		if id := maskedRateLimitRequestID.FindSubmatch(match); id != nil {
-			hint = append(hint, ", request id: "...)
-			hint = append(hint, id[1]...)
-		}
-		return hint
-	})
-}
-
 func (a *Agent) forward(raw json.RawMessage) {
-	raw = rewriteMaskedRateLimit(raw)
 	var m map[string]json.RawMessage
 	if json.Unmarshal(raw, &m) != nil {
 		return
@@ -445,6 +522,9 @@ func (a *Agent) forward(raw json.RawMessage) {
 	}
 	a.mu.Unlock()
 	a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: owner, Message: raw})
+	if extra := a.robotNotificationClient(owner, meta.ThreadID); extra != "" {
+		a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: extra, Message: raw})
+	}
 }
 func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	u, _ := url.Parse(a.cfg.ServerURL + "/api/v1/agent/ws")
@@ -454,11 +534,14 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 		u.Scheme = "ws"
 	}
 	credentials, _ := a.credentials()
-	conn, _, e := (&websocket.Dialer{HandshakeTimeout: 10 * time.Second}).DialContext(ctx, u.String(), http.Header{
+	conn, response, e := (&websocket.Dialer{HandshakeTimeout: 10 * time.Second}).DialContext(ctx, u.String(), http.Header{
 		"Authorization":           []string{"Bearer " + credentials.Token},
 		protocol.AppVersionHeader: []string{release.VersionName},
 	})
 	if e != nil {
+		if response != nil {
+			return &httpStatusError{status: response.StatusCode}
+		}
 		return e
 	}
 	defer conn.Close()
@@ -469,6 +552,7 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	a.relay = conn
 	a.mu.Unlock()
 	a.eventMu.Unlock()
+	a.setConnection(Connected, nil, time.Time{})
 	defer func() {
 		a.mu.Lock()
 		if a.relay == conn {
@@ -482,6 +566,8 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	log.Printf("relay connected as %s (%s)", credentials.AgentID, a.cfg.Name)
 	hello := protocol.P2P("hello", "")
 	hello.LAN = true
+	hello.DualNATPunch = true
+	hello.IPv6 = true
 	if e = a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, P2P: hello}); e != nil {
 		return e
 	}
@@ -558,6 +644,9 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		return
 	}
 	if req.Method == "" {
+		if env.ClientKind == protocol.ClientKindRobot {
+			return
+		}
 		if len(req.Result) == 0 && len(req.Error) == 0 {
 			return
 		}
@@ -635,6 +724,10 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 	if params == nil {
 		params = map[string]any{}
 	}
+	if env.ClientKind == protocol.ClientKindRobot {
+		a.handleRobot(ctx, app, send, env, req.Method, params)
+		return
+	}
 	if strings.HasPrefix(req.Method, protocol.DirectFilePrefix) {
 		if len(req.ID) != 0 {
 			result, err := a.directFileRPC(ctx, app, direct, req.Method, params)
@@ -701,6 +794,10 @@ func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.Ra
 	if len(req.ID) == 0 {
 		return
 	}
+	tooLarge := &appserver.RPCError{Code: -32000, Message: "响应内容过大，无法通过当前连接传输。"}
+	if err == nil && len(result) > maxRPCPayloadBytes {
+		err = tooLarge
+	}
 	resp := map[string]any{"id": req.ID}
 	if err != nil {
 		rpc := &appserver.RPCError{Code: -32000, Message: err.Error()}
@@ -713,8 +810,12 @@ func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.Ra
 		if len(result) == 0 {
 			result = json.RawMessage("null")
 		}
-		resp["result"] = rewriteMaskedRateLimit(result)
+		resp["result"] = result
 	}
-	_ = send.write(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, StreamID: env.StreamID, Message: mustJSON(resp)})
+	message := mustJSON(resp)
+	if len(message) > maxRPCPayloadBytes {
+		message = mustJSON(map[string]any{"id": req.ID, "error": tooLarge})
+	}
+	_ = send.write(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, StreamID: env.StreamID, Message: message})
 }
 func mustJSON(v any) json.RawMessage { b, _ := json.Marshal(v); return b }

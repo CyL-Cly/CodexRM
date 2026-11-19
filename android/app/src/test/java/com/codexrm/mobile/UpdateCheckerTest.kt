@@ -26,6 +26,21 @@ class UpdateCheckerTest {
         assertEquals(123456L, info.fileSize)
     }
 
+    @Test fun historyShowsOnlyAndroidVersionsAndKeepsMultilineNotes() {
+        val releases = UpdateChecker.parseHistory("""
+            {
+              "schemaVersion": 1,
+              "releases": [
+                {"platform":"android","versionName":"1.0.25","releaseNotes":"修复断线\n支持分页"},
+                {"platform":"linux","versionName":"0.6.19","releaseNotes":"Agent"},
+                {"platform":"android","versionName":"1.0.24","releaseNotes":"改善缓存"}
+              ]
+            }
+        """.trimIndent())
+        assertEquals(listOf("1.0.25", "1.0.24"), releases.map { it.versionName })
+        assertEquals("修复断线\n支持分页", releases.first().notes)
+    }
+
     @Test fun retainsCloudreveQueryString() {
         val manifest = validManifest.replace(
             "updates/CodexRM.apk",

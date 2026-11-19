@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -43,9 +44,15 @@ func signalUntil(t *testing.T, c *websocket.Conn, kind string) protocol.Envelope
 func TestDirectBusinessAndFallback(t *testing.T) {
 	t.Run("legacy", func(t *testing.T) {
 		_, h := directTestRM(t)
-		testDirectBusinessAndFallback(t, h)
+		testDirectBusinessAndFallback(t, h, false, false, false)
 	})
-	t.Run("independently verified UDP", func(t *testing.T) {
+	t.Run("both unpredictable with capability", func(t *testing.T) {
+		testDirectBusinessAndFallback(t, dualUnpredictableTestRM(t), true, false, false)
+	})
+	t.Run("IPv6 UDP", func(t *testing.T) {
+		testDirectBusinessAndFallback(t, ipv6TestRM(t), false, true, true)
+	})
+	t.Run("IPv4 UDP verified independently of IPv6 WebSocket", func(t *testing.T) {
 		s, err := server.New(server.Config{DataDir: t.TempDir(), AdminToken: "test-key", P2PSTUN: "127.0.0.1:9",
 			P2PTrustProxy: true, P2PLocalTest: true, P2PVerifyListen: "127.0.0.1:0", P2PVerifyPublic: "127.0.0.1:0"})
 		if err != nil {
@@ -56,18 +63,65 @@ func TestDirectBusinessAndFallback(t *testing.T) {
 			// Simulate the TLS reverse proxy seeing different IPs from the UDP listener.
 			ip := "192.0.2.10"
 			if r.URL.Path == "/api/v1/client/ws" {
-				ip = "192.0.2.20"
+				ip = "2001:db8::20"
 			}
 			r.Header.Set("X-Real-IP", ip)
 			r.Header.Set("X-Forwarded-Proto", "https")
 			handler.ServeHTTP(w, r)
 		}))
 		t.Cleanup(func() { s.Close(); h.Close() })
-		testDirectBusinessAndFallback(t, h)
+		testDirectBusinessAndFallback(t, h, false, true, false)
 	})
 }
 
-func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server) {
+func ipv6TestRM(t *testing.T) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 TCP loopback: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	stun, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skipf("no IPv6 UDP loopback: %v", err)
+	}
+	t.Cleanup(func() { _ = stun.Close() })
+	go func() {
+		var req [64]byte
+		for {
+			n, from, err := stun.ReadFromUDPAddrPort(req[:])
+			if err != nil {
+				return
+			}
+			if n != 20 {
+				continue
+			}
+			var reply [44]byte
+			copy(reply[:], req[:n])
+			binary.BigEndian.PutUint16(reply[:2], 0x0101)
+			binary.BigEndian.PutUint16(reply[2:4], 24)
+			binary.BigEndian.PutUint16(reply[20:22], 0x0020)
+			binary.BigEndian.PutUint16(reply[22:24], 20)
+			reply[25] = 2
+			binary.BigEndian.PutUint16(reply[26:28], from.Port()^0x2112)
+			for i, b := range from.Addr().As16() {
+				reply[28+i] = b ^ req[4+i]
+			}
+			_, _ = stun.WriteToUDPAddrPort(reply[:], from)
+		}
+	}()
+	s, err := server.New(server.Config{DataDir: t.TempDir(), AdminToken: "test-key", P2PSTUN: stun.LocalAddr().String(), P2PLocalTest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Construct directly so the unused default loopback listener isn't opened.
+	h := &httptest.Server{Listener: listener, Config: &http.Server{Handler: s.Handler()}}
+	h.Start()
+	t.Cleanup(func() { s.Close(); h.Close() })
+	return h
+}
+
+func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server, dualNAT, ipv6, wantIPv6 bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
@@ -98,8 +152,16 @@ func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server) {
 	if response(t, c, 1)["mock"] != true {
 		t.Fatal("WSS fallback not available during negotiation")
 	}
-	readSignal(protocol.P2P("begin", ""))
+	begin := protocol.P2P("begin", "")
+	begin.DualNATPunch, begin.IPv6 = dualNAT, ipv6
+	readSignal(begin)
 	start := signalUntil(t, c, "start").P2P
+	if start.DualNATPunch != dualNAT {
+		t.Fatalf("negotiated dual NAT punch = %t, want %t", start.DualNATPunch, dualNAT)
+	}
+	if start.IPv6 != ipv6 {
+		t.Fatalf("negotiated IPv6 = %t, want %t", start.IPv6, ipv6)
+	}
 	s, offer, err := p2p.Prepare(ctx, false, *start)
 	if err != nil {
 		t.Fatal(err)
@@ -107,6 +169,9 @@ func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server) {
 	defer s.Close()
 	readSignal(offer)
 	remote := signalUntil(t, c, "offer").P2P
+	if dualNAT && (offer.Mapping != protocol.P2PMappingVaries || remote.Mapping != protocol.P2PMappingVaries) {
+		t.Fatalf("expected both mappings to be unpredictable, got %q and %q", offer.Mapping, remote.Mapping)
+	}
 	ready := make(chan struct{})
 	go func() {
 		for {
@@ -127,6 +192,9 @@ func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server) {
 		t.Fatal(err)
 	}
 	defer link.Close()
+	if link.IsIPv6() != wantIPv6 {
+		t.Fatalf("IPv6 link = %t, want %t", link.IsIPv6(), wantIPv6)
+	}
 	readSignal(protocol.P2P("activate", start.ID))
 	signalUntil(t, c, "active")
 	direct := func(id int, method string, p any) map[string]any {
@@ -189,6 +257,108 @@ func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server) {
 	}
 }
 
+func dualUnpredictableTestRM(t *testing.T) *httptest.Server {
+	t.Helper()
+	// One STUN destination reports the usable loopback socket, the other a
+	// distant mapped port. Both clients classify their mapping as unpredictable.
+	var endpoints []string
+	for _, alternate := range []bool{true, false} {
+		stun, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = stun.Close() })
+		endpoints = append(endpoints, stun.LocalAddr().String())
+		go func() {
+			var buf [64]byte
+			for {
+				n, from, err := stun.ReadFromUDP(buf[:])
+				if err != nil {
+					return
+				}
+				if n < 20 {
+					continue
+				}
+				var reply [32]byte
+				copy(reply[:], buf[:20])
+				binary.BigEndian.PutUint16(reply[:2], 0x0101) // Binding success
+				binary.BigEndian.PutUint16(reply[2:4], 12)
+				binary.BigEndian.PutUint16(reply[20:22], 0x0020) // XOR-MAPPED-ADDRESS
+				binary.BigEndian.PutUint16(reply[22:24], 8)
+				reply[25] = 1
+				port := uint16(from.Port)
+				if alternate {
+					port = 1024 + uint16((uint32(port)+28000)%(65536-1024))
+				}
+				binary.BigEndian.PutUint16(reply[26:28], port^0x2112)
+				binary.BigEndian.PutUint32(reply[28:32], 0x7f000001^0x2112a442)
+				_, _ = stun.WriteToUDP(reply[:], from)
+			}
+		}()
+	}
+	s, err := server.New(server.Config{DataDir: t.TempDir(), AdminToken: "test-key", P2PSTUN: strings.Join(endpoints, ","), P2PLocalTest: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := httptest.NewServer(s.Handler())
+	t.Cleanup(func() { s.Close(); h.Close() })
+	return h
+}
+
+func TestDirectDualUnpredictableMappingsFallBackToRelay(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) { testDualNATFallback(t, false) })
+	t.Run("negotiated timeout", func(t *testing.T) { testDualNATFallback(t, true) })
+}
+
+func testDualNATFallback(t *testing.T, dualNAT bool) {
+	t.Helper()
+	h := dualUnpredictableTestRM(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	a, err := agent.New(agent.Config{ServerURL: h.URL, DataDir: t.TempDir(), Cwd: t.TempDir(), Mock: true, EnrollmentKey: "test-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := a.Pair(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	var client protocol.PairClaimResponse
+	post(t, h, "/api/v1/client/claim", "", "", protocol.PairClaimRequest{Code: pair.ManualPairingCode}, &client)
+	c := ws(t, h, "client", client.Token)
+	signalUntil(t, c, "available")
+	begin := protocol.P2P("begin", "")
+	begin.DualNATPunch = dualNAT
+	write(t, c, protocol.Envelope{Type: protocol.TypeP2P, P2P: begin})
+	start := signalUntil(t, c, "start").P2P
+	if start.DualNATPunch != dualNAT {
+		t.Fatalf("negotiated dual NAT punch = %t, want %t", start.DualNATPunch, dualNAT)
+	}
+	if fromAgent := signalUntil(t, c, "offer").P2P; fromAgent.Mapping != protocol.P2PMappingVaries {
+		t.Fatalf("unexpected Agent mapping classification: %q", fromAgent.Mapping)
+	}
+	blackhole, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blackhole.Close()
+	offer := protocol.P2P("offer", start.ID)
+	offer.Pin = strings.Repeat("ab", 32)
+	offer.Candidates = []string{blackhole.LocalAddr().String()}
+	offer.Mapping = protocol.P2PMappingVaries
+	write(t, c, protocol.Envelope{Type: protocol.TypeP2P, P2P: offer})
+	if stop := signalUntil(t, c, "stop").P2P; stop.ID != start.ID || stop.Reason != protocol.P2PReasonDualUnpredictableNAT {
+		t.Fatalf("unexpected stop: %+v", stop)
+	}
+	rpc(t, c, 1, "codexrm/info", nil)
+	if response(t, c, 1)["mock"] != true {
+		t.Fatal("RM no longer relays requests")
+	}
+}
+
 func TestDirectSignalingRejectsUnrelatedCandidatesAndRevokes(t *testing.T) {
 	_, h := directTestRM(t)
 	var a protocol.EnrollResponse
@@ -200,8 +370,13 @@ func TestDirectSignalingRejectsUnrelatedCandidatesAndRevokes(t *testing.T) {
 	ag, c := ws(t, h, "agent", a.Token), ws(t, h, "client", client.Token)
 	write(t, ag, protocol.Envelope{Type: protocol.TypeP2P, P2P: protocol.P2P("hello", "")})
 	signalUntil(t, c, "available")
-	write(t, c, protocol.Envelope{Type: protocol.TypeP2P, P2P: protocol.P2P("begin", ""), ClientID: "other"})
+	begin := protocol.P2P("begin", "")
+	begin.DualNATPunch = true
+	write(t, c, protocol.Envelope{Type: protocol.TypeP2P, P2P: begin, ClientID: "other"})
 	start := signalUntil(t, ag, "start")
+	if start.P2P.DualNATPunch || signalUntil(t, c, "start").P2P.DualNATPunch {
+		t.Fatal("client capability alone must not enable dual NAT punching")
+	}
 	if start.ClientID != client.ClientID {
 		t.Fatal("RM trusted a supplied client ID")
 	}

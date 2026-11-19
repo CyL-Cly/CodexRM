@@ -121,7 +121,7 @@ func TestOnlineInstallFromManifest(t *testing.T) {
 	if err := json.Unmarshal(configData, &config); err != nil {
 		t.Fatal(err)
 	}
-	if config.Server != "" || config.Workspace != workspace ||
+	if config.Server != clientconfig.DefaultRelayServer || config.EnrollmentKey != nil || config.Workspace != workspace ||
 		config.UpdateManifest != "" || config.UpdateServer != clientconfig.DefaultUpdateServer || !config.AutoUpdate {
 		t.Fatalf("unexpected installed configuration: %+v", config)
 	}

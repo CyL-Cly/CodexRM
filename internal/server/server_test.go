@@ -369,7 +369,6 @@ func TestAgentMockConcurrentRPCApprovalAndInterrupt(t *testing.T) {
 	tid := thread["id"]
 	rpc(t, c, 2, "turn/start", map[string]any{"threadId": tid, "input": []any{map[string]any{"type": "text", "text": "审批"}}})
 	var approvalID any
-	var turnID any
 	gotResponse := false
 	for approvalID == nil || !gotResponse {
 		env := read(t, c)
@@ -380,7 +379,6 @@ func TestAgentMockConcurrentRPCApprovalAndInterrupt(t *testing.T) {
 				t.Fatal(m)
 			}
 			gotResponse = true
-			turnID = m["result"].(map[string]any)["turn"].(map[string]any)["id"]
 		}
 		if m["method"] == "item/commandExecution/requestApproval" {
 			approvalID = m["id"]
@@ -406,7 +404,7 @@ func TestAgentMockConcurrentRPCApprovalAndInterrupt(t *testing.T) {
 		t.Fatalf("history missing: %v", history)
 	}
 	rpc(t, c, 5, "turn/start", map[string]any{"threadId": tid, "input": []any{map[string]any{"type": "text", "text": "long reply"}}})
-	turnID = response(t, c, 5)["turn"].(map[string]any)["id"]
+	turnID := response(t, c, 5)["turn"].(map[string]any)["id"]
 	rpc(t, c, 6, "turn/interrupt", map[string]any{"threadId": tid, "turnId": turnID})
 	env := until(t, c, func(e protocol.Envelope) bool {
 		var m map[string]any

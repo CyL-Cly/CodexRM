@@ -23,7 +23,8 @@ func main() {
 	webDir := flag.String("web", "web", "static UI directory served from disk")
 	updateDir := flag.String("updates", "", "client release directory (default: <data>/updates)")
 	enrollKey := flag.String("enroll-key", os.Getenv("CODEXRM_ENROLL_KEY"), "key required to register remote agents")
-	stun := flag.String("p2p-stun", os.Getenv("CODEXRM_P2P_STUN"), "comma-separated IPv4:port STUN endpoints; empty disables public P2P")
+	publicEnrollment := flag.Bool("public-enrollment", false, "allow agent registration without a shared key")
+	stun := flag.String("p2p-stun", os.Getenv("CODEXRM_P2P_STUN"), "comma-separated IPv4:port or [IPv6]:port STUN endpoints; empty disables public P2P")
 	lan := flag.Bool("p2p-lan", true, "allow paired peers to try on-link IPv4 direct connections")
 	verifyListen := flag.String("p2p-verify-listen", os.Getenv("CODEXRM_P2P_VERIFY_LISTEN"), "local IPv4:UDP port for candidate verification")
 	verifyPublic := flag.String("p2p-verify-public", os.Getenv("CODEXRM_P2P_VERIFY_PUBLIC"), "public IPv4:UDP port for candidate verification")
@@ -58,6 +59,7 @@ func main() {
 		DataDir:          *dataDir,
 		WebDir:           absWeb,
 		AdminToken:       *enrollKey,
+		PublicEnrollment: *publicEnrollment,
 		UpdateDir:        *updateDir,
 		P2PSTUN:          *stun,
 		P2PLAN:           *lan,

@@ -120,4 +120,28 @@ func TestThreadHandoffWithLocalCodex(t *testing.T) {
 	if len(page["data"].([]any)) != 4 {
 		t.Fatalf("handoff lost or replayed history: %v", page)
 	}
+	metadata := queueCall(t, app, "thread/turns/list", map[string]any{"threadId": threadID, "limit": 1, "itemsView": "notLoaded"})
+	metadataTurns, _ := metadata["data"].([]any)
+	if len(metadataTurns) != 1 || metadata["nextCursor"] == nil {
+		t.Fatalf("metadata-only page cannot advance: %v", metadata)
+	}
+	items, _ := metadataTurns[0].(map[string]any)["items"].([]any)
+	if len(items) != 0 {
+		t.Fatal("metadata-only page contains full items")
+	}
+	reopened := lifecycleCall(t, a, app, "thread/resume", map[string]any{"threadId": threadID})
+	thread := reopened["thread"].(map[string]any)
+	if thread["historyMode"] != "paginated" && len(thread["turns"].([]any)) != 4 {
+		t.Fatalf("resume lost history from a legacy thread: %v", thread["turns"])
+	}
+	rawSnapshot, err := a.threadSnapshot(ctx, app, map[string]any{"threadId": threadID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot struct {
+		Thread struct{ Turns []json.RawMessage }
+	}
+	if err := json.Unmarshal(rawSnapshot, &snapshot); err != nil || len(snapshot.Thread.Turns) != 4 {
+		t.Fatalf("snapshot lost history: turns=%d, error=%v", len(snapshot.Thread.Turns), err)
+	}
 }

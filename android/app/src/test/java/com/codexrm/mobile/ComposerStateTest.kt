@@ -1,8 +1,11 @@
 package com.codexrm.mobile
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -36,5 +39,23 @@ class ComposerStateTest {
         assertEquals("original", ComposerText.afterFailedSend("", "original"))
         assertEquals("original\n\nnew input", ComposerText.afterFailedSend("new input", "original"))
         assertEquals("new input", ComposerText.afterFailedSend("new input", ""))
+    }
+
+    @Test fun queuedDraftPreservesExistingTextAndUploadedAttachments() {
+        val photo = JSONObject().put("id", "uploaded-image").put("name", "photo.png")
+            .put("mimeType", "image/png").put("path", "/uploads/photo.png").put("size", 128)
+        val file = JSONObject().put("id", "uploaded-file").put("name", "notes.txt")
+            .put("mimeType", "text/plain").put("path", "/uploads/notes.txt").put("size", 64)
+        val input = AttachmentStore.input("first line\nsecond line", listOf(photo, file))
+        val draft = checkNotNull(QueuedComposerDraft.fromInput(input))
+
+        assertEquals("existing draft\n\nfirst line\nsecond line", draft.appendTo("existing draft"))
+        assertEquals(listOf("uploaded-image", "uploaded-file"), draft.files.map { it.string("id") })
+        assertEquals(input.toString(), AttachmentStore.input(draft.text, draft.files).toString())
+    }
+
+    @Test fun queueEditDoesNotDropImagesTheComposerCannotRestore() {
+        val input = JSONArray().put(JSONObject().put("type", "localImage").put("path", "/missing-metadata.png"))
+        assertNull(QueuedComposerDraft.fromInput(input))
     }
 }

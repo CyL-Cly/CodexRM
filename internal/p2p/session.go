@@ -22,18 +22,21 @@ import (
 )
 
 var (
-	ErrNoPeerCandidate = errors.New("no verified peer candidate")
-	ErrUDPPunch        = errors.New("UDP punch")
+	ErrNoPeerCandidate      = errors.New("no verified peer candidate")
+	ErrUDPPunch             = errors.New("UDP punch")
+	ErrDualUnpredictableNAT = errors.New("both peers have unpredictable UDP mappings and no working direct path")
 )
 
 type Session struct {
-	agent   bool
-	id      string
-	key     []byte
-	cert    tls.Certificate
-	sockets []*net.UDPConn
-	lan     []netip.Prefix
-	mapping string
+	agent        bool
+	id           string
+	key          []byte
+	cert         tls.Certificate
+	sockets      []*net.UDPConn
+	lan          []netip.Prefix
+	mapping      string
+	dualNATPunch bool
+	ipv6         bool
 }
 
 func Prepare(ctx context.Context, agent bool, start protocol.P2PSignal) (*Session, *protocol.P2PSignal, error) {
@@ -59,6 +62,7 @@ func PrepareWithLocalPrefixes(ctx context.Context, agent bool, start protocol.P2
 		return nil, nil, err
 	}
 	s := &Session{agent: agent, id: start.ID, key: key, cert: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}}
+	s.dualNATPunch, s.ipv6 = start.DualNATPunch, start.IPv6
 	if start.LAN {
 		for _, p := range local {
 			if IsLANIPv4(p.Addr()) && p.Bits() > 0 && p.Bits() < 32 {
@@ -124,11 +128,21 @@ func PrepareWithLocalPrefixes(ctx context.Context, agent bool, start protocol.P2
 		offer.Local = append(offer.Local, netip.AddrPortFrom(p.Addr(), port).String())
 	}
 	if addrs, e := net.InterfaceAddrs(); e == nil && (!start.LAN || len(start.STUN) > 0) {
+		// List IPv6 host addresses ahead of IPv4 host addresses.
+		var ipv4 []netip.Addr
 		for _, a := range addrs {
-			p, e := netip.ParsePrefix(a.String())
-			if e == nil && p.Addr().Is4() {
-				add(netip.AddrPortFrom(p.Addr(), port))
+			p, err := netip.ParsePrefix(a.String())
+			if err != nil {
+				continue
 			}
+			if s.ipv6 && IsPublicIPv6(p.Addr()) {
+				add(netip.AddrPortFrom(p.Addr(), port))
+			} else if p.Addr().Is4() {
+				ipv4 = append(ipv4, p.Addr())
+			}
+		}
+		for _, ip := range ipv4 {
+			add(netip.AddrPortFrom(ip, port))
 		}
 	}
 	if ctx.Err() != nil || (len(offer.Candidates) == 0 && len(offer.Local) == 0) {
@@ -139,6 +153,16 @@ func PrepareWithLocalPrefixes(ctx context.Context, agent bool, start protocol.P2
 }
 
 func (s *Session) openSocket() (*net.UDPConn, error) {
+	if len(s.sockets) == 0 && s.ipv6 {
+		// Use a dual-stack primary socket so either family can win without
+		// reopening the selected socket for QUIC. Extra NAT sockets stay IPv4.
+		if c, err := net.ListenUDP("udp", &net.UDPAddr{}); err == nil {
+			s.ipv6 = c.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Is6()
+			s.sockets = append(s.sockets, c)
+			return c, nil
+		}
+		s.ipv6 = false
+	}
 	c, err := net.ListenUDP("udp4", &net.UDPAddr{})
 	if err == nil {
 		s.sockets = append(s.sockets, c)
@@ -172,7 +196,9 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 	var targets []netip.AddrPort
 	for _, v := range offer.Candidates {
 		a, e := netip.ParseAddrPort(v)
-		if e == nil && a.Addr().Is4() && a.Port() != 0 && (a.Addr().IsGlobalUnicast() || a.Addr().IsLoopback()) {
+		if e == nil && a.Port() != 0 &&
+			((a.Addr().Is4() && (a.Addr().IsGlobalUnicast() || a.Addr().IsLoopback())) ||
+				(s.ipv6 && (IsPublicIPv6(a.Addr()) || a.Addr() == netip.IPv6Loopback()))) {
 			targets = append(targets, a)
 		}
 	}
@@ -186,8 +212,27 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 		return nil, ErrNoPeerCandidate
 	}
 	remoteMapping, remoteStep := protocol.NormalizeMapping(offer.Mapping, offer.Step)
-	i, addr, err := s.punch(ctx, targets, local, exactWindow(s.mapping, remoteMapping), remoteStep)
+	dualUnpredictable := s.mapping == protocol.P2PMappingVaries && remoteMapping == protocol.P2PMappingVaries
+	publicDualPunch := dualUnpredictable && s.dualNATPunch && len(targets) > 0
+	punchCtx := ctx
+	if dualUnpredictable {
+		limit := dualNATPunchTimeout
+		if !publicDualPunch {
+			if len(local) == 0 {
+				return nil, ErrDualUnpredictableNAT
+			}
+			targets = nil
+			limit = 3 * time.Second
+		}
+		var cancel context.CancelFunc
+		punchCtx, cancel = context.WithTimeout(ctx, limit)
+		defer cancel()
+	}
+	i, addr, err := s.punch(punchCtx, targets, local, exactWindow(s.mapping, remoteMapping), remoteStep, publicDualPunch)
 	if err != nil {
+		if dualUnpredictable && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			return nil, ErrDualUnpredictableNAT
+		}
 		return nil, err
 	}
 	c := s.sockets[i]
@@ -207,7 +252,7 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 	}}
 	tr := &quic.Transport{Conn: c}
 	qc := &quic.Config{HandshakeIdleTimeout: 3 * time.Second, MaxIdleTimeout: 8 * time.Second, KeepAlivePeriod: 2 * time.Second, MaxIncomingStreams: 1, MaxIncomingUniStreams: -1}
-	link := &Link{trans: tr, udp: c}
+	link := &Link{trans: tr, udp: c, ipv6: addr.Addr().Is6()}
 	for _, a := range local {
 		if a.Addr() == addr.Addr() {
 			link.lan = true

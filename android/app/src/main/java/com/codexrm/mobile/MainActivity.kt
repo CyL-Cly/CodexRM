@@ -1,11 +1,20 @@
 package com.codexrm.mobile
 
+import android.Manifest
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ActivityNotFoundException
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -13,6 +22,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
+import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -21,8 +32,10 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.BaseAdapter
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -37,14 +50,23 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import okhttp3.Call
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.io.File
 import java.io.IOException
 import java.util.Locale
+import java.util.UUID
 import kotlin.concurrent.thread
 import kotlin.math.min
+
+private const val PICK_COMPOSER_ATTACHMENT = 43
+private const val CAPTURE_ATTACHMENT_PERMISSION = 46
+private const val ALBUM_WRITE_PERMISSION = 47
+private const val ATTACHMENT_CAMERA_URI_FLAGS = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
 
 internal class MainActivity : Activity() {
     private lateinit var store: DeviceStore
@@ -54,6 +76,7 @@ internal class MainActivity : Activity() {
     private var attachmentFiles = mutableListOf<JSONObject>()
     private var preparingAttachments = false
     private var attachmentPickerKey = ""
+    private var attachmentCameraFile = ""
     private var composerBinding = ComposerBinding("", "", "")
     private var composerRestoreToken = ComposerRestoreToken(composerBinding, 0)
     private var composerEditVersion = 0L
@@ -64,16 +87,20 @@ internal class MainActivity : Activity() {
     private var pairCall: Call? = null
     private var updateCall: Call? = null
     private var updateDialog: AlertDialog? = null
+    private var updateFailureReceiver: BroadcastReceiver? = null
     private var connectionDialog: AlertDialog? = null
     private var dialogShowsDirect = false
     private var updateOperation = 0
     private var pendingUpdate: UpdateChecker.VersionInfo? = null
+    private var startupUpdate: UpdateChecker.VersionInfo? = null
+    private var resumed = false
     private var started = false
     private var mainVisible = false
     private var mainBuilt = false
     private var pairMessage = ""
+    private var pairPage: ScrollView? = null
 
-    private lateinit var mainRoot: FrameLayout
+    private lateinit var mainRoot: SidebarSwipeLayout
     private lateinit var contentRoot: LinearLayout
     private lateinit var sidebar: LinearLayout
     private lateinit var sidebarShade: View
@@ -92,25 +119,29 @@ internal class MainActivity : Activity() {
     private lateinit var connectionIcon: IconView
     private lateinit var deviceLabel: TextView
     private lateinit var connectionDot: View
-    private lateinit var threadTitle: TextView
+    private lateinit var topbarTitle: TextView
     private lateinit var demoBadge: TextView
-    private lateinit var threadActions: View
     private lateinit var messageList: ListView
     private lateinit var welcome: LinearLayout
     private lateinit var welcomeDescription: TextView
     private lateinit var olderButton: TextView
     private lateinit var adapter: MessageAdapter
     private lateinit var composer: EditText
-    private lateinit var attachButton: View
+    private lateinit var attachButton: FrameLayout
+    private lateinit var attachmentChoices: LinearLayout
+    private lateinit var sendButton: FrameLayout
+    private lateinit var continueButton: FrameLayout
     private lateinit var attachmentScroll: HorizontalScrollView
     private lateinit var attachmentRows: LinearLayout
     private lateinit var attachmentStatus: TextView
     private lateinit var stopButton: FrameLayout
     private lateinit var workspaceSpinner: Spinner
-    private lateinit var modelSpinner: Spinner
+    private lateinit var modelButton: TextView
     private lateinit var effortSpinner: Spinner
     private lateinit var cwdLabel: TextView
     private lateinit var runningActions: LinearLayout
+    private lateinit var bootstrapArea: LinearLayout
+    private lateinit var outboxArea: LinearLayout
     private lateinit var queueArea: LinearLayout
     private lateinit var activityRow: LinearLayout
     private lateinit var activityText: TextView
@@ -125,11 +156,17 @@ internal class MainActivity : Activity() {
 
     private var online = false
     private var loaded = false
+    private var bootstrapping = false
+    private var bootstrapError = ""
+    private var approvalRecoveryMessage = ""
     private var loading = false
     private var sending = false
+    private var activePendingSendId = ""
+    private var outbox = OutboxState()
     private var running = false
     private var readOnly = false
     private var activeTurnId = ""
+    private var latestTurn: TurnProgress? = null
     private var startedAt = 0L
     private var currentThread: JSONObject? = null
     private var currentThreadId = ""
@@ -143,20 +180,33 @@ internal class MainActivity : Activity() {
     private var threadListVersion = 0
     private val deletingThreads = HashSet<String>()
     private var workspaces = listOf<Workspace>()
+    private var modelCatalog = ModelCatalog()
     private var models = listOf<ModelOption>()
+    private var selectedModelOption: ModelOption? = null
     private var updatingSpinners = false
     private var generation = 0
     private var openGeneration = 0
     private var sidebarOpen = false
-    private var sidebarBackStartX: Float? = null
+    private enum class BackTarget { DEVICES, SIDEBAR, ATTACHMENTS, PAIR }
+
+    private class BackPreview(val draw: (Float) -> Unit, val restore: (committing: Boolean) -> Unit)
+
+    private class BackGesture(val target: BackTarget, var preview: BackPreview?) {
+        var progress = 0f
+        var invalidated = false
+        var completion: ValueAnimator? = null
+    }
+
+    private var backGesture: BackGesture? = null
     private var backCallbackRegistered = false
     private val backCallback: Any? = SystemBackCompat.createCallback(
-        onStarted = ::startSidebarBack,
-        onProgressed = ::progressSidebarBack,
-        onCancelled = ::cancelSidebarBack,
-        onBack = { handleSystemBack() },
+        onStarted = ::startBackGesture,
+        onProgressed = ::progressBackGesture,
+        onCancelled = { finishBackGesture(commit = false) },
+        onBack = ::invokeSystemBack,
     )
     private var collapsedPaths = mutableSetOf<String>()
+    private val expandedWorkspaceThreads = mutableSetOf<Pair<String, String>>()
     private var workspacesCollapsed = false
     private var devicesExpanded = false
     private var devicePopup: PopupWindow? = null
@@ -166,10 +216,14 @@ internal class MainActivity : Activity() {
     private val deltaBuffers = HashMap<String, DeltaBuffer>()
     private val dirtyDeltaIds = LinkedHashSet<String>()
     private val requests = LinkedHashMap<String, JSONObject>()
+    private val requestScopes = HashMap<String, ApprovalScope>()
     private val responding = HashSet<String>()
     private val messageQueues = HashMap<String, JSONObject>()
+    private val pendingQueueRemovals = HashSet<String>()
+    private var editingQueueDraft: ComposerBinding? = null
     private var historyCursor: String? = null
     private var historyOlder = false
+    private val historyMessageIds = HashSet<String>()
     private var renderScheduled = false
     private var snapshotRunning = false
     private var snapshotRequestVersion = 0
@@ -197,6 +251,7 @@ internal class MainActivity : Activity() {
         }
         workspaceFiles = WorkspaceFileUi(this) { client }
         attachmentPickerKey = savedInstanceState?.getString("attachmentPickerKey").orEmpty()
+        attachmentCameraFile = savedInstanceState?.getString("attachmentCameraFile").orEmpty()
         Ui.configure(this, store.darkTheme)
         devices = store.load()
         restoreThreadId = savedInstanceState?.getString("threadId").orEmpty()
@@ -211,18 +266,31 @@ internal class MainActivity : Activity() {
                     .setPositiveButton("我知道了", null),
             )
         }
+        checkForUpdatesOnStartup()
     }
 
     override fun onStart() { super.onStart(); started = true; if (mainVisible) connect() }
     override fun onResume() {
         super.onResume()
-        val pending = pendingUpdate ?: return
-        pendingUpdate = null
-        if (UpdateChecker.canInstall(this)) startUpdateDownload(pending) else showUpdateAvailable(pending)
+        resumed = true
+        val pending = pendingUpdate
+        if (pending != null) {
+            pendingUpdate = null
+            if (UpdateChecker.canInstall(this)) startUpdateDownload(pending) else showUpdateAvailable(pending)
+        }
+        showStartupUpdateIfReady()
+    }
+    override fun onPause() {
+        resumed = false
+        super.onPause()
+    }
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) showStartupUpdateIfReady()
     }
     override fun onStop() {
         started = false
-        cancelSidebarBack()
+        finishBackGesture(commit = false)
         workspaceFiles.activityStopped()
         saveDraft()
         devicePopup?.dismiss()
@@ -246,22 +314,22 @@ internal class MainActivity : Activity() {
         saveDraft()
         outState.putString("threadId", currentThreadId)
         outState.putString("attachmentPickerKey", attachmentPickerKey)
+        outState.putString("attachmentCameraFile", attachmentCameraFile)
         super.onSaveInstanceState(outState)
     }
 
     private fun showPair() {
+        invalidateBackPreview()
         saveDraft()
         workspaceFiles.closeManager()
         disconnect()
         mainVisible = false
         if (mainBuilt) {
             sidebarOpen = false
-            sidebarBackStartX = null
+            mainRoot.stopSidebarSwipe()
             sidebar.animate().cancel()
             sidebarShade.animate().cancel()
-            sidebar.translationX = -sidebar.layoutParams.width.toFloat()
-            sidebarShade.alpha = 0f
-            sidebarShade.visibility = View.GONE
+            drawSidebar(-sidebar.layoutParams.width.toFloat())
         }
         Ui.configure(this, store.darkTheme)
         val scroll = ScrollView(this).apply { isFillViewport = true; setBackgroundColor(Ui.BACKGROUND) }
@@ -314,7 +382,8 @@ internal class MainActivity : Activity() {
         })
         if (devices.isNotEmpty()) card.addView(Ui.button(this, "返回已配对设备") { showMain() }, matchWidth(top = 12))
         Ui.applyWindowInsets(scroll)
-        setContentView(scroll)
+        pairPage = scroll
+        setContentView(FrameLayout(this).apply { addView(scroll, backPageParams()) })
         updateBackHandling()
     }
 
@@ -363,18 +432,8 @@ internal class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (workspaceFiles.onActivityResult(requestCode, resultCode, data)) return
-        if (requestCode == 43) {
-            if (resultCode != RESULT_OK || data == null) return
-            val uris = mutableListOf<Uri>()
-            data.clipData?.let { clips -> for (index in 0 until clips.itemCount) uris += clips.getItemAt(index).uri }
-            if (uris.isEmpty()) data.data?.let(uris::add)
-            val key = attachmentPickerKey.ifEmpty { attachmentDraftKey() }
-            preparingAttachments = true; attachmentStatus.text = "正在读取附件…"; attachmentStatus.visibility = View.VISIBLE; updateControls()
-            attachmentStore.stage(key, uris) { error ->
-                if (isDestroyed) return@stage
-                preparingAttachments = false
-                renderAttachments(); updateControls(); toast(error)
-            }
+        if (requestCode == PICK_COMPOSER_ATTACHMENT) {
+            receiveAttachments(resultCode, data)
             return
         }
         if (requestCode != 42 || resultCode != RESULT_OK) return
@@ -383,9 +442,11 @@ internal class MainActivity : Activity() {
     }
 
     private fun showMain(reset: Boolean = false) {
+        invalidateBackPreview()
         if (reset) disconnect()
         if (!mainBuilt) buildMain()
         mainVisible = true
+        pairPage = null
         setContentView(mainRoot)
         device = devices.firstOrNull { it.agentId == store.selectedId } ?: devices.firstOrNull().also { store.selectedId = it?.agentId.orEmpty() }
         if (device == null) { showPair(); return }
@@ -398,14 +459,23 @@ internal class MainActivity : Activity() {
     private fun buildMain() {
         mainBuilt = true
         sidebarOpen = false
-        sidebarBackStartX = null
         devicesExpanded = false
         devicePopup?.dismiss()
         adapter = MessageAdapter(this, imageLoader, { file, done ->
             workspaceFiles.size(RemoteFile(currentCwd, currentThreadId, file.path), done)
-        }, { file -> workspaceFiles.download(RemoteFile(currentCwd, currentThreadId, file.path), file.name) })
+        }, ::downloadMessageFile)
         adapter.showFileCards = directFilesAvailable()
-        mainRoot = SidebarSwipeLayout(this, { mainVisible && !sidebarOpen }, { openSidebar() }).apply {
+        mainRoot = SidebarSwipeLayout(
+            this,
+            canOpenSidebar = { mainVisible && !sidebarOpen },
+            startSidebarDrag = {
+                sidebar.animate().cancel()
+                sidebarShade.animate().cancel()
+                sidebar.translationX
+            },
+            moveSidebar = ::drawSidebar,
+            finishSidebarDrag = { open -> if (open) openSidebar() else closeSidebar() },
+        ).apply {
             setBackgroundColor(Ui.BACKGROUND)
         }
         Ui.applyWindowInsets(mainRoot)
@@ -433,7 +503,7 @@ internal class MainActivity : Activity() {
             gravity = Gravity.CENTER; background = Ui.ripple(Color.TRANSPARENT, 0f); visibility = View.GONE
             setOnClickListener { loadOlderTurns() }
         }
-        transcript.addView(olderButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 42)))
+        transcript.addView(olderButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 48)))
         messageList = ListView(this).apply {
             divider = null; dividerHeight = 0; cacheColorHint = Color.TRANSPARENT; selector = Ui.rounded(Color.TRANSPARENT, 0f)
             clipToPadding = false; setStackFromBottom(true)
@@ -455,11 +525,15 @@ internal class MainActivity : Activity() {
             setPadding(Ui.dp(context, 12), 0, Ui.dp(context, 12), 0)
         }
         topbar.addView(Ui.iconButton(this, "panel", "打开侧栏", 44) { toggleSidebar() })
-        val titles = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(Ui.dp(context, 4), 0, 0, 0) }
-        titles.addView(Ui.text(this, "Codex Remote", 13f, bold = true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        threadTitle = Ui.text(this, "新会话", 12f, Ui.MUTED).apply { maxLines = 1; visibility = View.GONE }
-        titles.addView(threadTitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        topbar.addView(titles, LinearLayout.LayoutParams(0, Ui.dp(this, 56), 1f))
+        topbarTitle = Ui.text(this, "Codex Remote", 15f, bold = true).apply {
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            isSingleLine = true
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPaddingRelative(Ui.dp(context, 4), 0, Ui.dp(context, 4), 0)
+            background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 8).toFloat())
+            setOnClickListener { renameCurrentThread() }
+        }
+        topbar.addView(topbarTitle, LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1f))
         demoBadge = Ui.text(this, "演示模式", 9f, 0xffd2b889.toInt()).apply {
             background = Ui.rounded(0x1aac8232, Ui.dp(context, 4).toFloat(), 0x30ac8232)
             setPadding(Ui.dp(context, 7), Ui.dp(context, 4), Ui.dp(context, 7), Ui.dp(context, 4)); visibility = View.GONE
@@ -486,14 +560,22 @@ internal class MainActivity : Activity() {
         deviceButton.addView(deviceLabel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         deviceButton.addView(IconView(this, "chevron", Ui.MUTED), LinearLayout.LayoutParams(Ui.dp(this, 12), Ui.dp(this, 12)))
         topbar.addView(deviceButton, LinearLayout.LayoutParams(Ui.dp(this, 132), Ui.dp(this, 36)).apply { leftMargin = Ui.dp(this@MainActivity, 6) })
-        topbar.addView(Ui.iconButton(this, if (Ui.dark) "sun" else "moon", "切换明暗主题", 38) { toggleTheme() })
-        threadActions = Ui.iconButton(this, "more", "会话操作", 38) { manageThread() }.apply { visibility = View.GONE }
-        topbar.addView(threadActions)
+        topbar.addView(Ui.iconButton(this, "chat-plus", "新会话") { newChat() }.apply {
+            (getChildAt(0) as IconView).apply {
+                setColor(Ui.TEXT)
+                val iconSize = Ui.dp(context, 24)
+                layoutParams = FrameLayout.LayoutParams(iconSize, iconSize, Gravity.CENTER)
+            }
+        })
         contentRoot.addView(topbar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 60)))
     }
 
     private fun buildComposer(body: LinearLayout) {
         val zone = Ui.column(this).apply { setPadding(Ui.dp(context, 14), Ui.dp(context, 8), Ui.dp(context, 14), Ui.dp(context, 8)) }
+        bootstrapArea = Ui.column(this).apply { visibility = View.GONE }
+        zone.addView(bootstrapArea, matchWidth())
+        outboxArea = Ui.column(this).apply { visibility = View.GONE }
+        zone.addView(outboxArea, matchWidth())
         approvalScroll = ScrollView(this).apply { visibility = View.GONE; isFillViewport = false }
         approvalArea = Ui.column(this)
         approvalScroll.addView(approvalArea)
@@ -548,26 +630,41 @@ internal class MainActivity : Activity() {
         composerCard.addView(composer, matchWidth())
         runningActions = Ui.column(this, false).apply {
             gravity = Gravity.END; visibility = View.GONE
-            addView(Ui.button(context, "排队发送") { sendMessage(false) })
             addView(Ui.button(context, "插队发送") { sendMessage(true) })
         }
         composerCard.addView(runningActions, matchWidth())
         val toolbar = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL }
-        attachButton = Ui.iconButton(this, "attach", "添加文件或图片", 40) { pickAttachments() }
-        toolbar.addView(attachButton, LinearLayout.LayoutParams(Ui.dp(this, 40), Ui.dp(this, 44)))
-        modelSpinner = Spinner(this).apply { contentDescription = "选择模型" }
-        toolbar.addView(modelSpinner, LinearLayout.LayoutParams(0, Ui.dp(this, 44), 1f))
-        effortSpinner = Spinner(this).apply { contentDescription = "选择思考强度" }
-        toolbar.addView(effortSpinner, LinearLayout.LayoutParams(Ui.dp(this, 92), Ui.dp(this, 44)))
+        attachButton = Ui.iconButton(this, "attach", "添加文件或图片", 48) { toggleAttachmentChoices() }
+        toolbar.addView(attachButton, LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)))
+        modelButton = Ui.text(this, "默认模型", 11f, Ui.MUTED).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            minHeight = Ui.dp(context, 48)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(Ui.dp(context, 6), Ui.dp(context, 4), Ui.dp(context, 6), Ui.dp(context, 4))
+            background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 8).toFloat())
+            contentDescription = "选择模型，当前为默认模型"
+            isFocusable = true
+            setOnClickListener { showModelPicker() }
+        }
+        toolbar.addView(modelButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        effortSpinner = Spinner(this).apply { contentDescription = "选择思考强度"; minimumHeight = Ui.dp(context, 48) }
+        toolbar.addView(effortSpinner, LinearLayout.LayoutParams(Ui.dp(this, 104), Ui.dp(this, 48)))
         stopButton = circleButton("stop", "停止任务") { stopTurn() }.apply { visibility = View.GONE }
-        toolbar.addView(stopButton, LinearLayout.LayoutParams(Ui.dp(this, 44), Ui.dp(this, 44)).apply { leftMargin = Ui.dp(this@MainActivity, 4) })
+        toolbar.addView(stopButton, LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)).apply { leftMargin = Ui.dp(this@MainActivity, 4) })
+        sendButton = circleButton("arrow", "发送消息") { sendMessage(false) }.apply { visibility = View.GONE }
+        toolbar.addView(sendButton, LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)).apply { marginStart = Ui.dp(this@MainActivity, 4) })
+        continueButton = circleButton("play", "继续中断的任务") { continueTurn() }.apply { visibility = View.GONE }
+        toolbar.addView(continueButton, LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)).apply { marginStart = Ui.dp(this@MainActivity, 4) })
         composerCard.addView(toolbar, matchWidth())
         zone.addView(composerCard, matchWidth())
+        attachmentChoices = buildAttachmentChoices()
+        zone.addView(attachmentChoices, matchWidth(top = 8))
         val meta = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(Ui.dp(context, 4), Ui.dp(context, 8), Ui.dp(context, 4), 0) }
         val path = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL }
         cwdLabel = Ui.text(this, "点击设置工作目录", 10f, Ui.DIM).apply {
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
-            minHeight = Ui.dp(context, 40); isFocusable = true
+            minHeight = Ui.dp(context, 48); isFocusable = true
             background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 6).toFloat())
             setOnClickListener { openWorkspacePicker() }
             setOnLongClickListener { openWorkspaceFiles(currentCwd, currentThreadId) }
@@ -578,7 +675,7 @@ internal class MainActivity : Activity() {
             dropDownWidth = min(Ui.dp(context, 360), resources.displayMetrics.widthPixels - Ui.dp(context, 36))
             setPadding(0, 0, 0, 0)
         }
-        path.addView(workspaceSpinner, LinearLayout.LayoutParams(Ui.dp(this, 32), Ui.dp(this, 40)))
+        path.addView(workspaceSpinner, LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)))
         meta.addView(path, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         zone.addView(meta, matchWidth())
         zone.addView(Ui.text(this, "任务在你的电脑上运行  ·  CodexRM 连接每一处灵感", 8f, Ui.DIM).apply {
@@ -613,17 +710,9 @@ internal class MainActivity : Activity() {
         brand.addView(mark, LinearLayout.LayoutParams(Ui.dp(this, 30), Ui.dp(this, 30)))
         brand.addView(Ui.text(this, "Codex", 20f, bold = true).apply { setPadding(Ui.dp(context, 10), 0, 0, 0) })
         brand.addView(Ui.text(this, "RM", 20f, Ui.MUTED), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        brand.addView(Ui.text(this, "REMOTE", 9f, Ui.DIM).apply { background = Ui.rounded(Color.TRANSPARENT, Ui.dp(context, 4).toFloat(), Ui.BORDER); setPadding(Ui.dp(context, 5), Ui.dp(context, 4), Ui.dp(context, 5), Ui.dp(context, 4)) })
+        brand.addView(Ui.iconButton(this, if (Ui.dark) "sun" else "moon", "切换明暗主题") { toggleTheme() })
         brand.addView(Ui.iconButton(this, "close", "关闭侧栏", 42) { closeSidebar() })
         sidebar.addView(brand, matchWidth())
-        val newChat = Ui.column(this, false).apply {
-            gravity = Gravity.CENTER_VERTICAL; background = Ui.ripple(Ui.SURFACE, Ui.dp(context, 9).toFloat(), Ui.BORDER)
-            setPadding(Ui.dp(context, 12), 0, Ui.dp(context, 12), 0); setOnClickListener { newChat(); closeSidebar() }
-            addView(IconView(context, "edit", Ui.TEXT), LinearLayout.LayoutParams(Ui.dp(context, 18), Ui.dp(context, 18)))
-            addView(Ui.text(context, "新会话", 13f, bold = true).apply { setPadding(Ui.dp(context, 10), 0, 0, 0) }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(Ui.text(context, "Ctrl K", 10f, Ui.DIM))
-        }
-        sidebar.addView(newChat, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 46)))
         val search = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(Ui.dp(context, 10), 0, 0, 0) }
         search.addView(IconView(this, "search", Ui.DIM), LinearLayout.LayoutParams(Ui.dp(this, 18), Ui.dp(this, 18)))
         searchInput = Ui.input(this, "搜索会话").apply { textSize = 13f; background = null }
@@ -633,7 +722,6 @@ internal class MainActivity : Activity() {
             override fun afterTextChanged(s: Editable?) { renderWorkspaces() }
         })
         search.addView(searchInput, LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1f))
-        search.addView(Ui.text(this, "/", 11f, Ui.DIM).apply { background = Ui.rounded(Color.TRANSPARENT, Ui.dp(context, 3).toFloat(), Ui.BORDER); setPadding(Ui.dp(context, 5), 0, Ui.dp(context, 5), 0) })
         sidebar.addView(search, matchWidth())
         sidebarDeviceButton = Ui.column(this, false).apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -695,16 +783,11 @@ internal class MainActivity : Activity() {
         workspaceScroll.addView(workspaceContent)
         sidebar.addView(workspaceScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         val profile = Ui.column(this, false).apply {
-            gravity = Gravity.CENTER_VERTICAL; background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 8).toFloat())
-            setPadding(Ui.dp(context, 7), Ui.dp(context, 12), 0, 0); setOnClickListener { showSettings() }
-            val avatar = FrameLayout(context).apply {
-                background = Ui.rounded(0xffc7d1c3.toInt(), Ui.dp(context, 17).toFloat())
-                addView(IconView(context, "terminal", 0xff28382a.toInt()), FrameLayout.LayoutParams(Ui.dp(context, 16), Ui.dp(context, 16), Gravity.CENTER))
-            }
-            addView(avatar, LinearLayout.LayoutParams(Ui.dp(context, 32), Ui.dp(context, 32)))
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, Ui.dp(context, 12), 0, 0)
+            addView(Ui.iconButton(context, "more", "更多应用选项") { showAppMenu(it) })
             addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
-            addView(Ui.iconButton(context, "update", "检查更新", 40) { checkForUpdates() })
-            addView(IconView(context, "settings", Ui.DIM), LinearLayout.LayoutParams(Ui.dp(context, 20), Ui.dp(context, 20)))
+            addView(Ui.iconButton(context, "settings", "工作区设置") { showSettings() })
         }
         sidebar.addView(profile, matchWidth())
         val width = min(Ui.dp(this, 300), (resources.displayMetrics.widthPixels * 0.86).toInt())
@@ -721,12 +804,6 @@ internal class MainActivity : Activity() {
                 if (path.isNotEmpty() && pathKey(path) != pathKey(currentCwd)) selectWorkspace(path)
             }
         }
-        modelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                if (!updatingSpinners) { updateEfforts(preserve = true); saveModelPreference() }
-            }
-        }
         effortSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { if (!updatingSpinners) saveModelPreference() }
@@ -734,14 +811,26 @@ internal class MainActivity : Activity() {
         refreshWorkspaceSpinner(); refreshModelSpinner()
     }
 
-    private fun setSpinnerItems(spinner: Spinner, values: List<String>, selectedLabels: List<String> = values) {
+    private fun setSpinnerItems(
+        spinner: Spinner,
+        values: List<String>,
+        selectedLabels: List<String> = values,
+        dropdownNotes: List<String> = emptyList(),
+    ) {
         spinner.backgroundTintList = android.content.res.ColorStateList.valueOf(Ui.MUTED)
         spinner.adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, values) {
             private fun style(view: View, position: Int, dropdown: Boolean): View {
                 val text = view.findViewById<TextView>(android.R.id.text1)
-                text.text = if (dropdown) values[position] else selectedLabels[position]
+                val notes = if (dropdown) dropdownNotes.getOrNull(position).orEmpty() else ""
+                text.text = when {
+                    !dropdown -> selectedLabels[position]
+                    notes.isEmpty() -> values[position]
+                    else -> "${values[position]}\n${notes.lineSequence().joinToString(" ")}"
+                }
+                if (notes.isNotEmpty()) text.isSingleLine = false
                 text.setTextColor(Ui.MUTED); text.textSize = if (dropdown) 13f else 11f
-                text.maxLines = 1; text.ellipsize = android.text.TextUtils.TruncateAt.END
+                text.maxLines = if (notes.isEmpty()) 1 else 2
+                text.ellipsize = android.text.TextUtils.TruncateAt.END
                 view.setBackgroundColor(if (dropdown) Ui.SURFACE else Color.TRANSPARENT)
                 text.setPadding(Ui.dp(context, 6), 0, Ui.dp(context, 4), 0)
                 return view
@@ -753,15 +842,25 @@ internal class MainActivity : Activity() {
 
     private fun toggleSidebar() { if (sidebarOpen) closeSidebar() else openSidebar() }
     private fun openSidebar() {
+        mainRoot.stopSidebarSwipe()
         sidebarOpen = true
         updateBackHandling()
         animateSidebar()
     }
     private fun closeSidebar() {
+        mainRoot.stopSidebarSwipe()
         sidebarOpen = false
-        sidebarBackStartX = null
         updateBackHandling()
         animateSidebar()
+    }
+
+    private fun drawSidebar(translationX: Float) {
+        val width = sidebar.layoutParams.width.coerceAtLeast(1).toFloat()
+        val offset = translationX.coerceIn(-width, 0f)
+        sidebar.translationX = offset
+        sidebarShade.alpha = 1f + offset / width
+        val shadeVisibility = if (offset > -width) View.VISIBLE else View.GONE
+        if (sidebarShade.visibility != shadeVisibility) sidebarShade.visibility = shadeVisibility
     }
 
     private fun animateSidebar() {
@@ -778,45 +877,32 @@ internal class MainActivity : Activity() {
             .withEndAction { if (!sidebarOpen) sidebarShade.visibility = View.GONE }.start()
     }
 
-    private fun startSidebarBack(progress: Float) {
-        if (!mainVisible || !sidebarOpen || devicesExpanded || sidebar.width <= 0) return
-        sidebar.animate().cancel()
-        sidebarShade.animate().cancel()
-        sidebarBackStartX = sidebar.translationX
-        progressSidebarBack(progress)
-    }
-
-    private fun progressSidebarBack(progress: Float) {
-        val startX = sidebarBackStartX ?: return
-        val width = sidebar.width.toFloat()
-        val offset = startX + (-width - startX) * progress.coerceIn(0f, 1f)
-        sidebar.translationX = offset
-        sidebarShade.alpha = (1f + offset / width).coerceIn(0f, 1f)
-    }
-
-    private fun cancelSidebarBack() {
-        if (sidebarBackStartX == null) return
-        sidebarBackStartX = null
-        animateSidebar()
-    }
-
     private fun connect() {
         val current = device ?: return
         if (!started || !mainVisible || client != null) return
         online = false
         client = CodexClient(this, current, object : CodexClient.Listener {
             override fun onState(state: ConnectionState, agent: JSONObject?) {
-                if (device?.agentId != current.agentId) return
+                if (device !== current) return
                 val wasOnline = online
                 online = state == ConnectionState.ONLINE; current.online = online
+                val announcedVersion = agent?.string("appVersion").orEmpty()
+                val versionChanged = announcedVersion.isNotBlank() && announcedVersion != current.appVersion
                 agent?.let {
-                    val name = it.string("serverName"); val os = it.string("os"); val version = it.string("appVersion")
-                    if (name.isNotEmpty() && (name != current.serverName || os != current.os || version != current.appVersion)) {
-                        current.serverName = name; current.os = os; current.appVersion = version; store.save(devices)
+                    val name = it.string("serverName").ifBlank { current.serverName }
+                    val os = it.string("os").ifBlank { current.os }
+                    if (name != current.serverName || os != current.os || versionChanged) {
+                        current.serverName = name
+                        current.os = os
+                        if (versionChanged) current.appVersion = announcedVersion
+                        store.save(devices)
                     }
                 }
                 renderDevices()
-                if (online && !wasOnline) bootstrap() else updateControls()
+                // A fast restart can replace the peer without an intervening offline status.
+                if (online && (!wasOnline || (versionChanged && current.pendingAgentUpdateFrom.isNotBlank()))) {
+                    bootstrap()
+                } else updateControls()
             }
             override fun onRpcEvent(message: JSONObject) { if (device?.agentId == current.agentId) handleRpcEvent(message) }
             override fun onFailure(message: String) { if (mainVisible) toast(message) }
@@ -838,45 +924,73 @@ internal class MainActivity : Activity() {
     }
 
     private fun disconnect() {
-        generation++; client?.stop(); client = null
+        generation++
+        activePendingSendId.takeIf { it.isNotEmpty() }?.let {
+            outbox.failed(it, outcomeUnknown = true)
+            activePendingSendId = ""
+            persistOutbox()
+        }
+        client?.stop(); client = null
         updateDirectFiles()
         connectionDialog?.dismiss()
         invalidateSnapshots()
         devicePopup?.dismiss()
         devicesExpanded = false
+        updateBackHandling()
         devices.forEach { it.online = false }
-        online = false; loaded = false; sending = false; loading = false
-        requests.clear(); responding.clear(); messageQueues.clear()
+        online = false; loaded = false; bootstrapping = false; sending = false; loading = false
+        if (requests.isNotEmpty()) approvalRecoveryMessage = "连接中断，原审批仅作保留展示；重连并同步前不可操作。"
+        responding.clear(); messageQueues.clear()
         deletingThreads.clear()
         handler.removeCallbacks(elapsedTicker)
         if (mainBuilt) { renderApproval(); renderQueue(); renderDevices(); updateControls() }
     }
 
     private fun bootstrap() {
+        val current = device ?: return
+        if (bootstrapping || !online) return
+        bootstrapping = true
+        bootstrapError = ""
         val currentGeneration = ++generation
-        loaded = false; requests.clear(); responding.clear(); messageQueues.clear()
-        renderApproval(); renderQueue()
+        loaded = false
+        if (requests.isNotEmpty()) approvalRecoveryMessage = "正在从设备恢复待处理审批…"
+        responding.clear(); messageQueues.clear()
+        renderApproval(); renderQueue(); updateControls()
         rpc("codexrm/info") { result, error ->
             if (!active(currentGeneration)) return@rpc
-            if (error != null || result == null) { toast(error?.message ?: "无法读取设备信息"); return@rpc }
+            if (error != null || result == null) {
+                bootstrapping = false
+                bootstrapError = error?.message ?: "无法读取设备信息"
+                if (requests.isNotEmpty()) approvalRecoveryMessage = "审批尚未重新同步。请重试初始化，旧审批不会静默清除。"
+                renderApproval(); updateControls()
+                toast(bootstrapError)
+                return@rpc
+            }
+            // codexrm/info replays the agent's authoritative pending requests after its response.
+            val recoveringApprovals = requests.isNotEmpty()
+            requests.clear(); requestScopes.clear(); responding.clear()
+            approvalRecoveryMessage = if (recoveringApprovals) "审批状态已从设备重新同步；仍待处理的审批会重新显示。" else ""
             info = result
             val version = info.string("version")
-            if (version.isNotEmpty() && version != device?.appVersion) {
-                device?.appVersion = version
+            val updated = current.confirmAgentUpdate(version)
+            if (version.isNotBlank() && (version != current.appVersion || updated)) {
+                current.appVersion = version
                 store.save(devices)
                 renderDevices()
             }
+            if (updated) toast("电脑 Agent 更新成功（v$version）")
             updateDirectFiles()
-            demoBadge.visibility = if (info.optBoolean("mock")) View.VISIBLE else View.GONE
             welcomeDescription.text = if (info.optBoolean("mock")) "已连接演示设备，可以发送任务体验完整流程。" else "已连接 ${info.string("name")}，让 Codex 继续手边的工作。"
             if (currentCwd.isEmpty()) currentCwd = store.selectedWorkspace(currentAgent()).ifEmpty { info.string("cwd") }
             bindNewSessionDraft()
+            renderApproval()
             loadWorkspaces(currentGeneration); loadModels(); loadThreads(currentGeneration, reopenCurrent = true)
         }
     }
 
     private fun refreshAll() {
         if (!online) { toast("设备尚未连接"); return }
+        if (!loaded) { bootstrap(); return }
         loadWorkspaces(generation); loadModels(refresh = true); loadThreads(generation)
         if (currentThreadId.isNotEmpty()) openThread(currentThreadId, silent = true)
     }
@@ -910,7 +1024,12 @@ internal class MainActivity : Activity() {
         rpc("thread/list", params) { result, error ->
             if (!active(currentGeneration) || listVersion != threadListVersion) return@rpc
             if (error != null || result == null) {
-                threadListLoading = false; renderWorkspaces(); toast("无法读取会话：${error?.message}"); return@rpc
+                threadListLoading = false
+                if (reopenCurrent) {
+                    bootstrapping = false
+                    bootstrapError = "无法读取会话：${error?.message ?: "响应无效"}"
+                }
+                renderWorkspaces(); updateControls(); toast("无法读取会话：${error?.message}"); return@rpc
             }
             val array = result.arrayAt("data")
             val merged = LinkedHashMap<String, ThreadSummary>()
@@ -921,7 +1040,9 @@ internal class MainActivity : Activity() {
             if (threadCursor != null && !seen.contains(threadCursor) && seen.size < 20) {
                 loadThreads(currentGeneration, threadCursor, threads, seen + threadCursor!!, reopenCurrent, listVersion)
             } else {
-                threadListLoading = false; loaded = true; renderWorkspaces(); updateControls()
+                threadListLoading = false; loaded = true
+                if (reopenCurrent) { bootstrapping = false; bootstrapError = "" }
+                renderWorkspaces(); updateControls()
                 bindNewSessionDraft()
                 if (reopenCurrent) {
                     val reopen = restoreThreadId.ifEmpty { currentThreadId }
@@ -941,43 +1062,103 @@ internal class MainActivity : Activity() {
             }
         } else rpc("model/list", JSONObject().put("limit", 100)) { result, _ ->
             if (result == null) return@rpc
-            val array = result.arrayAt("data")
-            models = (0 until array.length()).mapNotNull { index -> modelOption(JSONObject().put("name", "当前 Codex 配置"), array.optJSONObject(index)) }
+            val provider = JSONObject().put("name", "当前 Codex 配置").put("models", result.arrayAt("data"))
+            modelCatalog = ModelCatalog(JSONObject().put("providers", JSONArray().put(provider)))
             refreshModelSpinner()
         }
     }
 
     private fun parseProviderModels(result: JSONObject) {
-        val providers = result.arrayAt("providers"); val values = ArrayList<ModelOption>()
-        for (index in 0 until providers.length()) {
-            val provider = providers.optJSONObject(index) ?: continue; val array = provider.arrayAt("models")
-            for (modelIndex in 0 until array.length()) modelOption(provider, array.optJSONObject(modelIndex))?.let(values::add)
-        }
-        models = values; refreshModelSpinner()
+        modelCatalog = ModelCatalog(result)
+        refreshModelSpinner()
         val warnings = result.arrayAt("warnings")
         if (warnings.length() > 0) toast((0 until warnings.length()).joinToString("；") { warnings.optString(it) })
     }
 
-    private fun modelOption(provider: JSONObject, value: JSONObject?): ModelOption? {
-        if (value == null || value.optBoolean("hidden")) return null
-        val model = value.string("model").ifEmpty { value.string("id") }; if (model.isEmpty()) return null
-        val efforts = ArrayList<String>(); val supported = value.arrayAt("supportedReasoningEfforts")
-        for (index in 0 until supported.length()) supported.optJSONObject(index)?.string("reasoningEffort")?.takeIf { it.isNotEmpty() }?.let(efforts::add)
-        val displayName = value.string("displayName").ifEmpty { model }
-        return ModelOption(provider.string("id"), model,
-            listOf(provider.string("name"), displayName).filter { it.isNotEmpty() }.joinToString(" · "),
-            value.string("defaultReasoningEffort"), efforts, displayName)
-    }
-
     private fun refreshModelSpinner() {
         if (!mainBuilt) return
+        val thread = currentThread
+        if (thread != null && thread.string("model").isNotEmpty()) {
+            showModelOptions(modelCatalog.providerId(thread.string("modelProvider")), thread.string("model"), selectedEffort())
+        } else {
+            val (provider, model, effort) = store.modelPreference(currentAgent(), pathKey(currentCwd))
+            showModelOptions(provider, model, effort)
+        }
+    }
+
+    private fun showModelOptions(provider: String, model: String, effort: String) {
+        models = modelCatalog.options(provider)
+        selectedModelOption = models.firstOrNull { it.model == model && it.providerId == provider }
         updatingSpinners = true
-        setSpinnerItems(modelSpinner, listOf("默认模型") + models.map(ModelOption::label), listOf("默认模型") + models.map(ModelOption::displayName))
-        val preference = store.modelPreference(currentAgent(), pathKey(currentCwd))
-        val index = models.indexOfFirst { it.model == preference.second && it.providerId == preference.first }
-        modelSpinner.setSelection(if (index >= 0) index + 1 else 0)
-        updateEfforts(preserve = false, preferred = preference.third)
+        updateModelButton()
+        updateEfforts(preserve = false, preferred = effort)
         updatingSpinners = false
+    }
+
+    private fun updateModelButton() {
+        if (!mainBuilt || !::modelButton.isInitialized) return
+        val selected = selectedModelOption
+        modelButton.text = selected?.displayName ?: "默认模型"
+        modelButton.contentDescription = "选择模型，当前为${selected?.let { "${it.providerName} ${it.displayName}" } ?: "默认模型"}"
+    }
+
+    private fun showModelPicker() {
+        if (!online || sending || loading || running || readOnly) {
+            toast(if (running) "任务运行中，停止后可切换模型" else "设备连接并同步后可切换模型")
+            return
+        }
+        val content = Ui.column(this).apply { setPadding(Ui.dp(context, 20), 0, Ui.dp(context, 20), 0) }
+        val search = Ui.boxInput(this, "搜索模型或供应商").apply { minHeight = Ui.dp(context, 48) }
+        content.addView(search, matchWidth(top = 8, bottom = 8))
+        val list = ListView(this).apply {
+            divider = null
+            dividerHeight = 0
+            isVerticalScrollBarEnabled = true
+        }
+        content.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, min(Ui.dp(this, 520), (resources.displayMetrics.heightPixels * 0.65).toInt())))
+        val dialog = AlertDialog.Builder(this).setTitle("选择模型").setView(content).setNegativeButton("关闭", null).create()
+        fun renderRows(rows: List<ModelPickerRow>) {
+            list.adapter = object : BaseAdapter() {
+                override fun getCount(): Int = rows.size
+                override fun getItem(position: Int): ModelPickerRow = rows[position]
+                override fun getItemId(position: Int): Long = position.toLong()
+                override fun isEnabled(position: Int): Boolean = !rows[position].header
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                    val row = rows[position]
+                    if (row.header) return Ui.text(this@MainActivity, row.title, 12f, Ui.MUTED, true).apply {
+                        minHeight = Ui.dp(context, 48)
+                        setPadding(Ui.dp(context, 12), Ui.dp(context, 8), Ui.dp(context, 12), Ui.dp(context, 4))
+                    }
+                    val selected = row.option == selectedModelOption
+                    val value = Ui.column(this@MainActivity).apply {
+                        minimumHeight = Ui.dp(context, 56)
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(Ui.dp(context, 14), Ui.dp(context, 8), Ui.dp(context, 14), Ui.dp(context, 8))
+                        background = Ui.ripple(if (selected) Ui.SURFACE_ALT else Color.TRANSPARENT, Ui.dp(context, 8).toFloat())
+                        contentDescription = "${row.title}，${row.notes}${if (selected) "，当前选中" else ""}"
+                    }
+                    value.addView(Ui.text(this@MainActivity, "${if (selected) "✓ " else ""}${row.title}", 14f, if (selected) Ui.GREEN else Ui.TEXT, selected))
+                    if (row.notes.isNotEmpty()) value.addView(Ui.text(this@MainActivity, row.notes, 11f, Ui.MUTED).apply { maxLines = 2 })
+                    return value
+                }
+            }
+        }
+        renderRows(ModelPicker.rows(models, ""))
+        search.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: Editable?) { renderRows(ModelPicker.rows(models, s?.toString().orEmpty())) }
+        })
+        list.setOnItemClickListener { _, _, position, _ ->
+            val row = list.adapter.getItem(position) as ModelPickerRow
+            if (row.header) return@setOnItemClickListener
+            selectedModelOption = row.option
+            updateModelButton()
+            updateEfforts(preserve = false, preferred = row.option?.defaultEffort.orEmpty())
+            saveModelPreference()
+            dialog.dismiss()
+        }
+        styledDialog(dialog)
     }
 
     private fun updateEfforts(preserve: Boolean, preferred: String = "") {
@@ -1010,13 +1191,17 @@ internal class MainActivity : Activity() {
         return values
     }
 
-    private fun selectedModel(): ModelOption? = models.getOrNull(modelSpinner.selectedItemPosition - 1)
+    private fun selectedModel(): ModelOption? = selectedModelOption
     private fun selectedEffort(): String = selectedModel()?.efforts?.getOrNull(effortSpinner.selectedItemPosition - 1).orEmpty()
 
     private fun resetConversation() {
         generation++; openGeneration++; invalidateSnapshots()
         currentThread = null; currentThreadId = ""; openingThreadId = ""; currentCwd = ""; info = JSONObject()
-        threads = emptyList(); workspaces = emptyList(); models = emptyList(); messageQueues.clear(); requests.clear()
+        modelCatalog = ModelCatalog(); selectedModelOption = null
+        threads = emptyList(); workspaces = emptyList(); models = emptyList(); messageQueues.clear(); requests.clear(); requestScopes.clear()
+        outbox = OutboxState(store.pendingSends(currentAgent())); activePendingSendId = ""
+        persistOutbox()
+        bootstrapping = false; bootstrapError = ""; approvalRecoveryMessage = ""
         running = false; readOnly = false; loading = false; historyCursor = null
         collapsedPaths = store.collapsed(currentAgent())
         rebindComposer(ComposerBinding(currentAgent(), "", ""))
@@ -1034,7 +1219,8 @@ internal class MainActivity : Activity() {
     }
 
     private fun clearTranscript() {
-        items.clear(); deltaBuffers.clear(); userMessages.clear()
+        latestTurn = null
+        items.clear(); deltaBuffers.clear(); userMessages.clear(); historyMessageIds.clear()
         if (mainBuilt) adapter.clear()
     }
 
@@ -1106,15 +1292,17 @@ internal class MainActivity : Activity() {
         if (readOnly) scheduleSnapshot()
     }
 
-    private fun renderTurn(turn: JSONObject) {
+    private fun renderTurn(turn: JSONObject, collector: MutableList<ChatMessage>? = null) {
+        if (collector != null) {
+            collector += TurnRenderer.messages(turn, readOnly)
+            return
+        }
+        latestTurn = TurnProgress.from(turn)
         userMessages.observeTurn(turn.string("id"))
         if (!readOnly && turn.string("status") == "inProgress") { running = true; activeTurnId = turn.string("id"); startedAt = System.currentTimeMillis() }
         val turnItems = turn.arrayAt("items")
         for (itemIndex in 0 until turnItems.length()) turnItems.optJSONObject(itemIndex)?.let { upsertItem(turn.string("id"), it, immediate = true) }
-        turn.optJSONObject("error")?.let { adapter.add(ChatMessage("error-${turn.string("id")}", MessageKind.ERROR, "错误", it.string("message"))) }
-        when (turn.string("status")) {
-            "interrupted" -> adapter.add(ChatMessage("stopped-${turn.string("id")}", MessageKind.STATUS, "", if (readOnly) "原客户端状态：等待同步或任务已停止" else "任务已停止"))
-        }
+        TurnRenderer.terminalMessages(turn, readOnly).forEach(adapter::add)
     }
 
     private fun failOpenThread(currentOpen: Int, message: String?) {
@@ -1130,10 +1318,12 @@ internal class MainActivity : Activity() {
     }
 
     private fun selectThreadModel(result: JSONObject, thread: JSONObject) {
-        val model = result.string("model").ifEmpty { thread.string("model") }; if (model.isEmpty()) return
-        val provider = thread.string("modelProvider")
-        val index = models.indexOfFirst { it.model == model && (provider.isEmpty() || it.providerId == provider || provider.contains(it.providerId)) }
-        if (index >= 0) { updatingSpinners = true; modelSpinner.setSelection(index + 1); updateEfforts(false, result.string("reasoningEffort")); updatingSpinners = false }
+        val model = result.string("model").ifEmpty { thread.string("model") }
+        if (model.isEmpty()) return
+        val runtimeId = result.string("modelProvider").ifEmpty { thread.string("modelProvider") }
+        thread.put("model", model)
+        if (runtimeId.isNotEmpty()) thread.put("modelProvider", runtimeId)
+        showModelOptions(modelCatalog.providerId(runtimeId), model, result.string("reasoningEffort"))
     }
 
     private fun loadOlderTurns() {
@@ -1141,16 +1331,24 @@ internal class MainActivity : Activity() {
         if (!online || currentThreadId.isEmpty() || loading) return
         loading = true; updateControls()
         val id = currentThreadId
+        val currentOpen = openGeneration
+        val currentGeneration = generation
         val params = JSONObject().put("threadId", id).put("cursor", cursor).put("limit", 30).put("sortDirection", "desc").put("itemsView", "full")
         rpc("thread/turns/list", params) { page, error ->
+            if (!active(currentGeneration) || currentOpen != openGeneration) return@rpc
             loading = false
-            if (error != null || page == null || id != currentThreadId) { toast(error?.message); updateControls(); return@rpc }
+            if (error != null || page == null || id != currentThreadId || cursor != historyCursor) { toast(error?.message); updateControls(); return@rpc }
             val data = page.arrayAt("data"); val older = ArrayList<ChatMessage>()
             for (index in data.length() - 1 downTo 0) {
-                val turn = data.optJSONObject(index) ?: continue; val turnItems = turn.arrayAt("items")
-                for (itemIndex in 0 until turnItems.length()) turnItems.optJSONObject(itemIndex)?.let { older += ProtocolFormatter.fromItem(it) }
+                renderTurn(data.optJSONObject(index) ?: continue, older)
             }
-            adapter.prepend(older); historyCursor = if (page.isNull("nextCursor")) null else page.string("nextCursor").takeIf { it.isNotEmpty() }
+            val firstPosition = messageList.firstVisiblePosition
+            val firstTop = messageList.getChildAt(0)?.top ?: 0
+            val merged = TranscriptState.prepend(adapter.snapshot(), older)
+            adapter.replace(merged.messages)
+            historyMessageIds += merged.historyIds
+            messageList.setSelectionFromTop(firstPosition + merged.historyIds.size, firstTop)
+            historyCursor = if (page.isNull("nextCursor")) null else page.string("nextCursor").takeIf { it.isNotEmpty() }
             historyOlder = true; updateControls()
         }
     }
@@ -1182,13 +1380,8 @@ internal class MainActivity : Activity() {
                 val thread = result.optJSONObject("thread")
                 if (thread != null) {
                     if (thread.objectAt("status").string("type") == "active") readOnly = true
-                    if (!historyOlder) {
-                        running = false; activeTurnId = ""
-                        currentThread = thread; clearTranscript()
-                        val turns = thread.arrayAt("turns")
-                        for (index in 0 until turns.length()) renderTurn(turns.optJSONObject(index) ?: continue)
-                        if (readOnly) adapter.add(ChatMessage("readonly", MessageKind.STATUS, "", "此会话由桌面客户端管理，自动同步已保存的消息。"))
-                    }
+                    val cursor = result.optString("nextCursor").takeIf { !result.isNull("nextCursor") && it.isNotEmpty() }
+                    replaceLatestSnapshot(thread, cursor)
                     updateControls()
                 }
             }
@@ -1196,20 +1389,237 @@ internal class MainActivity : Activity() {
         }
     }
 
+    private fun replaceLatestSnapshot(thread: JSONObject, nextCursor: String?) {
+        val turns = thread.arrayAt("turns")
+        val previous = currentThread?.arrayAt("turns")
+        val oldest = turns.optJSONObject(0)?.string("id")?.takeIf { it.isNotEmpty() }
+        val boundary = if (previous == null || oldest == null) -1 else
+            (0 until previous.length()).indexOfFirst { previous.optJSONObject(it)?.string("id") == oldest }
+        if (boundary < 0) {
+            // A disjoint snapshot has a new cursor. Old pages can be loaded again.
+            historyOlder = false
+        } else if (boundary > 0 && previous != null) {
+            for (index in 0 until boundary) {
+                val turn = previous.optJSONObject(index) ?: continue
+                TurnRenderer.messages(turn, readOnly).mapTo(historyMessageIds) { it.id }
+            }
+            historyOlder = true
+        }
+        if (!historyOlder) historyCursor = nextCursor
+        currentThread = thread
+        latestTurn = turns.optJSONObject(turns.length() - 1)?.let(TurnProgress::from)
+        running = false; activeTurnId = ""
+        val latest = ArrayList<ChatMessage>()
+        for (index in 0 until turns.length()) {
+            val turn = turns.optJSONObject(index) ?: continue
+            if (!readOnly && turn.string("status") == "inProgress") {
+                running = true; activeTurnId = turn.string("id"); startedAt = System.currentTimeMillis()
+            }
+            renderTurn(turn, latest)
+        }
+        if (readOnly) latest += ChatMessage("readonly", MessageKind.STATUS, "", "此会话由桌面客户端管理，自动同步已保存的消息。")
+        val merged = TranscriptState.latest(adapter.snapshot(), historyMessageIds, latest, historyOlder)
+
+        items.clear(); deltaBuffers.clear(); dirtyDeltaIds.clear(); userMessages.clear()
+        for (index in 0 until turns.length()) {
+            val turn = turns.optJSONObject(index) ?: continue
+            userMessages.observeTurn(turn.string("id"))
+            val turnItems = turn.arrayAt("items")
+            for (itemIndex in 0 until turnItems.length()) {
+                val item = turnItems.optJSONObject(itemIndex) ?: continue
+                val itemId = item.string("id").ifEmpty { "${turn.string("id")}-${item.string("type")}" }
+                if (!item.has("id")) item.put("id", itemId)
+                if (item.string("type") == "commandExecution") item.put("aggregatedOutput", item.string("aggregatedOutput").bounded())
+                items[itemId] = item
+            }
+        }
+        historyMessageIds.clear(); historyMessageIds += merged.historyIds
+        adapter.replace(merged.messages)
+    }
+
     private fun attachmentDraftKey(): String = composerBinding.attachmentKey(::pathKey)
 
-    private fun pickAttachments() {
-        if (sending || loading || preparingAttachments || readOnly) return
+    private fun buildAttachmentChoices(): LinearLayout = Ui.column(this, false).apply {
+        visibility = View.GONE
+        fun addChoice(icon: String, label: String, action: () -> Unit) {
+            val choice = Ui.column(context).apply {
+                gravity = Gravity.CENTER
+                minimumHeight = Ui.dp(context, 72)
+                background = Ui.ripple(Ui.SURFACE_ALT, Ui.dp(context, 14).toFloat(), Ui.BORDER)
+                isFocusable = true
+                contentDescription = label
+                addView(IconView(context, icon, Ui.TEXT), LinearLayout.LayoutParams(Ui.dp(context, 24), Ui.dp(context, 24)))
+                addView(Ui.text(context, label, 13f), LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = Ui.dp(context, 4) })
+                setOnClickListener {
+                    showAttachmentChoices(false)
+                    action()
+                }
+            }
+            addView(choice, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                if (childCount != 0) marginStart = Ui.dp(context, 8)
+            })
+        }
+        addChoice("camera", "拍照", ::startAttachmentCamera)
+        addChoice("image", "相册") { pickAttachments(imagesOnly = true) }
+        addChoice("attach", "文件") { pickAttachments(imagesOnly = false) }
+    }
+
+    private fun toggleAttachmentChoices() {
+        if (attachmentChoices.visibility == View.VISIBLE) {
+            showAttachmentChoices(false)
+            return
+        }
+        if (sending || loading || preparingAttachments || readOnly || editingQueueDraft == composerBinding) return
         if (!online || !loaded) { toast("设备尚未连接或正在同步"); return }
         if (!info.has("attachments")) { toast("请更新本地 Agent 以支持文件和图片"); return }
+        showAttachmentChoices(true)
+    }
+
+    private fun showAttachmentChoices(show: Boolean) {
+        attachmentChoices.visibility = if (show) View.VISIBLE else View.GONE
+        (attachButton.getChildAt(0) as IconView).setIcon(if (show) "close" else "attach")
+        attachButton.contentDescription = if (show) "关闭附件选项" else "添加文件或图片"
+        updateBackHandling()
+    }
+
+    private fun pickAttachments(imagesOnly: Boolean) {
         attachmentPickerKey = attachmentDraftKey()
         try {
+            if (imagesOnly && Build.VERSION.SDK_INT >= 33) {
+                try {
+                    startActivityForResult(Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+                        type = "image/*"
+                        putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, 10)
+                    }, PICK_COMPOSER_ATTACHMENT)
+                    return
+                } catch (_: ActivityNotFoundException) {
+                    // Fall back to the document picker if the system photo picker is absent.
+                }
+            }
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = if (imagesOnly) "image/*" else "*/*"
                 putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }, 43)
-        } catch (_: Exception) { toast("无法打开文件选择器") }
+            }, PICK_COMPOSER_ATTACHMENT)
+        } catch (_: Exception) {
+            attachmentPickerKey = ""
+            toast(if (imagesOnly) "无法打开相册" else "无法打开文件选择器")
+        }
+    }
+
+    private fun startAttachmentCamera() {
+        attachmentPickerKey = attachmentDraftKey()
+        // QR scanning declares CAMERA, so the permission must also be granted for ACTION_IMAGE_CAPTURE.
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), CAPTURE_ATTACHMENT_PERMISSION)
+        } else {
+            takeAttachmentPhoto()
+        }
+    }
+
+    private var pendingAlbumSave: (() -> Unit)? = null
+
+    internal fun withAlbumPermission(save: () -> Unit) {
+        if (Build.VERSION.SDK_INT >= 29 || checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
+            save()
+        } else if (pendingAlbumSave == null) {
+            pendingAlbumSave = save
+            requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), ALBUM_WRITE_PERMISSION)
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == ALBUM_WRITE_PERMISSION) {
+            val save = pendingAlbumSave
+            pendingAlbumSave = null
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) save?.invoke()
+            else toast("保存到相册需要存储权限")
+            return
+        }
+        if (requestCode != CAPTURE_ATTACHMENT_PERMISSION || attachmentPickerKey.isEmpty()) return
+        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            takeAttachmentPhoto()
+        } else if (!shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)) {
+            showCameraPermissionSettings()
+        } else {
+            attachmentPickerKey = ""
+            toast("拍照需要相机权限，也可以改用相册或文件")
+        }
+    }
+
+    private fun showCameraPermissionSettings() {
+        styledDialog(AlertDialog.Builder(this)
+            .setTitle("相机权限已关闭")
+            .setMessage("系统不会再次弹出授权框。可在系统设置中允许相机；不授权也可以继续从相册或文件中添加。")
+            .setPositiveButton("去系统设置") { _, _ ->
+                try {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+                } catch (_: Exception) { toast("无法打开系统设置，请改用相册或文件") }
+            }
+            .setNeutralButton("选择相册") { _, _ -> pickAttachments(imagesOnly = true) }
+            .setNegativeButton("选择文件") { _, _ -> pickAttachments(imagesOnly = false) })
+    }
+
+    private fun takeAttachmentPhoto() {
+        var temporaryPhoto: File? = null
+        try {
+            val directory = File(cacheDir, "attachment-camera").apply { mkdirs() }
+            val photo = File.createTempFile("IMG_", ".jpg", directory)
+            temporaryPhoto = photo
+            attachmentCameraFile = photo.name
+            val uri = attachmentCameraUri(photo)
+            startActivityForResult(Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                putExtra(MediaStore.EXTRA_OUTPUT, uri)
+                clipData = ClipData.newRawUri("附件照片", uri)
+                addFlags(ATTACHMENT_CAMERA_URI_FLAGS)
+            }, PICK_COMPOSER_ATTACHMENT)
+        } catch (_: Exception) {
+            temporaryPhoto?.delete()
+            attachmentCameraFile = ""
+            attachmentPickerKey = ""
+            toast("无法打开相机")
+        }
+    }
+
+    private fun attachmentCameraUri(photo: File): Uri =
+        FileProvider.getUriForFile(this, "$packageName.attachment-camera", photo)
+
+    private fun receiveAttachments(resultCode: Int, data: Intent?) {
+        val key = attachmentPickerKey
+        attachmentPickerKey = ""
+        val photo = attachmentCameraFile.takeIf(String::isNotEmpty)?.let { File(cacheDir, "attachment-camera/$it") }
+        attachmentCameraFile = ""
+        val uris = mutableListOf<Uri>()
+        if (photo != null) {
+            val uri = attachmentCameraUri(photo)
+            revokeUriPermission(uri, ATTACHMENT_CAMERA_URI_FLAGS)
+            if (resultCode == RESULT_OK && photo.length() > 0) uris += uri
+            else if (resultCode == RESULT_OK) toast("相机没有返回照片")
+        } else if (resultCode == RESULT_OK) {
+            data?.clipData?.let { clips ->
+                for (index in 0 until clips.itemCount) clips.getItemAt(index).uri?.let(uris::add)
+            }
+            if (uris.isEmpty()) data?.data?.let(uris::add)
+        }
+        if (key.isEmpty() || uris.isEmpty()) {
+            photo?.delete()
+            return
+        }
+        preparingAttachments = true
+        renderAttachments()
+        updateControls()
+        attachmentStore.stage(key, uris) { error ->
+            photo?.delete()
+            if (isDestroyed) return@stage
+            preparingAttachments = false
+            renderAttachments()
+            updateControls()
+            toast(error)
+        }
     }
 
     private fun renderAttachments() {
@@ -1260,8 +1670,33 @@ internal class MainActivity : Activity() {
         if (key == attachmentDraftKey()) renderAttachments()
     }
 
+    private fun canContinueTurn(): Boolean {
+        if (currentThreadId.isEmpty() || readOnly || running || latestTurn?.canContinue != true) return false
+        if (composer.text.isNotBlank() || attachmentFiles.isNotEmpty() || preparingAttachments || editingQueueDraft == composerBinding) return false
+        val queue = messageQueues[currentThreadId]
+        return queue == null || (!queue.optBoolean("dispatching") &&
+            (queue.arrayAt("entries").length() == 0 || queue.optBoolean("paused")))
+    }
+
+    private fun continueTurn() {
+        if (!canContinueTurn() || !online || !loaded || sending || loading || currentThreadId in deletingThreads) return
+        val unresolved = outbox.matching(composerBinding, ::pathKey)
+        if (unresolved.isNotEmpty()) { showPendingSend(unresolved.last().id); return }
+        val text = "请从中断处继续完成上一项任务。先核对已完成的工作和当前状态，再处理剩余步骤。"
+        val pending = PendingSend(
+            UUID.randomUUID().toString(), currentAgent(), currentThreadId, currentCwd, text,
+            emptyList(), attachmentDraftKey(), false, "", System.currentTimeMillis(), continuation = true,
+        )
+        outbox.begin(pending); activePendingSendId = pending.id; persistOutbox()
+        sending = true; updateControls()
+        startTurn(text, creating = false, openGeneration, emptyList(), pending)
+    }
+
     private fun sendMessage(steer: Boolean) {
         if (currentThreadId in deletingThreads) { toast("正在删除此对话"); return }
+        if (editingQueueDraft == composerBinding) return
+        val unresolved = outbox.matching(composerBinding, ::pathKey)
+        if (unresolved.isNotEmpty()) { showPendingSend(unresolved.last().id); return }
         val submittedText = composer.text.toString()
         val text = submittedText.trim()
         val files = attachmentFiles.toList()
@@ -1272,109 +1707,147 @@ internal class MainActivity : Activity() {
         if (files.isNotEmpty() && !info.has("attachments")) { toast("请更新本地 Agent 以支持文件和图片"); return }
         val sender = client ?: return
         val key = attachmentDraftKey()
+        val pending = PendingSend(
+            UUID.randomUUID().toString(), currentAgent(), currentThreadId, currentCwd,
+            submittedText, files, key, steer, activeTurnId, System.currentTimeMillis(),
+        )
+        outbox.begin(pending); activePendingSendId = pending.id; persistOutbox()
         val currentGeneration = generation
         sending = true; updateControls()
         AttachmentUploader(attachmentStore, sender).upload(key, files, { progress ->
             if (active(currentGeneration)) attachmentStatus.text = progress
         }) { error ->
             if (!active(currentGeneration)) return@upload
-            if (error != null) { sending = false; renderAttachments(); updateControls(); toast(error.message); return@upload }
+            if (error != null) {
+                outbox.failed(pending.id, outcomeUnknown = false); activePendingSendId = ""; persistOutbox()
+                sending = false; renderAttachments(); updateControls(); toast(error.message); return@upload
+            }
             imageLoader.retain(files, attachmentStore) { cacheError ->
                 if (!active(currentGeneration)) return@retain
-                if (cacheError != null) { sending = false; renderAttachments(); updateControls(); toast(cacheError.message); return@retain }
+                if (cacheError != null) {
+                    outbox.failed(pending.id, outcomeUnknown = false); activePendingSendId = ""; persistOutbox()
+                    sending = false; renderAttachments(); updateControls(); toast(cacheError.message); return@retain
+                }
                 val remaining = ComposerText.afterSuccessfulSend(composer.text.toString(), submittedText)
                 if (remaining != composer.text.toString()) setComposerText(remaining)
                 saveDraft()
-                dispatchMessage(text, steer, files, key, submittedText)
+                dispatchMessage(text, steer, files, pending)
             }
         }
     }
 
-    private fun dispatchMessage(text: String, steer: Boolean, files: List<JSONObject>, attachmentKey: String, submittedText: String) {
+    private fun dispatchMessage(text: String, steer: Boolean, files: List<JSONObject>, pending: PendingSend) {
         val sendOpenGeneration = openGeneration
-        if (running) sendFollowup(text, steer, sendOpenGeneration, files, attachmentKey, submittedText)
+        if (running) sendFollowup(text, steer, sendOpenGeneration, files, pending)
         else if (currentThread == null) {
             val params = JSONObject().put("sandbox", store.sandbox).put("approvalPolicy", store.approvalPolicy)
             if (currentCwd.isNotEmpty()) params.put("cwd", currentCwd)
             selectedModel()?.let { params.put("model", it.model).put("codexrmProvider", it.providerId) }
             rpc("thread/start", params) { result, error ->
                 if (sendOpenGeneration != openGeneration) return@rpc
-                if (error != null || result == null) { failSend(submittedText, error?.message); return@rpc }
+                if (error != null || result == null) { failSend(pending, error); return@rpc }
                 currentThread = result.optJSONObject("thread"); currentThreadId = currentThread?.string("id").orEmpty()
-                if (currentThreadId.isEmpty()) { failSend(submittedText, "新会话响应无效"); return@rpc }
+                if (currentThreadId.isEmpty()) { failSend(pending, null, "新会话响应无效"); return@rpc }
                 currentCwd = currentThread?.string("cwd").ifNullOrEmpty(currentCwd)
                 val previousBinding = composerBinding
                 val pendingText = composer.text.toString()
-                rebindComposer(ComposerBinding(currentAgent(), currentThreadId, currentCwd))
-                setComposerText(pendingText)
-                saveDraft()
+                val newBinding = ComposerBinding(currentAgent(), currentThreadId, currentCwd)
+                rebindComposer(newBinding)
+                val newAttachmentKey = newBinding.attachmentKey(::pathKey)
+                if (pending.attachmentKey != newAttachmentKey) {
+                    val merged = LinkedHashMap<String, JSONObject>()
+                    (attachmentStore.load(newAttachmentKey) + attachmentStore.load(pending.attachmentKey)).forEach {
+                        merged[it.string("draftId").ifEmpty { it.string("path") }] = it
+                    }
+                    attachmentStore.save(newAttachmentKey, merged.values.toList())
+                    attachmentStore.save(pending.attachmentKey, emptyList())
+                }
+                val threadPending = outbox.threadStarted(pending.id, currentThreadId, currentCwd, newAttachmentKey)
+                    ?: pending.copy(threadId = currentThreadId, cwd = currentCwd, attachmentKey = newAttachmentKey)
+                persistOutbox()
+                setComposerText(pendingText); renderAttachments(); saveDraft()
                 val previousWorkspace = if (previousBinding.threadId.isEmpty()) pathKey(previousBinding.cwd) else null
                 store.saveDraft(previousBinding.agentId, previousBinding.threadId, "", previousWorkspace)
-                startTurn(text, creating = true, sendOpenGeneration, files, attachmentKey, submittedText)
+                updateControls()
+                startTurn(text, creating = true, sendOpenGeneration, files, threadPending)
             }
-        } else startTurn(text, creating = false, sendOpenGeneration, files, attachmentKey, submittedText)
+        } else startTurn(text, creating = false, sendOpenGeneration, files, pending)
     }
 
-    private fun startTurn(text: String, creating: Boolean, sendOpenGeneration: Int, files: List<JSONObject>, attachmentKey: String, submittedText: String) {
+    private fun startTurn(text: String, creating: Boolean, sendOpenGeneration: Int, files: List<JSONObject>, pending: PendingSend) {
         val optimisticId = "optimistic-${System.nanoTime()}"
         val input = ProtocolFormatter.input(text, files)
         userMessages.begin(optimisticId, input)
         adapter.add(ProtocolFormatter.fromItem(JSONObject().put("id", optimisticId).put("type", "userMessage").put("content", input)))
         val threadId = currentThreadId
+        val previousTurn = latestTurn
         rpc("turn/start", turnParams(threadId, text, files)) { result, error ->
-            sending = false
             if (sendOpenGeneration != openGeneration || currentThreadId != threadId) return@rpc
             if (error != null || result == null) {
                 userMessages.cancel(optimisticId); adapter.remove(optimisticId)
-                retainSentAttachments(attachmentKey, files); failSend(submittedText, error?.message); return@rpc
+                retainSentAttachments(pending.attachmentKey, files); failSend(pending, error); return@rpc
             }
-            finishSentAttachments(attachmentKey, files)
+            sending = false; activePendingSendId = ""; outbox.confirmed(pending.id); persistOutbox()
+            finishSentAttachments(pending.attachmentKey, files)
             val turn = result.optJSONObject("turn"); if (turn == null) { updateControls(); return@rpc }
-            activeTurnId = turn.string("id"); running = true; startedAt = System.currentTimeMillis()
-            reconcileUserMessage(optimisticId, activeTurnId)
+            val started = TurnProgress.from(turn)
+            if (latestTurn == previousTurn) {
+                latestTurn = started
+                activeTurnId = started.id
+                running = started.status == "inProgress"
+                startedAt = System.currentTimeMillis()
+            }
+            reconcileUserMessage(optimisticId, started.id)
             val turnItems = turn.arrayAt("items")
             for (index in 0 until turnItems.length()) {
                 val item = turnItems.optJSONObject(index) ?: continue
-                upsertItem(activeTurnId, item, immediate = true)
+                upsertItem(started.id, item, immediate = true)
             }
             if (creating) rpc("thread/name/set", JSONObject().put("threadId", threadId).put("name", text.ifEmpty { files.firstOrNull()?.string("name").orEmpty() }.lineSequence().first().take(40))) { _, _ -> }
             updateControls()
         }
     }
 
-    private fun sendFollowup(text: String, steer: Boolean, sendOpenGeneration: Int, files: List<JSONObject>, attachmentKey: String, submittedText: String) {
+    private fun sendFollowup(text: String, steer: Boolean, sendOpenGeneration: Int, files: List<JSONObject>, pending: PendingSend) {
         val threadId = currentThreadId; val optimisticId = "steer-${System.nanoTime()}"
         if (steer) {
-            val turnId = activeTurnId
+            val turnId = pending.expectedTurnId
             val input = ProtocolFormatter.input(text, files)
             userMessages.begin(optimisticId, input, turnId)
             adapter.add(ProtocolFormatter.fromItem(JSONObject().put("id", optimisticId).put("type", "userMessage").put("content", input)))
             val params = JSONObject().put("threadId", threadId).put("expectedTurnId", turnId).put("input", input)
             rpc("turn/steer", params) { result, error ->
-                sending = false
                 if (sendOpenGeneration != openGeneration) return@rpc
                 if (error != null) {
                     userMessages.cancel(optimisticId); adapter.remove(optimisticId)
-                    retainSentAttachments(attachmentKey, files); failSend(submittedText, error.message)
+                    retainSentAttachments(pending.attachmentKey, files); failSend(pending, error)
                 } else {
+                    sending = false; activePendingSendId = ""; outbox.confirmed(pending.id); persistOutbox()
                     reconcileUserMessage(optimisticId, result?.string("turnId").ifNullOrEmpty(turnId))
-                    finishSentAttachments(attachmentKey, files); toast("补充指令已发送"); updateControls()
+                    finishSentAttachments(pending.attachmentKey, files); toast("补充指令已发送"); updateControls()
                 }
             }
         } else rpc("codexrm/queue/add", turnParams(threadId, text, files)) { result, error ->
-            sending = false
             if (sendOpenGeneration != openGeneration) return@rpc
-            if (error != null) { retainSentAttachments(attachmentKey, files); failSend(submittedText, error.message) }
-            else { finishSentAttachments(attachmentKey, files); result?.let(::acceptMessageQueue); toast("消息已排队"); updateControls() }
+            if (error != null) { retainSentAttachments(pending.attachmentKey, files); failSend(pending, error) }
+            else {
+                sending = false; activePendingSendId = ""; outbox.confirmed(pending.id); persistOutbox()
+                finishSentAttachments(pending.attachmentKey, files); result?.let(::acceptMessageQueue); toast("消息已排队"); updateControls()
+            }
         }
     }
 
-    private fun failSend(submittedText: String, message: String?) {
-        sending = false
-        val restored = ComposerText.afterFailedSend(composer.text.toString(), submittedText)
-        if (restored != composer.text.toString()) setComposerText(restored)
-        saveDraft()
-        updateControls(); toast(message.ifNullOrEmpty("消息发送失败"))
+    private fun failSend(pending: PendingSend, error: Exception?, fallback: String = "消息发送失败") {
+        val unknown = error is RpcOutcomeUnknown
+        sending = false; activePendingSendId = ""
+        outbox.failed(pending.id, unknown); persistOutbox()
+        if (!pending.continuation) {
+            val restored = ComposerText.afterFailedSend(composer.text.toString(), pending.submittedText)
+            if (restored != composer.text.toString()) setComposerText(restored)
+            saveDraft()
+        }
+        updateControls()
+        toast(if (unknown) "发送状态未确认，内容已保留。请先核对会话历史；不会自动重发。" else error?.message ?: fallback)
     }
 
     private fun turnParams(threadId: String, text: String, files: List<JSONObject> = emptyList()): JSONObject {
@@ -1396,7 +1869,9 @@ internal class MainActivity : Activity() {
     private fun handleRpcEvent(message: JSONObject) {
         if (message.has("id")) {
             val key = requestKey(message.opt("id"))
-            if (!requests.containsKey(key)) requests[key] = message
+            val params = message.objectAt("params")
+            requests[key] = message
+            requestScopes[key] = ApprovalScope(currentAgent(), params.string("threadId"), params.string("turnId"))
             renderApproval(); return
         }
         val method = message.string("method"); val params = message.objectAt("params")
@@ -1420,7 +1895,9 @@ internal class MainActivity : Activity() {
             }
             "codexrm/queue/updated" -> { acceptMessageQueue(params); return }
             "codexrm/request/resolved", "serverRequest/resolved" -> {
-                val id = params.opt("id") ?: params.opt("requestId"); if (id != null) { requests.remove(requestKey(id)); responding.remove(requestKey(id)) }
+                val id = params.opt("id") ?: params.opt("requestId"); if (id != null) {
+                    val key = requestKey(id); requests.remove(key); requestScopes.remove(key); responding.remove(key)
+                }
                 renderApproval(); return
             }
             "codexrm/request/failed" -> {
@@ -1439,7 +1916,10 @@ internal class MainActivity : Activity() {
         val turn = params.optJSONObject("turn")
         val threadId = params.string("threadId").ifEmpty { turn?.string("threadId").orEmpty() }
         if (method == "turn/started" || method == "turn/completed") {
-            threads = threads.map { if (it.id == threadId) it.copy(active = method == "turn/started") else it }
+            val updatedAt = System.currentTimeMillis() / 1000
+            threads = threads.map {
+                if (it.id == threadId) it.copy(active = method == "turn/started", updatedAt = updatedAt) else it
+            }
             renderWorkspaces()
         }
         if (method == "turn/completed" && turn != null) {
@@ -1448,20 +1928,27 @@ internal class MainActivity : Activity() {
                 val entry = iterator.next(); val p = entry.value.objectAt("params")
                 val nonBlockingQuestion = entry.value.string("method") == "item/tool/requestUserInput" && !p.optBoolean("isBlocking", true)
                 if (p.string("threadId") == threadId && p.string("turnId") == turn.string("id") &&
-                    (!nonBlockingQuestion || turn.string("status") != "completed")) { responding.remove(entry.key); iterator.remove() }
+                    (!nonBlockingQuestion || turn.string("status") != "completed")) {
+                    responding.remove(entry.key); requestScopes.remove(entry.key); iterator.remove()
+                }
             }
             renderApproval()
         }
         if (threadId.isNotEmpty() && threadId != currentThreadId) return
         when (method) {
             "turn/started" -> if (turn != null) {
+                latestTurn = TurnProgress.from(turn)
                 activeTurnId = turn.string("id"); running = true; startedAt = System.currentTimeMillis()
                 userMessages.started(activeTurnId)
                 val turnItems = turn.arrayAt("items"); for (index in 0 until turnItems.length()) turnItems.optJSONObject(index)?.let { upsertItem(turn.string("id"), it) }
                 updateControls(); handler.removeCallbacks(elapsedTicker); handler.post(elapsedTicker)
             }
             "turn/completed" -> if (turn != null) {
-                running = false; handler.removeCallbacks(elapsedTicker)
+                val finished = TurnProgress.from(turn)
+                if (!running || activeTurnId == finished.id) {
+                    latestTurn = finished
+                    running = false; handler.removeCallbacks(elapsedTicker)
+                }
                 val turnItems = turn.arrayAt("items"); for (index in 0 until turnItems.length()) turnItems.optJSONObject(index)?.let { upsertItem(turn.string("id"), it) }
                 turn.optJSONObject("error")?.let { adapter.add(ChatMessage("error-${turn.string("id")}", MessageKind.ERROR, "错误", it.string("message"))) }
                 if (turn.string("status") == "interrupted") adapter.add(ChatMessage("stopped-${turn.string("id")}", MessageKind.STATUS, "", "任务已停止"))
@@ -1474,7 +1961,13 @@ internal class MainActivity : Activity() {
             "turn/plan/updated" -> upsertItem(params.string("turnId"), JSONObject().put("id", "plan-${params.string("turnId")}").put("type", "plan").put("text", params.string("explanation")).put("plan", params.arrayAt("plan")))
             "turn/diff/updated" -> upsertItem(params.string("turnId"), JSONObject().put("id", "diff-${params.string("turnId")}").put("type", "diff").put("diff", params.string("diff")))
             "error" -> {
-                running = params.optBoolean("willRetry")
+                val turnId = params.string("turnId")
+                if (threadId == currentThreadId && turnId.isNotEmpty() && !params.optBoolean("willRetry") &&
+                    (latestTurn == null || latestTurn?.id == turnId)) {
+                    latestTurn = TurnProgress(turnId, "failed")
+                    running = false
+                    handler.removeCallbacks(elapsedTicker)
+                }
                 val error = params.optJSONObject("error")
                 adapter.add(ChatMessage("error-${System.nanoTime()}", MessageKind.ERROR, "Codex 错误", error?.string("message").ifNullOrEmpty("Codex 发生错误")))
                 scheduleRender(); updateControls()
@@ -1569,33 +2062,89 @@ internal class MainActivity : Activity() {
         for (index in 0 until entries.length()) {
             val entry = entries.optJSONObject(index) ?: continue
             val row = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL }
-            val text = ProtocolFormatter.userText(JSONObject().put("content", entry.arrayAt("input")))
+            val id = entry.string("id")
+            val input = entry.arrayAt("input")
+            val item = JSONObject().put("content", input)
+            val text = ProtocolFormatter.userText(item).ifBlank {
+                MessageImages.fromItem(item).joinToString("\n") { "📎 ${it.name}" }
+            }
             row.addView(Ui.text(this, "${index + 1}. $text", 12f).apply { maxLines = 3 }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            row.addView(Ui.button(this, if (queue.optBoolean("dispatching") && index == 0) "发送中…" else "取消") { changeMessageQueue("remove", entry.string("id")) })
+            val dispatching = queue.optBoolean("dispatching") && index == 0
+            val removable = id.isNotEmpty() && !dispatching && id !in pendingQueueRemovals
+            row.addView(Ui.button(this, if (dispatching) "发送中…" else "取消并编辑") {
+                val draft = QueuedComposerDraft.fromInput(input)
+                if (draft == null) toast("这条待发送消息包含当前输入框无法编辑的内容")
+                else changeMessageQueue("remove", id, draft)
+            }.apply { isEnabled = removable && editingQueueDraft == null; alpha = if (isEnabled) 1f else .4f })
+            row.addView(Ui.iconButton(this, "close", "删除第 ${index + 1} 条待发送消息") {
+                changeMessageQueue("remove", id)
+            }.apply { isEnabled = removable; alpha = if (isEnabled) 1f else .4f })
             card.addView(row, matchWidth(top = 6))
         }
         queue.string("error").takeIf { it.isNotEmpty() }?.let { card.addView(Ui.text(this, it, 11f, Ui.MUTED), matchWidth(top = 6)) }
         queueArea.addView(card, matchWidth(bottom = 10))
     }
 
-    private fun changeMessageQueue(action: String, id: String = "") {
-        if (sending || loading || readOnly || currentThreadId.isEmpty()) return
-        val params = JSONObject().put("threadId", currentThreadId); if (id.isNotEmpty()) params.put("id", id)
-        rpc("codexrm/queue/$action", params) { result, error -> if (result != null) acceptMessageQueue(result) else toast(error?.message) }
+    private fun changeMessageQueue(action: String, id: String = "", draft: QueuedComposerDraft? = null) {
+        val threadId = currentThreadId
+        if (!online || sending || loading || readOnly || threadId.isEmpty()) return
+        val binding = composerBinding
+        if (draft != null && (preparingAttachments || editingQueueDraft != null || binding.threadId != threadId)) return
+        val requestClient = client ?: return
+        if (id.isNotEmpty() && !pendingQueueRemovals.add(id)) return
+        if (draft != null) editingQueueDraft = binding
+        if (id.isNotEmpty()) { renderQueue(); updateSendState() }
+
+        val params = JSONObject().put("threadId", threadId)
+        if (id.isNotEmpty()) params.put("id", id)
+        requestClient.request("codexrm/queue/$action", params) { result, error ->
+            pendingQueueRemovals.remove(id)
+            if (draft != null) editingQueueDraft = null
+            if (result != null && draft != null) restoreQueuedDraft(binding, draft)
+            if (requestClient === client && result != null) acceptMessageQueue(result)
+            if (requestClient === client && result == null) {
+                toast(error?.message)
+                if (currentThreadId == threadId && id.isNotEmpty()) loadMessageQueue(threadId)
+            }
+            if (id.isNotEmpty()) { renderQueue(); updateSendState() }
+        }
+    }
+
+    private fun restoreQueuedDraft(binding: ComposerBinding, draft: QueuedComposerDraft) {
+        val visible = mainVisible && mainBuilt && composerBinding == binding
+        val existingText = if (visible) composer.text.toString() else store.draft(binding.agentId, binding.threadId)
+        val text = draft.appendTo(existingText)
+        if (draft.files.isNotEmpty()) {
+            val key = binding.attachmentKey(::pathKey)
+            val restored = draft.files.map { it.put("draftId", UUID.randomUUID().toString()) }
+            attachmentStore.save(key, attachmentStore.load(key) + restored)
+        }
+        store.saveDraft(binding.agentId, binding.threadId, text)
+        if (!visible) return
+
+        composerEditVersion++
+        setComposerText(text)
+        composer.setSelection(composer.length())
+        renderAttachments()
+        if (composer.requestFocus()) getSystemService(InputMethodManager::class.java)?.showSoftInput(composer, InputMethodManager.SHOW_IMPLICIT)
     }
 
     private fun renderApproval() {
         if (!mainBuilt) return
         approvalArea.removeAllViews()
-        val visible = requests.values.filter { message ->
-            val threadId = message.objectAt("params").string("threadId")
-            currentThreadId.isEmpty() || threadId.isEmpty() || threadId == currentThreadId
+        val visible = requests.keys.mapNotNull { key ->
+            if (ApprovalFilter.visible(requestScopes[key], currentAgent(), currentThreadId, activeTurnId)) requests[key] else null
         }
-        approvalScroll.visibility = if (visible.isEmpty()) View.GONE else View.VISIBLE
-        if (visible.isEmpty()) return
+        approvalScroll.visibility = if (visible.isEmpty() && approvalRecoveryMessage.isEmpty()) View.GONE else View.VISIBLE
+        if (approvalRecoveryMessage.isNotEmpty()) {
+            approvalArea.addView(Ui.text(this, approvalRecoveryMessage, 11f, Ui.MUTED).apply {
+                setPadding(Ui.dp(context, 8), Ui.dp(context, 6), Ui.dp(context, 8), Ui.dp(context, 6))
+            }, matchWidth())
+        }
         val permissions = visible.filter(::isPermission)
-        if (permissions.size > 1) {
-            val batch = Ui.column(this, false)
+        val permissionScopes = permissions.map { requestScopes[requestKey(it.opt("id"))] ?: ApprovalScope("", "", "") }
+        if (ApprovalFilter.canBatch(permissionScopes)) {
+            val batch = Ui.column(this)
             batch.addView(Ui.button(this, "全部允许 (${permissions.size})", primary = true) { permissions.forEach { answerPermission(it, "accept") } })
             batch.addView(Ui.button(this, "全部拒绝") { permissions.forEach { answerPermission(it, "decline") } })
             approvalArea.addView(batch, matchWidth())
@@ -1608,7 +2157,7 @@ internal class MainActivity : Activity() {
             }
             card.addView(Ui.text(this, ProtocolFormatter.requestTitle(message), 13f, bold = true))
             card.addView(Ui.text(this, ProtocolFormatter.requestDetails(message), 12f, Ui.MUTED).apply { maxLines = 7; ellipsize = android.text.TextUtils.TruncateAt.END }, matchWidth(top = 7))
-            val actions = Ui.column(this, false)
+            val actions = Ui.column(this)
             if (permission) {
                 actions.addView(Ui.button(this, "允许一次", primary = true) { answerPermission(message, "accept") })
                 actions.addView(Ui.button(this, "本次会话允许") { answerPermission(message, "acceptForSession") })
@@ -1620,7 +2169,7 @@ internal class MainActivity : Activity() {
                 actions.addView(Ui.button(this, "返回结果", primary = true) { if (!busy) showRawResponse(message) })
                 actions.addView(Ui.button(this, "取消") { respondError(message) })
             }
-            for (index in 0 until actions.childCount) actions.getChildAt(index).isEnabled = !busy
+            for (index in 0 until actions.childCount) actions.getChildAt(index).isEnabled = !busy && online && loaded
             card.addView(actions, matchWidth(top = 10))
             approvalArea.addView(card, matchWidth(bottom = 12))
         }
@@ -1628,6 +2177,9 @@ internal class MainActivity : Activity() {
 
     private fun answerPermission(message: JSONObject, decision: String) {
         val key = requestKey(message.opt("id")); if (responding.contains(key)) return
+        if (!ApprovalFilter.visible(requestScopes[key], currentAgent(), currentThreadId, activeTurnId)) {
+            toast("该审批不属于当前会话或轮次，已阻止操作"); renderApproval(); return
+        }
         val id = message.opt("id") ?: return
         if (client?.respond(id, ProtocolFormatter.permissionResult(message, decision)) == true) { responding.add(key); renderApproval() }
     }
@@ -1669,16 +2221,20 @@ internal class MainActivity : Activity() {
 
     private fun respondResult(message: JSONObject, result: Any) {
         val id = message.opt("id") ?: return; val key = requestKey(id)
+        if (!ApprovalFilter.visible(requestScopes[key], currentAgent(), currentThreadId, activeTurnId)) return
         if (client?.respond(id, result) == true) { responding.add(key); renderApproval() }
     }
     private fun respondError(message: JSONObject) {
         val id = message.opt("id") ?: return; val key = requestKey(id)
+        if (!ApprovalFilter.visible(requestScopes[key], currentAgent(), currentThreadId, activeTurnId)) return
         if (client?.respondError(id, "User cancelled remote interaction") == true) { responding.add(key); renderApproval() }
     }
     private fun isPermission(message: JSONObject): Boolean = message.string("method") in setOf("item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval")
 
     private fun toggleDevices() {
         devicesExpanded = !devicesExpanded
+        updateBackHandling()
+        deviceDropdown.animate().cancel()
         renderDevices()
         if (devicesExpanded) {
             deviceDropdown.alpha = 0f
@@ -1701,8 +2257,6 @@ internal class MainActivity : Activity() {
         sidebarDeviceButton.isSelected = devicesExpanded
         sidebarDeviceChevron.rotation = if (devicesExpanded) 180f else 0f
         deviceDropdown.visibility = if (devicesExpanded) View.VISIBLE else View.GONE
-        deviceDropdown.alpha = 1f
-        deviceDropdown.translationY = 0f
         deviceListScroll.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             if (devicesExpanded) min(Ui.dp(this, 56) * devices.size, Ui.dp(this, 224)) else 0,
@@ -1719,7 +2273,7 @@ internal class MainActivity : Activity() {
     private fun selectDevice(item: Device, closeSidebarAfter: Boolean) {
         devicePopup?.dismiss()
         devicesExpanded = false
-        if (closeSidebarAfter) closeSidebar()
+        if (closeSidebarAfter) closeSidebar() else updateBackHandling()
         if (item.agentId == device?.agentId) {
             renderDevices()
             return
@@ -1792,17 +2346,22 @@ internal class MainActivity : Activity() {
         }
         var shown = 0
         groups.values.sortedWith(compareByDescending<WorkspaceGroup> { group ->
-            group.threads.maxOfOrNull { it.updatedAt } ?: 0L
+            group.threads.maxOfOrNull { it.lastActivityAt } ?: 0L
         }.thenBy { it.path }).forEach { group ->
-            group.threads.sortWith(compareByDescending<ThreadSummary> { it.updatedAt }.thenByDescending { it.createdAt }.thenBy { it.id })
+            group.threads.sortWith(
+                compareByDescending<ThreadSummary> { it.lastActivityAt }.thenByDescending { it.createdAt }.thenByDescending { it.id }
+            )
             val matching = group.threads.filter { query.isEmpty() || "${it.title} ${it.cwd}".lowercase().contains(query) }
             if (query.isNotEmpty() && matching.isEmpty()) return@forEach
             shown++
-            val expanded = query.isNotEmpty() || !collapsedPaths.contains(pathKey(group.path))
+            val key = pathKey(group.path)
+            val expanded = query.isNotEmpty() || key !in collapsedPaths
             val heading = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL; background = Ui.ripple(if (expanded) Ui.SURFACE else Color.TRANSPARENT, Ui.dp(context, 7).toFloat()) }
             val toggle = Ui.column(this, false).apply {
                 gravity = Gravity.CENTER_VERTICAL; setOnClickListener {
-                    val key = pathKey(group.path); if (!collapsedPaths.add(key)) collapsedPaths.remove(key); store.saveCollapsed(currentAgent(), collapsedPaths); renderWorkspaces()
+                    if (!collapsedPaths.add(key)) collapsedPaths.remove(key)
+                    store.saveCollapsed(currentAgent(), collapsedPaths)
+                    renderWorkspaces()
                 }
                 setOnLongClickListener { openWorkspaceFiles(group.path, group.threads.firstOrNull()?.id.orEmpty()) }
                 addView(IconView(context, if (expanded) "chevron" else "right", Ui.MUTED), LinearLayout.LayoutParams(Ui.dp(context, 16), Ui.dp(context, 16)))
@@ -1817,7 +2376,11 @@ internal class MainActivity : Activity() {
             workspaceRows.addView(heading, matchWidth())
             if (expanded) {
                 val history = Ui.column(this).apply { setPadding(Ui.dp(context, 17), 0, 0, Ui.dp(context, 10)) }
-                matching.forEach { thread ->
+                val folder = currentAgent() to key
+                val canShowOlder = query.isEmpty() && matching.size > WORKSPACE_THREAD_FOLD_THRESHOLD
+                val showOlder = canShowOlder && folder in expandedWorkspaceThreads
+                val visibleThreads = if (canShowOlder && !showOlder) matching.take(WORKSPACE_RECENT_THREAD_LIMIT) else matching
+                visibleThreads.forEachIndexed { index, thread ->
                     val row = Ui.column(this, false).apply {
                         gravity = Gravity.CENTER_VERTICAL; background = Ui.ripple(if (thread.id == currentThreadId) Ui.SURFACE else Color.TRANSPARENT, Ui.dp(context, 7).toFloat())
                         isFocusable = true
@@ -1826,13 +2389,26 @@ internal class MainActivity : Activity() {
                     }
                     row.addView(Ui.text(this, thread.title, 12f, if (thread.id == currentThreadId) Ui.TEXT else Ui.MUTED).apply {
                         maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; setPadding(Ui.dp(context, 12), 0, 0, 0)
-                    }, LinearLayout.LayoutParams(0, Ui.dp(this, 42), 1f))
+                    }, LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1f))
                     if (thread.active) row.addView(ProgressBar(this, null, android.R.attr.progressBarStyleSmall).apply {
                         isIndeterminate = true
                         indeterminateTintList = android.content.res.ColorStateList.valueOf(Ui.GREEN)
                         contentDescription = "进行中"
                     }, LinearLayout.LayoutParams(Ui.dp(this, 14), Ui.dp(this, 14)).apply { rightMargin = Ui.dp(this@MainActivity, 10) })
                     history.addView(row, matchWidth())
+                    if (canShowOlder && index + 1 == WORKSPACE_RECENT_THREAD_LIMIT) {
+                        val olderCount = matching.size - WORKSPACE_RECENT_THREAD_LIMIT
+                        val label = if (showOlder) "收起旧对话" else "展开其余 $olderCount 条对话"
+                        val older = Ui.button(this, label) {
+                            if (showOlder) expandedWorkspaceThreads.remove(folder) else expandedWorkspaceThreads.add(folder)
+                            renderWorkspaces()
+                        }.apply {
+                            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                            setTextColor(Ui.MUTED)
+                            background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 7).toFloat())
+                        }
+                        history.addView(older, matchWidth())
+                    }
                 }
                 if (matching.isEmpty()) history.addView(Ui.text(this, "还没有会话", 11f, Ui.DIM).apply { setPadding(Ui.dp(context, 12), 0, 0, 0) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 36)))
                 workspaceRows.addView(history, matchWidth())
@@ -1841,7 +2417,7 @@ internal class MainActivity : Activity() {
         if (shown == 0) workspaceRows.addView(Ui.text(this, if (query.isNotEmpty()) "没有匹配的会话" else if (online) "还没有会话，从一个新任务开始" else "连接设备后，会话会出现在这里", 11f, Ui.DIM).apply { setPadding(Ui.dp(context, 10), 0, 0, 0) })
         if (threadCursor != null && !threadListLoading) workspaceRows.addView(Ui.text(this, "加载更多会话", 11f, Ui.MUTED).apply {
             gravity = Gravity.CENTER; setOnClickListener { loadThreads(generation, threadCursor, threads) }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 42)))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 48)))
     }
 
     private data class WorkspaceGroup(val name: String, val path: String, val pinned: Boolean, val threads: MutableList<ThreadSummary> = mutableListOf())
@@ -1961,6 +2537,61 @@ internal class MainActivity : Activity() {
         popup.showAsDropDown(deviceButton, deviceButton.width - width, Ui.dp(this, 6))
     }
 
+    private fun showAppMenu(anchor: View) {
+        PopupMenu(this, anchor).apply {
+            menu.add(0, 1, 0, "关于")
+            menu.add(0, 2, 1, "检查更新")
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    1 -> showAbout()
+                    2 -> checkForUpdates()
+                    else -> return@setOnMenuItemClickListener false
+                }
+                true
+            }
+            show()
+        }
+    }
+
+    private fun showAbout() {
+        val content = Ui.column(this).apply {
+            setPadding(Ui.dp(context, 24), Ui.dp(context, 8), Ui.dp(context, 24), Ui.dp(context, 16))
+        }
+        val version = UpdateChecker.currentVersionName(this)
+        val code = UpdateChecker.currentVersionCode(this)
+        content.addView(Ui.text(this, "已安装 v$version ($code)", 12f, Ui.MUTED))
+        content.addView(Ui.text(this, "版本更新日志", 14f, bold = true), matchWidth(top = 16))
+        val history = Ui.column(this)
+        content.addView(history, matchWidth(top = 8))
+        val scroll = ScrollView(this).apply { addView(content) }
+        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("关于 CodexRM").setView(scroll).setPositiveButton("关闭", null))
+        var historyCall: Call? = null
+
+        fun loadHistory() {
+            history.removeAllViews()
+            history.addView(Ui.text(this, "正在读取更新日志…", 12f, Ui.MUTED))
+            historyCall = UpdateChecker.fetchHistory { releases, error ->
+                if (!dialog.isShowing || isFinishing || isDestroyed) return@fetchHistory
+                history.removeAllViews()
+                if (error != null || releases == null) {
+                    history.addView(Ui.text(this, "无法读取更新日志", 12f, Ui.MUTED))
+                    history.addView(Ui.button(this, "重试") { loadHistory() }, matchWidth(top = 8))
+                } else if (releases.isEmpty()) {
+                    history.addView(Ui.text(this, "暂无 Android 更新记录", 12f, Ui.MUTED))
+                } else {
+                    for (release in releases) {
+                        val title = listOf("v${release.versionName}", release.date).filter(String::isNotEmpty).joinToString(" · ")
+                        history.addView(Ui.text(this, title, 13f, bold = true), matchWidth(top = 12))
+                        history.addView(Ui.text(this, release.notes.ifEmpty { "未提供改动说明" }, 12f, Ui.MUTED), matchWidth(top = 4))
+                    }
+                }
+            }
+        }
+
+        dialog.setOnDismissListener { historyCall?.cancel() }
+        loadHistory()
+    }
+
     private fun showSettings() {
         closeSidebar(); val column = Ui.column(this).apply { setPadding(Ui.dp(context, 22), 0, Ui.dp(context, 22), Ui.dp(context, 12)) }
         column.addView(Ui.text(this, "在左侧“工作区”添加或切换文件夹。同一台设备可以管理多个目录。", 11f, Ui.DIM))
@@ -1985,11 +2616,6 @@ internal class MainActivity : Activity() {
         if (info.optBoolean("desktopControl")) column.addView(Ui.button(this, "关闭 Codex 桌面客户端") {
             rpc("codexrm/desktop/close") { result, error -> toast(result?.string("message") ?: error?.message) }
         }, matchWidth(top = 10))
-        column.addView(Ui.text(this, "CodexRM Android ${UpdateChecker.currentVersionName(this)} (${UpdateChecker.currentVersionCode(this)})", 11f, Ui.MUTED), matchWidth(top = 16))
-        column.addView(Ui.button(this, "检查更新") {
-            dialog.dismiss()
-            checkForUpdates()
-        }, matchWidth(top = 8))
         if (current != null) column.addView(Ui.text(this, "解除当前设备配对", 12f, Ui.DANGER).apply {
             gravity = Gravity.CENTER; background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 7).toFloat(), Ui.BORDER)
             setOnClickListener { dialog.dismiss(); confirmDeleteDevice(current) }
@@ -2006,8 +2632,17 @@ internal class MainActivity : Activity() {
     }
 
     private fun requestAgentUpdate() {
+        val current = device ?: return
+        val connection = client ?: return
+        if (!online || !info.optBoolean("remoteUpdate")) { toast("电脑 Agent 离线或不支持远程更新"); return }
         val requestGeneration = generation
-        val agentId = currentAgent()
+        // Save before sending since a restart can interrupt the update response.
+        val previousPending = current.pendingAgentUpdateFrom
+        val versionBeforeUpdate = previousPending.ifBlank { current.appVersion.ifBlank { info.string("version") } }
+        if (versionBeforeUpdate != previousPending) {
+            current.pendingAgentUpdateFrom = versionBeforeUpdate
+            store.save(devices)
+        }
         val spinner = ProgressBar(this).apply { isIndeterminate = true }
         val column = Ui.column(this).apply {
             setPadding(Ui.dp(context, 24), Ui.dp(context, 4), Ui.dp(context, 24), Ui.dp(context, 8))
@@ -2017,10 +2652,22 @@ internal class MainActivity : Activity() {
         }
         val dialog = styledDialog(AlertDialog.Builder(this).setTitle("更新电脑 Agent").setView(column))
         dialog.setCancelable(false)
-        client?.request("codexrm/update", timeoutMs = 600_000) { result, error ->
+        connection.request("codexrm/update", timeoutMs = 600_000) { result, error ->
             dialog.dismiss()
-            if (generation != requestGeneration || currentAgent() != agentId) return@request
+            if (device !== current || current.pendingAgentUpdateFrom != versionBeforeUpdate) return@request
+            val pending = when {
+                error is RpcOutcomeUnknown -> versionBeforeUpdate
+                error != null || result == null -> previousPending
+                !result.optBoolean("updateAvailable") -> ""
+                else -> versionBeforeUpdate
+            }
+            if (pending != current.pendingAgentUpdateFrom) {
+                current.pendingAgentUpdateFrom = pending
+                store.save(devices)
+            }
+            if (generation != requestGeneration || !online) return@request
             when {
+                error is RpcOutcomeUnknown -> toast("更新结果待确认，重连后将检查版本")
                 error != null || result == null -> styledDialog(AlertDialog.Builder(this)
                     .setTitle("电脑 Agent 更新")
                     .setMessage(error?.message ?: "更新请求失败")
@@ -2029,13 +2676,33 @@ internal class MainActivity : Activity() {
                 result.optBoolean("updatePending") -> toast("更新已校验，将在当前任务和排队消息结束后自动安装")
                 else -> toast("更新已校验，电脑 Agent 将重启完成安装")
             }
-        } ?: dialog.dismiss()
+        }
+    }
+
+    private fun checkForUpdatesOnStartup() {
+        val operation = updateOperation
+        updateCall = UpdateChecker.fetchLatest { latest, error ->
+            if (operation != updateOperation || isFinishing || isDestroyed) return@fetchLatest
+            updateCall = null
+            if (error != null || latest == null || latest.versionCode <= UpdateChecker.currentVersionCode(this)) {
+                return@fetchLatest
+            }
+            startupUpdate = latest
+            showStartupUpdateIfReady()
+        }
+    }
+
+    private fun showStartupUpdateIfReady() {
+        val latest = startupUpdate ?: return
+        // Wait for the main window to regain focus if another dialog or activity is open.
+        if (!resumed || !hasWindowFocus() || isFinishing || isDestroyed) return
+        startupUpdate = null
+        showUpdateAvailable(latest)
     }
 
     private fun checkForUpdates() {
-        val operation = ++updateOperation
-        updateCall?.cancel()
-        updateDialog?.dismiss()
+        cancelUpdateOperation()
+        val operation = updateOperation
         val spinner = ProgressBar(this).apply { isIndeterminate = true }
         val column = Ui.column(this).apply {
             setPadding(Ui.dp(context, 24), Ui.dp(context, 4), Ui.dp(context, 24), Ui.dp(context, 8))
@@ -2072,8 +2739,11 @@ internal class MainActivity : Activity() {
 
     private fun cancelUpdateOperation() {
         updateOperation++
+        startupUpdate = null
         updateCall?.cancel()
         updateCall = null
+        updateFailureReceiver?.let { unregisterReceiver(it) }
+        updateFailureReceiver = null
         updateDialog?.dismiss()
         updateDialog = null
     }
@@ -2124,9 +2794,8 @@ internal class MainActivity : Activity() {
             showUpdateAvailable(info)
             return
         }
-        val operation = ++updateOperation
-        updateCall?.cancel()
-        updateDialog?.dismiss()
+        cancelUpdateOperation()
+        val operation = updateOperation
         val status = Ui.text(this, "正在下载更新…0%", 13f, Ui.MUTED)
         val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
         val column = Ui.column(this).apply {
@@ -2163,43 +2832,88 @@ internal class MainActivity : Activity() {
             status.text = "即将关闭软件，正在安装更新"
             progress.isIndeterminate = true
 
-            // A self-update can replace this process as soon as the session is committed.
             val appContext = applicationContext
             handler.postDelayed({
                 if (operation != updateOperation || isFinishing || isDestroyed) return@postDelayed
-                thread(name = "codexrm-update-install") {
-                    val result = runCatching { UpdateChecker.install(appContext, apk, info.versionCode) }
-                    handler.post {
-                        if (operation != updateOperation || isFinishing || isDestroyed) return@post
-                        updateDialog = null
-                        dialog.dismiss()
-                        result.onFailure {
-                            showUpdateFailure("无法提交安装：${it.message ?: "系统安装器不可用"}") { startUpdateDownload(info) }
+                val requestId = UUID.randomUUID().toString()
+                val receiver = object : BroadcastReceiver() {
+                    override fun onReceive(context: Context, intent: Intent) {
+                        if (operation == updateOperation &&
+                            intent.getStringExtra(UpdateInstallReceiver.EXTRA_REQUEST_ID) == requestId
+                        ) {
+                            cancelUpdateOperation()
                         }
                     }
+                }
+                ContextCompat.registerReceiver(
+                    this, receiver, IntentFilter(UpdateInstallReceiver.ACTION_INSTALL_FAILED),
+                    ContextCompat.RECEIVER_NOT_EXPORTED,
+                )
+                updateFailureReceiver = receiver
+                thread(name = "codexrm-update-install") {
+                    // Commit is asynchronous. Keep the dialog visible until Android replaces this process.
+                    runCatching { UpdateChecker.install(appContext, apk, info.versionCode, requestId) }
+                        .onFailure { error ->
+                            handler.post {
+                                if (operation != updateOperation || isFinishing || isDestroyed) return@post
+                                cancelUpdateOperation()
+                                showUpdateFailure("无法提交安装：${error.message ?: "系统安装器不可用"}") { startUpdateDownload(info) }
+                            }
+                        }
                 }
             }, 2000L)
         }
     }
 
-    private fun manageThread() {
-        if (currentThread == null) return
-        val input = Ui.boxInput(this, "会话名称").apply { setText(currentThread?.string("name")) }
-        val column = Ui.column(this).apply { setPadding(Ui.dp(context, 22), 0, Ui.dp(context, 22), Ui.dp(context, 12)) }
-        column.addView(input, matchWidth())
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("会话设置").setView(column).setPositiveButton("保存名称") { _, _ ->
-            val name = input.text.toString().trim(); if (name.isEmpty()) return@setPositiveButton
-            rpc("thread/name/set", JSONObject().put("threadId", currentThreadId).put("name", name)) { _, error ->
-                if (error != null) toast(error.message) else { currentThread?.put("name", name); updateControls(); loadThreads(generation) }
-            }
-        }.setNegativeButton("取消", null))
+    private fun renameCurrentThread() {
+        val thread = currentThread ?: return
         val targetId = currentThreadId
-        val targetTitle = currentThread?.let(ProtocolFormatter::thread)?.title.orEmpty()
-        column.addView(Ui.text(this, "删除当前对话", 12f, Ui.DANGER).apply {
-            gravity = Gravity.CENTER; setOnClickListener {
-                dialog.dismiss(); confirmDeleteThread(targetId, targetTitle)
+        val targetAgent = currentAgent()
+        if (targetId.isEmpty() || loading) return
+
+        val input = Ui.boxInput(this, "会话标题").apply {
+            isSingleLine = true
+            setText(thread.string("name"))
+            selectAll()
+        }
+        val content = Ui.column(this).apply {
+            setPadding(Ui.dp(context, 22), 0, Ui.dp(context, 22), Ui.dp(context, 12))
+            addView(input, matchWidth())
+        }
+        val dialog = styledDialog(AlertDialog.Builder(this)
+            .setTitle("修改会话标题")
+            .setView(content)
+            .setPositiveButton("保存", null)
+            .setNegativeButton("取消", null))
+        val save = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        save.setOnClickListener {
+            val name = input.text.toString().trim()
+            if (name.isEmpty()) {
+                input.error = "请输入会话标题"
+                return@setOnClickListener
             }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 46)).apply { topMargin = Ui.dp(this@MainActivity, 12) })
+            if (targetAgent != currentAgent()) {
+                dialog.dismiss()
+                return@setOnClickListener
+            }
+            save.isEnabled = false
+            val renameGeneration = generation
+            rpc("thread/name/set", JSONObject().put("threadId", targetId).put("name", name)) { _, error ->
+                if (error != null) {
+                    save.isEnabled = true
+                    toast(error.message)
+                } else {
+                    dialog.dismiss()
+                    if (renameGeneration == generation && currentAgent() == targetAgent) {
+                        if (currentThreadId == targetId) {
+                            currentThread?.put("name", name)
+                            updateControls()
+                        }
+                        loadThreads(renameGeneration)
+                    }
+                }
+            }
+        }
     }
 
     private fun confirmDeleteDevice(target: Device) {
@@ -2259,23 +2973,33 @@ internal class MainActivity : Activity() {
         threadListVersion++; threadListLoading = false
         threads = threads.filterNot { it.id == id }; messageQueues.remove(id)
         val resolved = requests.filterValues { it.objectAt("params").string("threadId") == id }.keys.toSet()
-        resolved.forEach { requests.remove(it); responding.remove(it) }
+        resolved.forEach { requests.remove(it); requestScopes.remove(it); responding.remove(it) }
         if (currentThreadId == id) newChat()
         renderWorkspaces(); renderApproval(); renderQueue()
     }
 
     private fun toggleTheme() {
+        val wasSidebarOpen = sidebarOpen
+        invalidateBackPreview()
         saveDraft(); val savedMessages = if (mainBuilt) adapter.snapshot() else emptyList()
         store.darkTheme = !store.darkTheme; Ui.configure(this, store.darkTheme)
         mainBuilt = false; buildMain(); adapter.replace(savedMessages); mainVisible = true; setContentView(mainRoot)
         restoreDraft(); renderDevices(); renderWorkspaces(); renderApproval(); renderQueue(); refreshWorkspaceSpinner(); refreshModelSpinner(); updateControls()
+        if (wasSidebarOpen) {
+            sidebarOpen = true
+            drawSidebar(0f)
+        }
         updateBackHandling()
     }
 
     private fun updateConnectionIndicator() {
         if (!mainBuilt) return
         val status = client?.directStatus
-        connectionButton.visibility = if (online && status != null) View.VISIBLE else View.INVISIBLE
+        connectionButton.visibility = when {
+            currentThreadId.isNotEmpty() -> View.GONE
+            online && status != null -> View.VISIBLE
+            else -> View.INVISIBLE
+        }
         if (!online || status == null) {
             connectionDialog?.dismiss()
             return
@@ -2327,13 +3051,20 @@ internal class MainActivity : Activity() {
 
     private fun updateControls() {
         if (!mainBuilt) return
+        renderBootstrapState(); renderOutbox(); updateModelButton()
         updateConnectionIndicator()
         val currentDeviceName = device?.serverName?.takeIf { it.isNotBlank() } ?: "连接设备"
         deviceLabel.text = currentDeviceName
         deviceButton.contentDescription = "选择设备，当前设备：$currentDeviceName，${if (online) "已连接" else "离线"}"
         connectionDot.background = Ui.rounded(if (online) Ui.GREEN else Ui.DIM, Ui.dp(this, 3).toFloat())
-        threadTitle.text = currentThread?.let(ProtocolFormatter::thread)?.title ?: "新会话"
-        threadActions.visibility = if (currentThread == null) View.GONE else View.VISIBLE
+        val hasOpenThread = currentThreadId.isNotEmpty()
+        deviceButton.visibility = if (hasOpenThread) View.GONE else View.VISIBLE
+        demoBadge.visibility = if (!hasOpenThread && info.optBoolean("mock")) View.VISIBLE else View.GONE
+        topbarTitle.text = if (hasOpenThread) currentThread?.string("name").orEmpty().ifBlank { "无题" } else "Codex Remote"
+        val canRename = hasOpenThread && !loading
+        topbarTitle.isClickable = canRename
+        topbarTitle.isFocusable = canRename
+        topbarTitle.tooltipText = if (canRename) "修改会话标题" else null
         cwdLabel.text = currentCwd.ifEmpty { "点击设置工作目录" }
         cwdLabel.contentDescription = if (currentCwd.isEmpty()) "点击设置工作目录" else "设置工作目录，当前目录：$currentCwd"
         cwdLabel.isEnabled = !sending && !loading
@@ -2346,23 +3077,151 @@ internal class MainActivity : Activity() {
         activityText.text = if (online) "Codex 正在处理" else "连接已断开，恢复后同步任务"
         composer.isEnabled = !readOnly
         workspaceSpinner.isEnabled = online && !sending && !loading
-        modelSpinner.isEnabled = online && !sending && !loading && !running && !readOnly; effortSpinner.isEnabled = modelSpinner.isEnabled
+        modelButton.isEnabled = online && !sending && !loading && !running && !readOnly
+        effortSpinner.isEnabled = modelButton.isEnabled
         runningActions.visibility = if (running) View.VISIBLE else View.GONE
         updateSendState()
     }
 
     private fun updateSendState() {
-        if (!mainBuilt) return
+        if (!mainBuilt || !::sendButton.isInitialized) return
+        val hasPayload = composer.text.isNotBlank() || attachmentFiles.isNotEmpty()
+        val editingQueuedMessage = editingQueueDraft == composerBinding
+        val showContinue = canContinueTurn()
+        continueButton.visibility = if (showContinue) View.VISIBLE else View.GONE
+        continueButton.isEnabled = showContinue && online && loaded && !loading && !sending && currentThreadId !in deletingThreads
+        continueButton.alpha = if (continueButton.isEnabled) 1f else .35f
+        sendButton.visibility = if (hasPayload) View.VISIBLE else View.GONE
+        sendButton.isEnabled = hasPayload && online && loaded && !sending && !loading && !preparingAttachments && !readOnly && !editingQueuedMessage &&
+            (!running || info.optBoolean("messageQueue")) && (attachmentFiles.isEmpty() || info.has("attachments"))
+        sendButton.alpha = if (sendButton.isEnabled) 1f else .35f
+        sendButton.contentDescription = if (running) "排队发送" else "发送消息"
         stopButton.visibility = if (running && !readOnly) View.VISIBLE else View.GONE
         // Keep the button clickable when merely offline or unsupported so a tap explains
         // why (a disabled button gave Android 12 users silent "no response"); dim it instead.
-        val attachReady = online && loaded && !sending && !loading && !readOnly && !preparingAttachments && info.has("attachments")
-        attachButton.isEnabled = !sending && !loading && !readOnly && !preparingAttachments
+        attachButton.isEnabled = !sending && !loading && !readOnly && !preparingAttachments && !editingQueuedMessage
+        val attachReady = attachButton.isEnabled && online && loaded && info.has("attachments")
         attachButton.alpha = if (attachReady) 1f else .35f
+        if (!attachReady && attachmentChoices.visibility == View.VISIBLE) showAttachmentChoices(false)
         stopButton.isEnabled = !readOnly && online && !sending && !loading
     }
 
+    private fun persistOutbox() {
+        store.savePendingSends(currentAgent(), outbox.values())
+        if (mainBuilt) renderOutbox()
+    }
+
+    private fun renderBootstrapState() {
+        if (!mainBuilt) return
+        bootstrapArea.removeAllViews()
+        if (!bootstrapping && bootstrapError.isEmpty()) {
+            bootstrapArea.visibility = View.GONE
+            return
+        }
+        bootstrapArea.visibility = View.VISIBLE
+        val card = Ui.column(this).apply {
+            setPadding(Ui.dp(context, 12), Ui.dp(context, 10), Ui.dp(context, 12), Ui.dp(context, 10))
+            background = Ui.rounded(Ui.SURFACE, Ui.dp(context, 12).toFloat(), if (bootstrapError.isEmpty()) Ui.BORDER else Ui.DANGER)
+        }
+        card.addView(Ui.text(this, if (bootstrapping) "正在同步设备信息与会话…" else "设备初始化失败：$bootstrapError", 12f, if (bootstrapError.isEmpty()) Ui.MUTED else Ui.DANGER))
+        if (!bootstrapping && bootstrapError.isNotEmpty()) {
+            card.addView(Ui.button(this, "重试初始化", primary = true) { bootstrap() }, matchWidth(top = 8))
+        }
+        bootstrapArea.addView(card, matchWidth(bottom = 8))
+    }
+
+    private fun renderOutbox() {
+        if (!mainBuilt) return
+        outboxArea.removeAllViews()
+        val pending = outbox.values()
+        outboxArea.visibility = if (pending.isEmpty()) View.GONE else View.VISIBLE
+        pending.forEach { value ->
+            val waiting = value.id == activePendingSendId && value.stage == PendingSendStage.WAITING
+            val preview = value.submittedText.trim().ifEmpty { value.files.firstOrNull()?.string("name").orEmpty() }.take(80)
+            val target = if (value.threadId.isNotEmpty()) "会话 ${value.threadId}" else "新会话 · ${value.cwd}"
+            val row = Ui.column(this).apply {
+                setPadding(Ui.dp(context, 12), Ui.dp(context, 8), Ui.dp(context, 12), Ui.dp(context, 8))
+                minimumHeight = Ui.dp(context, 56)
+                background = Ui.ripple(Ui.SURFACE, Ui.dp(context, 12).toFloat(), Ui.BORDER)
+                isFocusable = true
+                contentDescription = "${if (waiting) "等待发送确认" else "发送状态未确认"}：$preview"
+                setOnClickListener { showPendingSend(value.id) }
+            }
+            row.addView(Ui.text(this, if (waiting) "等待设备确认发送…" else "发送状态未确认 · 不会自动重发", 12f, if (waiting) Ui.MUTED else Ui.DANGER, true))
+            row.addView(Ui.text(this, "$target\n$preview", 11f, Ui.MUTED).apply { maxLines = 3 })
+            outboxArea.addView(row, matchWidth(bottom = 8))
+        }
+    }
+
+    private fun showPendingSend(id: String) {
+        val value = outbox.get(id) ?: return
+        if (id == activePendingSendId && value.stage == PendingSendStage.WAITING) {
+            toast("请求仍在等待设备确认")
+            return
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("发送状态未确认")
+            .setMessage("内容已保留，但无法确定设备是否已接受。请先核对会话历史；应用不会自动重发。\n\n${value.submittedText.take(500)}")
+            .setPositiveButton("核对会话") { _, _ -> verifyPendingSend(value) }
+            .setNeutralButton("清除标记") { _, _ -> resolvePendingSend(value) }
+        if (!value.continuation) dialog.setNegativeButton("仍然重发") { _, _ -> retryPendingSend(value) }
+        styledDialog(dialog)
+    }
+
+    private fun preservePendingDraft(value: PendingSend) {
+        val workspace = if (value.threadId.isEmpty()) pathKey(value.cwd) else null
+        val saved = store.draft(value.agentId, value.threadId, workspace)
+        store.saveDraft(value.agentId, value.threadId, OutboxRecovery.draft(saved, listOf(value)), workspace)
+    }
+
+    private fun verifyPendingSend(value: PendingSend) {
+        preservePendingDraft(value)
+        if (value.threadId.isNotEmpty()) {
+            if (sending || loading) { toast("请等待当前请求完成后核对"); return }
+            openThread(value.threadId)
+        } else {
+            refreshAll()
+            toast("尚未确认新会话是否创建，请核对会话列表后再决定是否重发")
+        }
+    }
+
+    private fun retryPendingSend(value: PendingSend) {
+        if (outbox.matching(composerBinding, ::pathKey).none { it.id == value.id }) {
+            toast("先打开对应会话并核对内容")
+            return
+        }
+        preservePendingDraft(value)
+        restoreDraft(ComposerRestoreToken(composerBinding, composerEditVersion))
+        outbox.confirmed(value.id); persistOutbox()
+        sendMessage(value.steer && running)
+    }
+
+    private fun resolvePendingSend(value: PendingSend) {
+        preservePendingDraft(value)
+        outbox.confirmed(value.id); persistOutbox()
+        restoreDraft(ComposerRestoreToken(composerBinding, composerEditVersion))
+        toast("已清除未确认标记，草稿与附件保留")
+    }
+
+    private fun recoverPendingAttachments(binding: ComposerBinding) {
+        val targetKey = binding.attachmentKey(::pathKey)
+        var changed = false
+        outbox.matching(binding, ::pathKey).forEach { value ->
+            if (value.attachmentKey.isEmpty() || value.attachmentKey == targetKey) return@forEach
+            val source = attachmentStore.load(value.attachmentKey)
+            val target = attachmentStore.load(targetKey)
+            val merged = LinkedHashMap<String, JSONObject>()
+            (target + source).forEach { merged[it.string("draftId").ifEmpty { it.string("path") }] = it }
+            attachmentStore.save(targetKey, merged.values.toList())
+            attachmentStore.save(value.attachmentKey, emptyList())
+            outbox.update(value.copy(attachmentKey = targetKey))
+            changed = true
+        }
+        if (changed) persistOutbox()
+    }
+
     private fun rebindComposer(binding: ComposerBinding): ComposerRestoreToken {
+        if (mainBuilt && attachmentChoices.visibility == View.VISIBLE) showAttachmentChoices(false)
         composerBinding = binding
         if (mainBuilt) {
             setComposerText("")
@@ -2389,8 +3248,10 @@ internal class MainActivity : Activity() {
         if (!mainBuilt || token.binding != composerBinding) return
         val binding = token.binding
         val workspace = if (binding.threadId.isEmpty()) pathKey(binding.cwd) else null
+        recoverPendingAttachments(binding)
         if (token.editVersion == composerEditVersion) {
-            setComposerText(store.draft(binding.agentId, binding.threadId, workspace))
+            val saved = store.draft(binding.agentId, binding.threadId, workspace)
+            setComposerText(OutboxRecovery.draft(saved, outbox.matching(binding, ::pathKey)))
         }
         renderAttachments(); updateSendState()
     }
@@ -2429,6 +3290,14 @@ internal class MainActivity : Activity() {
         workspaceFiles.connectionChanged()
         if (::adapter.isInitialized) adapter.showFileCards = directFilesAvailable()
     }
+    private fun downloadMessageFile(file: ArtifactCard) {
+        if (!directFilesAvailable()) {
+            toast(if (client?.usingDirect == true) "当前 Agent 不支持直连文件下载" else "P2P 直连后可下载此文件")
+            return
+        }
+        workspaceFiles.download(RemoteFile(currentCwd, currentThreadId, file.path), file.name)
+    }
+
     private fun openWorkspaceFiles(path: String, threadId: String): Boolean {
         if (path.isEmpty()) return false
         if (!directFilesAvailable()) {
@@ -2447,30 +3316,166 @@ internal class MainActivity : Activity() {
     private fun matchWidth(top: Int = 0, bottom: Int = 0): LinearLayout.LayoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(this@MainActivity, top); bottomMargin = Ui.dp(this@MainActivity, bottom) }
     private fun String?.ifNullOrEmpty(fallback: String): String = if (isNullOrEmpty()) fallback else this
     private fun toast(message: String?) { if (!message.isNullOrEmpty()) Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
-    private fun styledDialog(builder: AlertDialog.Builder): AlertDialog = builder.show().apply {
+    private fun styledDialog(builder: AlertDialog.Builder): AlertDialog = styledDialog(builder.create())
+    private fun styledDialog(dialog: AlertDialog): AlertDialog = dialog.apply {
+        show()
         setOnShowListener { window?.setBackgroundDrawable(Ui.rounded(Ui.BACKGROUND, Ui.dp(context, 20).toFloat(), Ui.BORDER)) }
     }
 
 
-    private fun handleSystemBack(): Boolean = when {
-        mainVisible && sidebarOpen && devicesExpanded && sidebarBackStartX == null -> {
-            devicesExpanded = false
-            renderDevices()
-            true
-        }
-        mainVisible && sidebarOpen -> { closeSidebar(); true }
-        !mainVisible && devices.isNotEmpty() -> { showMain(); true }
-        else -> false
+    private fun currentBackTarget(): BackTarget? = when {
+        mainVisible && sidebarOpen && devicesExpanded -> BackTarget.DEVICES
+        mainVisible && sidebarOpen -> BackTarget.SIDEBAR
+        mainVisible && attachmentChoices.visibility == View.VISIBLE -> BackTarget.ATTACHMENTS
+        !mainVisible && devices.isNotEmpty() -> BackTarget.PAIR
+        else -> null
     }
 
+    private fun performBack(target: BackTarget) = when (target) {
+        BackTarget.DEVICES -> toggleDevices()
+        BackTarget.SIDEBAR -> closeSidebar()
+        BackTarget.ATTACHMENTS -> showAttachmentChoices(false)
+        BackTarget.PAIR -> showMain()
+    }
+
+    private fun startBackGesture(progress: Float, fromRightEdge: Boolean) {
+        if (backGesture != null) finishBackGesture(commit = backGesture?.completion != null)
+        val target = currentBackTarget() ?: return
+        val preview = when (target) {
+            BackTarget.DEVICES -> panelBackPreview(deviceDropdown, -Ui.dp(this, 16).toFloat())
+            BackTarget.SIDEBAR -> sidebarBackPreview()
+            BackTarget.ATTACHMENTS -> panelBackPreview(attachmentChoices, Ui.dp(this, 16).toFloat())
+            BackTarget.PAIR -> pairBackPreview(if (fromRightEdge) -1 else 1)
+        }
+        backGesture = BackGesture(target, preview)
+        progressBackGesture(progress)
+    }
+
+    private fun sidebarBackPreview(): BackPreview {
+        sidebar.animate().cancel()
+        sidebarShade.animate().cancel()
+        val startX = sidebar.translationX
+        val width = sidebar.layoutParams.width.coerceAtLeast(1).toFloat()
+        return BackPreview(
+            draw = { progress -> drawSidebar(startX + (-width - startX) * progress) },
+            restore = { committing -> if (!committing) animateSidebar() },
+        )
+    }
+
+    private fun panelBackPreview(panel: View, offset: Float): BackPreview {
+        panel.animate().cancel()
+        val startY = panel.translationY
+        val startAlpha = panel.alpha
+        return BackPreview(
+            draw = { progress ->
+                panel.translationY = startY + (offset - startY) * progress
+                panel.alpha = startAlpha * (1f - progress)
+            },
+            restore = {
+                panel.translationY = 0f
+                panel.alpha = 1f
+            },
+        )
+    }
+
+    private fun backPageParams() = FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+    )
+
+    private fun pairBackPreview(direction: Int): BackPreview? {
+        val page = pairPage ?: return null
+        val host = page.parent as? FrameLayout ?: return null
+        if (!mainBuilt || mainRoot.parent != null) return null
+        val conversation = mainRoot
+        val previousAccessibility = conversation.importantForAccessibility
+        val previousFocusability = conversation.descendantFocusability
+        // Reveal the conversation while keeping focus and input on the pairing form.
+        conversation.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        conversation.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+        val touchShield = View(this).apply {
+            isClickable = true
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        host.addView(conversation, 0, backPageParams())
+        host.addView(touchShield, 1, backPageParams())
+        host.requestApplyInsets()
+        return BackPreview(
+            draw = { progress -> page.translationX = direction * host.width * progress },
+            restore = {
+                page.translationX = 0f
+                host.removeView(touchShield)
+                host.removeView(conversation)
+                conversation.importantForAccessibility = previousAccessibility
+                conversation.descendantFocusability = previousFocusability
+            },
+        )
+    }
+
+    private fun progressBackGesture(progress: Float) {
+        val gesture = backGesture ?: return
+        if (gesture.invalidated || gesture.completion != null) return
+        gesture.progress = progress.coerceIn(0f, 1f)
+        gesture.preview?.draw?.invoke(gesture.progress)
+    }
+
+    private fun invokeSystemBack() {
+        val gesture = backGesture
+        if (gesture == null) {
+            currentBackTarget()?.let(::performBack)
+            return
+        }
+        val preview = gesture.preview
+        if (gesture.invalidated || gesture.completion != null || preview == null || gesture.progress >= 1f) {
+            finishBackGesture(commit = true)
+            return
+        }
+        // The platform may commit before handing us progress 1 (for example after a fling).
+        val completion = ValueAnimator.ofFloat(gesture.progress, 1f).apply {
+            duration = (150 * (1f - gesture.progress)).toLong().coerceIn(50, 150)
+            addUpdateListener { preview.draw(it.animatedValue as Float) }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) = finishBackGesture(commit = true)
+            })
+        }
+        gesture.completion = completion
+        completion.start()
+    }
+
+    private fun invalidateBackPreview() {
+        val gesture = backGesture ?: return
+        if (gesture.invalidated) return
+        // A network or UI update can replace the destination mid-swipe. Consume this swipe
+        // without applying it to the new destination, even if the previous panel reopens.
+        gesture.invalidated = true
+        gesture.preview?.restore?.invoke(false)
+        gesture.preview = null
+        if (gesture.completion != null) finishBackGesture(commit = false)
+    }
+
+    private fun finishBackGesture(commit: Boolean) {
+        val gesture = backGesture ?: return
+        backGesture = null
+        gesture.completion?.removeAllListeners()
+        gesture.completion?.cancel()
+        val committing = commit && !gesture.invalidated && currentBackTarget() == gesture.target
+        gesture.preview?.restore?.invoke(committing)
+        if (committing) performBack(gesture.target)
+        updateBackHandling()
+    }
+
+    @SuppressLint("GestureBackNavigation") // API 28-32 fallback; newer versions use the platform dispatcher.
+    @Suppress("DEPRECATION")
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (!handleSystemBack()) super.onBackPressed()
+        val target = currentBackTarget()
+        if (target == null) super.onBackPressed() else performBack(target)
     }
 
     private fun updateBackHandling() {
         val callback = backCallback ?: return
-        val interceptBack = (mainVisible && sidebarOpen) || (!mainVisible && devices.isNotEmpty())
+        val target = currentBackTarget()
+        if (backGesture?.let { it.target != target } == true) invalidateBackPreview()
+        val interceptBack = target != null || backGesture != null
         if (interceptBack == backCallbackRegistered) return
         if (interceptBack) {
             SystemBackCompat.register(this, callback)

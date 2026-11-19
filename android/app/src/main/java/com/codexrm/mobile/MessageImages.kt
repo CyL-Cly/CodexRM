@@ -4,18 +4,24 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
 
-internal data class MessageImage(val source: String, val name: String = "图片", val attachmentId: String = "") {
+internal data class MessageImage(
+    val source: String,
+    val name: String = "图片",
+    val attachmentId: String = "",
+    val messageId: String = "",
+) {
     fun cacheKey(scope: String, cwd: String): String = "$scope\n" + when {
         attachmentId.isNotEmpty() -> "attachment:$attachmentId"
-        isRemote || source.startsWith("/") || WINDOWS_PATH.containsMatchIn(source) -> source
-        else -> "$cwd\n$source"
+        else -> {
+            val resource = if (isRemote || source.startsWith("/") || WINDOWS_PATH.containsMatchIn(source)) source else "$cwd\n$source"
+            if (isRemote || messageId.isEmpty()) resource else "message:$messageId\n$resource"
+        }
     }
 
     val isRemote: Boolean get() = source.startsWith("https://", true) || source.startsWith("http://", true) || source.startsWith("data:image/", true)
 
-    // A path identifies mutable Agent-side content, not an immutable image version.
-    // Uploaded IDs and remote resources retain their normal memory/disk cache path.
-    val allowsEarlyCache: Boolean get() = isRemote || attachmentId.isNotEmpty()
+    // Local files are mutable. Bind their cached copies to the original message.
+    val allowsEarlyCache: Boolean get() = isRemote || attachmentId.isNotEmpty() || messageId.isNotEmpty()
 
     companion object {
         private val WINDOWS_PATH = Regex("^[A-Za-z]:[/\\\\]")

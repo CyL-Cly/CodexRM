@@ -3,7 +3,9 @@ package agenthost
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,6 +22,8 @@ import (
 
 type Host struct {
 	OpenOnStart            bool
+	LANSettings            bool
+	LinuxUpdateExecutable  string // Set by the standalone agent before Run.
 	mu                     sync.Mutex
 	opMu                   sync.Mutex
 	config                 clientconfig.Connection
@@ -28,8 +32,15 @@ type Host struct {
 	installDir             string
 	active                 *agent.Agent
 	activeCtx              context.Context
+	wxLocalServer          string
+	wxActive               *agent.Agent
+	wxActiveCtx            context.Context
+	wxActiveVersion        uint64
 	version, activeVersion uint64
 	lastError              string
+	connectionState        agent.ConnectionState
+	lastConnectedAt        *time.Time
+	nextRetryAt            *time.Time
 	changed                chan struct{}
 	ctx                    context.Context
 	cancel                 context.CancelFunc
@@ -37,7 +48,9 @@ type Host struct {
 	openBrowser            func(string) error
 	startUpdate            func(*updater.Plan) error
 	newUpdater             func(updater.Config) (*updater.Updater, error)
+	activeUpdater          *updater.Updater
 	pendingUpdate          *updater.Plan
+	linuxUpdate            *updater.LinuxUpdate
 	updateRetryAt          time.Time
 	updateWake             chan struct{}
 }
@@ -58,7 +71,8 @@ func (h *Host) OpenSettings() {
 		err = h.openBrowser(url)
 	}
 	if err != nil {
-		log.Printf("打开设置页面: %v", err)
+		// Headless Linux has no browser; the URL is still needed for an SSH tunnel.
+		log.Printf("无法自动打开设置页面，请在浏览器访问 %s（原因：%v）", url, err)
 	}
 }
 
@@ -69,7 +83,21 @@ func (h *Host) Run(ctx context.Context) error {
 	h.mu.Unlock()
 	defer h.cancel()
 	defer h.closePage()
-	if h.OpenOnStart {
+	if h.LANSettings {
+		address, err := h.SettingsURL()
+		if err != nil {
+			return fmt.Errorf("启动局域网设置页面: %w", err)
+		}
+		local, _ := url.Parse(address)
+		log.Printf("Agent 设置页面监听端口 %s，密码保存在 %s；风险提示：仅可在可信网络启用 LAN 设置", local.Port(), h.settingsAccessPath())
+	} else if runtime.GOOS == "linux" {
+		address, err := h.SettingsURL()
+		if err != nil {
+			return fmt.Errorf("启动本机设置页面: %w", err)
+		}
+		local, _ := url.Parse(address)
+		log.Printf("设置服务仅监听本机。headless 环境请使用 SSH 端口转发：ssh -L <本地端口>:%s <主机>", local.Host)
+	} else if h.OpenOnStart {
 		h.OpenSettings()
 	}
 	// A configured server may be offline, and a new installation may have no
@@ -98,7 +126,15 @@ func (h *Host) Run(ctx context.Context) error {
 		h.mu.Unlock()
 		generationCtx, cancel := context.WithCancel(runCtx)
 		finished := make(chan struct{})
-		go func() { defer close(finished); h.runConnection(generationCtx, cfg, version) }()
+		go func() {
+			defer close(finished)
+			if h.wxLocalServer != "" && h.wxLocalServer != cfg.Server {
+				wxDone := make(chan struct{})
+				go func() { defer close(wxDone); h.runWXConnection(generationCtx, version) }()
+				defer func() { <-wxDone }()
+			}
+			h.runConnection(generationCtx, cfg, version)
+		}()
 		reconfigure := false
 		for !reconfigure && runCtx.Err() == nil {
 			select {
@@ -127,7 +163,47 @@ func (h *Host) Run(ctx context.Context) error {
 	return nil
 }
 
+type updateMode string
+
+const (
+	updateLinuxAgent   updateMode = "linux-agent"
+	updateLinuxManual  updateMode = "linux-manual"
+	updateWindowsStore updateMode = "windows-package"
+	updateWindowsAgent updateMode = "windows-agent"
+	updateManual       updateMode = "manual"
+)
+
+func (h *Host) updateMode() updateMode {
+	switch runtime.GOOS {
+	case "linux":
+		if h.LinuxUpdateExecutable != "" && !h.base.Mock {
+			return updateLinuxAgent
+		}
+		return updateLinuxManual
+	case "windows":
+		if installation.IsPackaged() {
+			return updateWindowsStore
+		}
+		if h.installDir != "" {
+			return updateWindowsAgent
+		}
+	}
+	return updateManual
+}
+
+// RestartUpdate completes a Linux update after Run has shut down all listeners
+// and connections. Windows hands the update off to its detached helper.
+func (h *Host) RestartUpdate(ctx context.Context) error {
+	if h.linuxUpdate != nil {
+		return h.linuxUpdate.Restart(ctx)
+	}
+	return nil
+}
+
 func (h *Host) updaterConfig() updater.Config {
+	if h.updateMode() == updateLinuxAgent {
+		return updater.Config{ServerURL: clientconfig.DefaultUpdateServer, ManifestURL: clientconfig.LinuxUpdateManifest, StateDir: filepath.Join(h.StateDir(), ".codexrm-updates"), LinuxExecutable: h.LinuxUpdateExecutable, VersionCode: release.VersionCode}
+	}
 	return updater.Config{ServerURL: clientconfig.DefaultUpdateServer, ManifestURL: clientconfig.DefaultUpdateServer + "update.json", InstallDir: h.installDir, VersionCode: release.VersionCode, Args: []string{"--config", h.path}}
 }
 
@@ -135,7 +211,8 @@ func (h *Host) runUpdates(ctx context.Context, ready chan<- *updater.Plan) {
 	h.mu.Lock()
 	autoUpdate := h.config.AutoUpdate
 	h.mu.Unlock()
-	if h.installDir == "" || installation.IsPackaged() || h.base.Mock || !autoUpdate || runtime.GOOS != "windows" {
+	mode := h.updateMode()
+	if (mode != updateWindowsAgent && mode != updateLinuxAgent) || h.base.Mock || !autoUpdate {
 		return
 	}
 	u, err := h.newUpdater(h.updaterConfig())
@@ -143,6 +220,9 @@ func (h *Host) runUpdates(ctx context.Context, ready chan<- *updater.Plan) {
 		log.Printf("automatic update: %v", err)
 		return
 	}
+	h.mu.Lock()
+	h.activeUpdater = u
+	h.mu.Unlock()
 	u.Run(ctx, ready)
 }
 
@@ -159,6 +239,8 @@ func (h *Host) queueUpdate(plan *updater.Plan) {
 	log.Printf("update %s ready; waiting for conversations to finish", plan.Manifest.VersionName)
 }
 
+var errUpdateBusy = errors.New("secondary agent is busy")
+
 func (h *Host) applyPendingUpdate() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -167,20 +249,42 @@ func (h *Host) applyPendingUpdate() error {
 	}
 	plan := h.pendingUpdate
 	start := func() error {
-		if err := h.startUpdate(plan); err != nil {
+		var err error
+		if h.updateMode() == updateLinuxAgent {
+			h.linuxUpdate, err = plan.StageLinux()
+		} else {
+			err = h.startUpdate(plan)
+		}
+		if err != nil {
 			h.updateRetryAt = time.Now().Add(time.Minute)
 			return err
 		}
-		h.pendingUpdate = nil // The helper now owns the staged files.
+		h.pendingUpdate = nil // The restart path now owns the staged files.
 		log.Printf("applying update %s", plan.Manifest.VersionName)
 		h.cancel()
 		return nil
 	}
-	if h.active != nil && h.activeCtx.Err() == nil {
-		_, err := h.active.TryStartUpdate(start)
-		return err
+	// Both connections share this host and are stopped by the update.
+	if h.wxActive != nil && h.wxActiveCtx.Err() == nil {
+		startUpdate := start
+		start = func() error {
+			started, err := h.wxActive.TryStartUpdate(startUpdate)
+			if !started && err == nil {
+				return errUpdateBusy
+			}
+			return err
+		}
 	}
-	return start()
+	var err error
+	if h.active != nil && h.activeCtx.Err() == nil {
+		_, err = h.active.TryStartUpdate(start)
+	} else {
+		err = start()
+	}
+	if errors.Is(err, errUpdateBusy) {
+		return nil
+	}
+	return err
 }
 
 // Manual checks use the same idle gate as automatic updates and return while a
@@ -205,8 +309,13 @@ func (h *Host) checkForUpdateMode(applyImmediately bool) (bool, error) {
 	if !running {
 		return false, errors.New("Agent 正在退出")
 	}
-	if h.installDir == "" || installation.IsPackaged() || runtime.GOOS != "windows" {
-		return false, errors.New("此版本由 Windows 管理更新，或未使用受管理的安装目录")
+	switch h.updateMode() {
+	case updateLinuxManual:
+		return false, errors.New("Linux Agent 请下载更新包，停止 Agent 后替换二进制文件并重新启动")
+	case updateWindowsStore:
+		return false, errors.New("此版本由 Windows 管理更新")
+	case updateManual:
+		return false, errors.New("请下载新版本并手动更新 Agent")
 	}
 	if pending {
 		return true, nil
@@ -215,6 +324,9 @@ func (h *Host) checkForUpdateMode(applyImmediately bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	h.mu.Lock()
+	h.activeUpdater = u
+	h.mu.Unlock()
 	plan, err := u.Prepare(ctx)
 	if err != nil || plan == nil {
 		return false, err
@@ -238,7 +350,9 @@ func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, v
 	}
 	base := h.base
 	base.ServerURL, base.EnrollmentKey = cfg.Server, cfg.EnrollmentKey
-	base.CheckForUpdate = h.checkRemoteUpdate
+	if h.updateMode() != updateLinuxManual {
+		base.CheckForUpdate = h.checkRemoteUpdate
+	}
 	base.NoAutoPair = true
 	if cfg.Workspace != "" {
 		base.Cwd = cfg.Workspace
@@ -251,7 +365,7 @@ func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, v
 			}
 		}
 	}
-	a, err := agent.New(base)
+	a, err := agent.NewForServer(base)
 	if err != nil {
 		h.setError(version, err)
 		return
@@ -262,6 +376,7 @@ func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, v
 		return
 	}
 	h.active, h.activeCtx, h.activeVersion, h.lastError = a, ctx, version, ""
+	h.connectionState, h.nextRetryAt = agent.Connecting, nil
 	h.mu.Unlock()
 	for ctx.Err() == nil {
 		err = a.Run(ctx)
@@ -269,6 +384,13 @@ func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, v
 			break
 		}
 		h.setError(version, err)
+		h.mu.Lock()
+		if h.version == version {
+			h.connectionState = agent.Retrying
+			retryAt := time.Now().Add(3 * time.Second).UTC()
+			h.nextRetryAt = &retryAt
+		}
+		h.mu.Unlock()
 		select {
 		case <-ctx.Done():
 		case <-time.After(3 * time.Second):
@@ -283,7 +405,7 @@ func (h *Host) setError(version uint64, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.version == version {
-		h.lastError = err.Error()
+		h.lastError = "连接初始化或运行失败；请检查服务器、授权、网络及 Codex 配置后重试"
 	}
 	log.Printf("agent connection: %v", err)
 }
@@ -292,7 +414,7 @@ func (h *Host) current(ctx context.Context) (*agent.Agent, context.Context, func
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.active == nil || h.activeVersion != h.version || h.activeCtx.Err() != nil {
-		return nil, nil, nil, errors.New("请先保存远程服务器和连接授权密钥，稍后重试")
+		return nil, nil, nil, errors.New("请先保存远程服务器设置，稍后重试")
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	stop := context.AfterFunc(h.activeCtx, cancel)

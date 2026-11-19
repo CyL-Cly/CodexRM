@@ -15,6 +15,7 @@ import (
 
 type Link struct {
 	lan    bool
+	ipv6   bool
 	stream *quic.Stream
 	conn   *quic.Conn
 	udp    *net.UDPConn
@@ -22,7 +23,8 @@ type Link struct {
 	once   sync.Once
 }
 
-func (l *Link) IsLAN() bool { return l.lan }
+func (l *Link) IsLAN() bool  { return l.lan }
+func (l *Link) IsIPv6() bool { return l.ipv6 }
 
 func (l *Link) Read() ([]byte, error) {
 	var header [4]byte

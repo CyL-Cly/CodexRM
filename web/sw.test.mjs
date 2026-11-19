@@ -83,6 +83,13 @@ function createHarness() {
     await Promise.all(pending);
   }
 
+  async function dispatchMessage(data) {
+    const pending = [];
+    const event = { data, waitUntil: (promise) => pending.push(Promise.resolve(promise)) };
+    for (const listener of listeners.get("message") || []) listener(event);
+    await Promise.all(pending);
+  }
+
   async function dispatchFetch(url, { mode = "same-origin", headers = {}, method = "GET" } = {}) {
     const request = { url: new URL(url, ORIGIN).href, method, mode, headers: new Headers(headers) };
     const pending = [];
@@ -104,6 +111,7 @@ function createHarness() {
     stores,
     networkCalls,
     lifecycle,
+    dispatchMessage,
     dispatchFetch,
     cache: (name) => {
       if (!stores.has(name)) stores.set(name, new MemoryCache());
@@ -113,7 +121,7 @@ function createHarness() {
   };
 }
 
-const VERSION = "20261118-2";
+const VERSION = "20261119-6";
 const SHELL = `codexrm-shell-${VERSION}`;
 const PAGES = `codexrm-pages-${VERSION}`;
 const RUNTIME = `codexrm-runtime-${VERSION}`;
@@ -144,16 +152,25 @@ test("manifest has installable identity and real 192/512 PNG icons", () => {
   assert.ok(manifest.icons.some((item) => item.purpose === "maskable" && item.sizes === "512x512"));
 });
 
-test("install precaches the shell and activation removes only old CodexRM caches", async () => {
+test("install precaches the shell, waits safely and activation removes only old CodexRM caches", async () => {
   const harness = createHarness();
   harness.cache("codexrm-shell-0.5.1");
   harness.cache("unrelated-application");
   await harness.lifecycle("install");
   assert.equal((await harness.cache(SHELL).keys()).length, 11);
-  assert.equal(harness.worker.skipped, true);
+  assert.equal(harness.worker.skipped, false);
   await harness.lifecycle("activate");
   assert.deepEqual([...harness.stores.keys()].sort(), [SHELL, "unrelated-application"].sort());
   assert.equal(harness.worker.clients.claimed, true);
+});
+
+test("only an explicit SKIP_WAITING message activates the waiting worker", async () => {
+  const harness = createHarness();
+  await harness.lifecycle("install");
+  await harness.dispatchMessage({ type: "UNRELATED_MESSAGE" });
+  assert.equal(harness.worker.skipped, false);
+  await harness.dispatchMessage({ type: "SKIP_WAITING" });
+  assert.equal(harness.worker.skipped, true);
 });
 
 test("versioned assets use cache-first without another network request", async () => {

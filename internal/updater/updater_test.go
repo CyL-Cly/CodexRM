@@ -124,6 +124,77 @@ func TestTwentyHourChecksPersistAcrossInstancesAndServerChanges(t *testing.T) {
 	}
 }
 
+func TestFailedChecksUseBoundedBackoffWithoutConsumingSuccessInterval(t *testing.T) {
+	var fail atomic.Bool
+	var requests atomic.Int32
+	feed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		if fail.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer feed.Close()
+	u, err := New(Config{ServerURL: feed.URL, InstallDir: t.TempDir(), VersionCode: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	u.now = func() time.Time { return now }
+	if _, err = u.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	successfulAt := u.Snapshot().LastSuccessfulCheck
+	now = now.Add(CheckInterval)
+	fail.Store(true)
+	for i, backoff := range []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, time.Hour, time.Hour} {
+		if _, err = u.Check(context.Background()); err == nil {
+			t.Fatal("failed update check returned no error")
+		}
+		snapshot := u.Snapshot()
+		if !snapshot.LastSuccessfulCheck.Equal(successfulAt) {
+			t.Fatalf("failure consumed successful check: %+v", snapshot)
+		}
+		if snapshot.NextRetryAt == nil || !snapshot.NextRetryAt.Equal(now.Add(backoff)) || snapshot.Phase != "error" || snapshot.Error == "" {
+			t.Fatalf("attempt %d snapshot = %+v, want backoff %s", i+1, snapshot, backoff)
+		}
+		before := requests.Load()
+		if _, err = u.Check(context.Background()); err != nil || requests.Load() != before {
+			t.Fatalf("retry interval was bypassed: requests=%d, err=%v", requests.Load(), err)
+		}
+		now = now.Add(backoff)
+	}
+	fail.Store(false)
+	if _, err = u.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := u.Snapshot()
+	if snapshot.Phase != "up-to-date" || !snapshot.LastSuccessfulCheck.Equal(now) || snapshot.NextRetryAt == nil || !snapshot.NextRetryAt.Equal(now.Add(CheckInterval)) {
+		t.Fatalf("successful retry snapshot = %+v", snapshot)
+	}
+}
+
+func TestLegacyUpdateStateMigratesAndSnapshotIsQueryable(t *testing.T) {
+	root := t.TempDir()
+	lastCheck := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	legacy := map[string]any{"server": "https://updates.example", "manifestUrl": "https://updates.example/update.json", "lastCheck": lastCheck}
+	if err := writeJSON(filepath.Join(root, ".state", "update-state.json"), legacy); err != nil {
+		t.Fatal(err)
+	}
+	u, err := New(Config{ServerURL: "https://updates.example", InstallDir: root, VersionCode: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := u.Snapshot()
+	if !snapshot.LastAttempt.Equal(lastCheck) || !snapshot.LastSuccessfulCheck.Equal(lastCheck) || snapshot.Phase != "idle" {
+		t.Fatalf("legacy migration snapshot = %+v", snapshot)
+	}
+	if delay := u.nextCheck(); delay < CheckInterval-2*time.Hour || delay > CheckInterval-time.Hour {
+		t.Fatalf("legacy successful check interval = %s", delay)
+	}
+}
+
 func TestRunAlwaysChecksAtStartupThenWaitsTwentyHours(t *testing.T) {
 	if CheckInterval != 20*time.Hour {
 		t.Fatalf("unexpected interval: %s", CheckInterval)

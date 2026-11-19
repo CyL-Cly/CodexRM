@@ -2,7 +2,7 @@
 
 自托管的 Codex 远程工作区。电脑上的 Go Agent 启动本地 Codex，通过出站 WebSocket 连接 Go 服务器；浏览器完成配对后即可远程操作。响应式 Web 界面支持深浅主题、手机布局和可安装的 PWA。
 
-> CodexRM 是独立的社区项目，不是 OpenAI 官方产品。使用真实模式前，需要自行安装并配置 Codex 客户端。
+> CodexRM 是独立的社区项目，不是 OpenAI 官方产品。使用真实模式前，请安装并登录 Codex 桌面版，或自行安装并配置 Codex CLI。
 
 ```text
 浏览器 ── HTTPS / WebSocket ── 中继服务器 :18080
@@ -12,7 +12,7 @@
                             Codex app-server
 ```
 
-功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
+功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复；发送在途记录独立保存，进程或页面中断后标记为“发送状态未确认”，先同步核对，不自动重发。配对失效可直接重新配对，草稿继续保留。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
 
 网页采用 DeepSeek Harness 的主题、侧栏、居中新对话页、圆角输入区、消息气泡和模型菜单布局，适配 CodexRM 的设备、工作区和 Codex 通信。模型菜单提供按供应商分组、搜索及思考强度选择。新对话沿用当前浏览器内这台设备最近选择或成功发送使用的供应商、模型和思考强度，跨工作区、刷新后保留；仅查看旧对话不会覆盖最近选择。无记录或模型已不可用时，选择可用的默认模型。复用主题和布局样式的 MIT 许可见 `web/dsh-LICENSE.txt`。
 
@@ -38,7 +38,7 @@
 
 ## PWA 与加载缓存
 
-页面提供 Web App Manifest、桌面/移动端安装图标和 Service Worker，可通过浏览器“安装应用”使用独立窗口。首次在线访问后会预缓存应用壳，离线仍可打开界面和恢复本地草稿；远程设备连接、发送任务和同步会话仍需网络。
+页面提供 Web App Manifest、桌面/移动端安装图标和 Service Worker，可通过浏览器“安装应用”使用独立窗口；iOS 提供“分享 → 添加到主屏幕”的引导。首次在线访问后会预缓存应用壳，离线仍可打开界面和恢复本地草稿，并明确区分浏览器断网与远程 Agent 离线；远程设备连接、发送任务和同步会话仍需网络。新版本下载后由用户确认更新，运行中任务或未确认发送不会被强制刷新中断。
 
 静态加载使用三层 Cache Storage：版本化应用壳采用缓存优先，页面采用网络优先并保留离线副本，Manifest 与图标采用运行时缓存和 stale-while-revalidate。版本化 JS/CSS 同时使用浏览器一年 immutable HTTP 缓存；HTML 和 Service Worker 每次检查更新。旧版本缓存会在升级后自动清理。`/api/`、带 Authorization 的请求、非 GET、跨域请求及 WebSocket 不经过 Service Worker 缓存，会话和配对响应不会写入 Cache Storage。
 
@@ -54,7 +54,7 @@ cd codexrm
 
 Windows 上可双击根目录的 `build.bat`，依次选择 Windows / Linux 和 Agent / Server，也可选择同时构建两者。程序输出到 `build/bin`：Windows 文件为 `codexrm-server.exe`、`codexrm-agent.exe`，Linux amd64 文件带 `-linux-amd64` 后缀。
 
-也可直接运行 `.\build\scripts\build.ps1`，默认构建 Windows Agent 和 Server；加 `-Linux` 构建 Linux 版本，加 `-Target Agent` 或 `-Target Server` 单独构建。页面已内嵌至服务端二进制，不依赖额外的静态文件目录。
+也可直接运行 `.\build\scripts\build.ps1`，默认构建 Windows Agent 和 Server；加 `-Linux` 构建 Linux 版本，加 `-Target Agent` 或 `-Target Server` 单独构建。Server 从磁盘 `web/` 目录提供页面，部署时需同时部署二进制与该目录；页面不内嵌至服务端二进制。
 
 启动本地连接器：
 
@@ -62,7 +62,15 @@ Windows 上可双击根目录的 `build.bat`，依次选择 Windows / Linux 和 
 .\build\bin\codexrm-agent.exe
 ```
 
-Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 RM URL 时，每次启动都会自动打开本机设置页面；也可右键托盘图标选择 **设置**。填写远程服务器和连接授权密钥后保存，Agent 自动连接。设置页可生成配对码、显示二维码、查看和移除已配对设备；更新服务器固定为 `https://codexrm.dagongren.tech/`，不在设置中显示。
+Windows Agent 直接在系统托盘运行，不依赖 PowerShell。全新安装默认连接公共中继 `https://codexrm.ooth.tech`，无需连接授权密钥。右键托盘图标选择 **设置** 可更换服务器和填写该服务器所需的密钥，保存后 Agent 自动重连。设置页可生成配对码、显示二维码、查看和移除已配对设备；更新服务器固定为 `https://codexrm.dagongren.tech/`，不在设置中显示。
+
+首次使用按以下五步完成验证：
+
+1. 安装并登录 Codex 桌面版，或配置好 Codex CLI，然后启动 Agent。
+2. 在托盘设置页确认服务器状态为“已连接”，点击 **生成配对码**。
+3. 打开中继网页（公共中继为 `https://codexrm.ooth.tech`），扫描二维码或输入一次性配对码。配对失效时直接点击 **重新配对**，本地草稿会保留。
+4. 在侧栏“工作区”旁点击 **+**，选择电脑上的项目目录。
+5. 发送“请说明当前项目结构”。能收到流式回复即完成连接验证；失败时按页面中的连接状态、错误原因和重试按钮处理，不要重复提交未确认的任务。
 
 ```powershell
 .\build\bin\codexrm-agent.exe --settings
@@ -73,11 +81,21 @@ Windows Agent 直接在系统托盘运行，不依赖 PowerShell。尚未配置 
 
 已配对设备使用该浏览器检测到的完整 WebGL GPU 型号作为名称；检测不可用时回退为系统和浏览器名称。旧配对在浏览器重新连接后自动更新名称，无需重新配对。
 
+## Linux 无桌面设置
+
+启动 `codexrm-agent` 后，设置页默认只监听 `127.0.0.1`，不会暴露到局域网；这适合通过 SSH 端口转发或本机浏览器访问。首次由系统分配一个空闲端口，生成随机访问凭证，URL 中的 `#...` 片段仅保存在本机，随启动日志输出。重启会复用同一端口和凭证。用 SSH 隧道时可执行 `ssh -L 8080:127.0.0.1:<port> user@host`，再在本机浏览器打开 `http://127.0.0.1:8080/`。
+
+确需从可信局域网直接访问时，显式传入 `--lan-settings`。此模式会把端口和随机密码保存到 `connection.json` 同目录的 `settings-access.json`（权限 `0600`），默认位置是 `~/.config/CodexRM/.state/settings-access.json`，如从安装目录的 `bin/` 启动则使用安装目录中的 `.state/`，也可通过 `--config` 指定连接配置路径。启动日志会显示端口和配置文件路径，在浏览器中用 `http://<Agent 的局域网 IP>:<port>/` 打开并输入文件中的 `password`。重启继续使用同一端口和密码，端口被占用时启动会报错。
+
+设置页使用 HTTP；LAN 模式请通过防火墙把端口限制在可信局域网内，并优先使用 SSH 隧道，避免在不可信网络中传输密码、连接密钥和配对码。可用 `--restart` 通知同配置目录的旧实例退出，或 `--settings` 打开已有实例的设置页。
+
+Linux amd64 的独立 Agent 包支持自动更新，也可以在设置页点击“检查更新”。运行账号需要拥有 Agent 二进制并能写入其所在目录。详见 [Linux Agent 自更新](docs/updates.md#linux-agent-自更新)。
+
 ## 其他 Windows 电脑安装
 
 需要在 Windows“已安装的应用”中使用 **移动** 更换安装磁盘时，使用原生 **MSIX 版 CodexRM Agent**，参见 [MSIX 安装与跨盘移动](docs/windows-msix.md)。可运行 `.\build\scripts\package-msix.ps1` 构建；MSIX 由 Windows 管理安装、移动、更新和卸载。
 
-双击 `CodexRM-Setup.exe` 即可打开安装向导。安装器内置 Agent，支持自定义目录和离线安装。首次启动后可在本机设置页配置 RM URL 和密钥。
+双击 `CodexRM-Setup.exe` 即可打开安装向导。安装器内置 Agent，支持自定义目录和离线安装。首次启动后，可从本机设置页生成配对码或改用自托管服务器。
 
 默认安装到 `%LOCALAPPDATA%\CodexRM`，提供开始菜单入口，可选登录自启动和桌面快捷方式。从 Windows「已安装的应用」中卸载。
 
@@ -217,7 +235,7 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | `GET /api/v1/health` | 健康检查 |
 | `GET /update.json` | Windows 客户端自动更新清单 |
 | `GET /android-update.json` | Android 客户端手动更新清单 |
-| `GET /linux-update.json` | Linux amd64 Agent 手动更新清单 |
+| `GET /linux-update.json` | Linux amd64 Agent 更新清单 |
 | `POST /api/v1/agent/enroll` | 注册/续期，远程注册需 `X-Enrollment-Key` |
 | `POST /api/v1/agent/pair` | Agent 生成配对码 |
 | `GET /api/v1/agent/pair/status` | 查询配对状态，需 Agent token |

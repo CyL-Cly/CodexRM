@@ -15,14 +15,17 @@ import (
 )
 
 const (
-	punchPing       byte = 1
-	punchSelected   byte = 2
-	punchConfirm    byte = 3
-	punchTick            = 5 * time.Millisecond
-	candidateRetry       = 40 * time.Millisecond
-	lanHeadStart         = 600 * time.Millisecond
-	maxPunchSockets      = 256
-	maxProbeTargets      = 2048
+	punchPing           byte = 1
+	punchSelected       byte = 2
+	punchConfirm        byte = 3
+	punchTick                = 5 * time.Millisecond
+	candidateRetry           = 40 * time.Millisecond
+	lanHeadStart             = 600 * time.Millisecond
+	maxPunchSockets          = 256
+	maxProbeTargets          = 2048
+	dualNATPunchTimeout      = 8 * time.Second
+	dualNATProbeTargets      = 100
+	dualNATPunchSockets      = 32
 )
 
 func exactWindow(local, remote string) time.Duration {
@@ -75,8 +78,8 @@ func predictedTargets(exact []netip.AddrPort, step int) []netip.AddrPort {
 }
 
 // Start with the observed step, then nearby ports, then other ports on the same addresses.
-func expandedTargets(exact []netip.AddrPort, step int) []netip.AddrPort {
-	seen := make(map[netip.AddrPort]bool, maxProbeTargets)
+func expandedTargets(exact []netip.AddrPort, step, budget int) []netip.AddrPort {
+	seen := make(map[netip.AddrPort]bool, budget)
 	var out []netip.AddrPort
 	var ips []netip.Addr
 	for _, a := range exact {
@@ -89,7 +92,7 @@ func expandedTargets(exact []netip.AddrPort, step int) []netip.AddrPort {
 		return nil
 	}
 	add := func(a netip.AddrPort) {
-		if !seen[a] && len(seen) < maxProbeTargets {
+		if !seen[a] && len(seen) < budget {
 			seen[a] = true
 			out = append(out, a)
 		}
@@ -98,19 +101,21 @@ func expandedTargets(exact []netip.AddrPort, step int) []netip.AddrPort {
 	for _, a := range predictedTargets(exact, step) {
 		add(a)
 	}
-	for d := 1; d <= 64; d++ {
+	// Leave room for randomized ports even with the smaller dual-NAT budget.
+	nearLimit := budget - budget/4
+	for d := 1; d <= 64 && len(seen) < nearLimit; d++ {
 		for _, a := range exact {
 			if !canExpand(a.Addr()) {
 				continue
 			}
 			for _, port := range [...]int{int(a.Port()) + d, int(a.Port()) - d} {
-				if port >= minPort && port <= 65535 {
+				if port >= minPort && port <= 65535 && len(seen) < nearLimit {
 					add(netip.AddrPortFrom(a.Addr(), uint16(port)))
 				}
 			}
 		}
 	}
-	for len(seen) < maxProbeTargets {
+	for len(seen) < budget {
 		p := uint16(minPort + rand.IntN(65536-minPort))
 		for _, ip := range ips {
 			add(netip.AddrPortFrom(ip, p))
@@ -122,7 +127,7 @@ func expandedTargets(exact []netip.AddrPort, step int) []netip.AddrPort {
 type agentProbes struct {
 	exact, extra           []netip.AddrPort
 	exactIndex, extraIndex int
-	step                   int
+	step, budget           int
 	expanded               bool
 	nextExact              time.Time
 }
@@ -132,7 +137,7 @@ func (p *agentProbes) next(now, expandAt time.Time) netip.AddrPort {
 		return netip.AddrPort{}
 	}
 	if !now.Before(expandAt) && !p.expanded {
-		p.extra, p.expanded = expandedTargets(p.exact, p.step), true
+		p.extra, p.expanded = expandedTargets(p.exact, p.step, p.budget), true
 	}
 	if p.exactIndex < len(p.exact) || !now.Before(p.nextExact) {
 		a := p.exact[p.exactIndex%len(p.exact)]
@@ -154,7 +159,7 @@ type probe struct {
 	kind   byte
 }
 
-func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, exactFor time.Duration, step int) (int, netip.AddrPort, error) {
+func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, exactFor time.Duration, step int, dualNAT bool) (int, netip.AddrPort, error) {
 	role, other := byte(1), byte(2)
 	if s.agent {
 		role, other = other, role
@@ -178,9 +183,15 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 	events := make(chan probe, 1024)
 	publicIPs, localIPs := make(map[netip.Addr]bool), make(map[netip.Addr]bool)
 	grow := false
+	var ipv4, ipv6 []netip.AddrPort
 	for _, a := range targets {
 		publicIPs[a.Addr()] = true
-		grow = grow || canExpand(a.Addr())
+		if a.Addr().Is4() {
+			ipv4 = append(ipv4, a)
+			grow = grow || canExpand(a.Addr())
+		} else {
+			ipv6 = append(ipv6, a)
+		}
 	}
 	for _, a := range local {
 		localIPs[a.Addr()] = true
@@ -195,6 +206,7 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 				if err != nil {
 					return
 				}
+				from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
 				if n != 38 || (!publicIPs[from.Addr()] && !localIPs[from.Addr()]) {
 					continue
 				}
@@ -227,11 +239,15 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 		publicAfter = publicAfter.Add(lanHeadStart)
 	}
 	expandAt := publicAfter.Add(exactFor)
-	var nextPrimary, nextLocal, nextSelect, nextRepeat time.Time
+	var nextPrimary, nextIPv6, nextLocal, nextSelect, nextRepeat time.Time
 	var lastSelected netip.AddrPort
 	extraIndex := 1
-	probes := agentProbes{exact: targets, step: step}
-	predicted := predictedTargets(targets, step)
+	probeBudget, socketLimit := maxProbeTargets, maxPunchSockets
+	if dualNAT {
+		probeBudget, socketLimit = dualNATProbeTargets, dualNATPunchSockets
+	}
+	probes := agentProbes{exact: ipv4, step: step, budget: probeBudget}
+	predicted := predictedTargets(ipv4, step)
 	predIndex := 0
 	var nextPred time.Time
 	// A candidate is only nominated after a confirm from that endpoint. Keep
@@ -281,7 +297,14 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 				pingAll(0, local)
 				nextLocal = now.Add(candidateRetry)
 			}
-			if len(targets) == 0 || now.Before(publicAfter) {
+			if now.Before(publicAfter) {
+				continue
+			}
+			if len(ipv6) > 0 && !now.Before(nextIPv6) {
+				pingAll(0, ipv6)
+				nextIPv6 = now.Add(candidateRetry)
+			}
+			if len(ipv4) == 0 {
 				continue
 			}
 			if s.agent {
@@ -291,7 +314,7 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 				continue
 			}
 			if !now.Before(nextPrimary) {
-				pingAll(0, targets)
+				pingAll(0, ipv4)
 				nextPrimary = now.Add(candidateRetry)
 			}
 			if now.Before(expandAt) {
@@ -307,7 +330,7 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 			if step >= 1 && step <= 32 && s.mapping != protocol.P2PMappingVaries {
 				continue
 			}
-			if grow && len(s.sockets) < maxPunchSockets {
+			if grow && len(s.sockets) < socketLimit {
 				c, err := s.openSocket()
 				if err != nil {
 					// Existing sockets still work even when we hit a local resource limit.
@@ -315,12 +338,12 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 				} else {
 					i := len(s.sockets) - 1
 					listen(i, c)
-					pingAll(i, targets)
+					pingAll(i, ipv4)
 					continue
 				}
 			}
 			if len(s.sockets) > 1 {
-				pingAll(extraIndex, targets)
+				pingAll(extraIndex, ipv4)
 				extraIndex = 1 + extraIndex%(len(s.sockets)-1)
 			}
 		}
