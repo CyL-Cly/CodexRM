@@ -162,15 +162,12 @@ func TestProviderRoutingWithLocalCodex(t *testing.T) {
 	}
 	turn(0, "rotated-test-key-one")
 	turn(1, "test-key-two")
-	_ = app.Close()
-	app = launch()
 	params := map[string]any{"threadId": threads[0], "codexrmProvider": items[1].ID, "model": "same-model", "excludeTurns": true}
 	if err := a.prepareProvider(ctx, app, "thread/resume", params); err != nil {
 		t.Fatal(err)
 	}
-	for key, value := range items[0].Overrides() {
-		params["config"].(map[string]any)[key] = value
-	}
+	params["modelProvider"] = items[0].RuntimeID()
+	params["config"] = map[string]any{"model_providers."+items[0].RuntimeID(): items[1].Overrides()["model_providers."+items[1].RuntimeID()]}
 	result := queueCall(t, app, "thread/resume", params)
 	t.Logf("switched outer=%v inner=%v", result["modelProvider"], result["thread"].(map[string]any)["modelProvider"])
 	turn(0, "test-key-two")
