@@ -124,7 +124,7 @@ func TestProviderRoutingWithLocalCodex(t *testing.T) {
 		}
 		select {
 		case got := <-requests:
-			if got.Path != map[string]string{"test-key-one": "/1/responses", "rotated-test-key-one": "/1/responses", "test-key-two": "/2/responses"}[key] || got.Token != "Bearer "+token || got.Model != "same-model" {
+			if got.Path != map[string]string{"test-key-one": "/1/responses", "rotated-test-key-one": "/1/responses", "test-key-two": "/2/responses"}[token] || got.Token != "Bearer "+token || got.Model != "same-model" {
 				t.Fatalf("wrong supplier request: %#v", got)
 			}
 		case <-ctx.Done():
@@ -167,6 +167,9 @@ func TestProviderRoutingWithLocalCodex(t *testing.T) {
 	params := map[string]any{"threadId": threads[0], "codexrmProvider": items[1].ID, "model": "same-model", "excludeTurns": true}
 	if err := a.prepareProvider(ctx, app, "thread/resume", params); err != nil {
 		t.Fatal(err)
+	}
+	for key, value := range items[0].Overrides() {
+		params["config"].(map[string]any)[key] = value
 	}
 	result := queueCall(t, app, "thread/resume", params)
 	t.Logf("switched outer=%v inner=%v", result["modelProvider"], result["thread"].(map[string]any)["modelProvider"])
