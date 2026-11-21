@@ -86,18 +86,11 @@ jobs:
           }
           "INNO_ISCC=$compiler" >> $env:GITHUB_ENV
 
-      - name: Package Windows offline installer and server
+      - name: Package Windows Agent offline installer
         shell: pwsh
         run: |
-          & ./build/scripts/build.ps1 -Target All
+          & ./build/scripts/build.ps1 -Target Agent
           & ./build/scripts/package-setup.ps1 -OutputPath "nightly-dist/CodexRM-$env:TAG-windows-amd64-Setup.exe"
-
-          $serverDir = Join-Path $env:RUNNER_TEMP 'codexrm-windows-server-amd64'
-          New-Item -ItemType Directory -Path $serverDir | Out-Null
-          Copy-Item -LiteralPath './build/bin/codexrm-server.exe', './LICENSE' -Destination $serverDir
-          Copy-Item -LiteralPath './web' -Destination $serverDir -Recurse
-          Remove-Item -LiteralPath (Join-Path $serverDir 'web/app.test.mjs'), (Join-Path $serverDir 'web/sw.test.mjs')
-          Compress-Archive -Path (Join-Path $serverDir '*') -DestinationPath "nightly-dist/CodexRM-$env:TAG-windows-amd64-server.zip"
 
       - uses: actions/upload-artifact@v7.0.2
         with:
@@ -124,21 +117,26 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Package Linux amd64
+      - name: Package Linux Server for amd64 and arm64
         env:
           CGO_ENABLED: 0
-          GOARCH: amd64
           GOOS: linux
         run: |
           out="$PWD/nightly-dist"
-          linux="$RUNNER_TEMP/codexrm-linux-amd64"
-          mkdir -p "$out" "$linux"
-          go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-agent" ./cmd/codexrm-agent
-          go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-server" ./cmd/codexrm-server
-          git archive HEAD web | tar -x -C "$linux"
-          rm -f "$linux/web/app.test.mjs" "$linux/web/sw.test.mjs"
-          cp LICENSE "$linux/"
-          tar -czf "$out/CodexRM-$TAG-linux-amd64.tar.gz" -C "$linux" .
+          mkdir -p "$out"
+          for arch in amd64 arm64; do
+            linux="$RUNNER_TEMP/codexrm-linux-$arch"
+            mkdir -p "$linux"
+            GOARCH="$arch" go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-server" ./cmd/codexrm-server
+            # Keep the Linux Agent in the existing amd64 bundle.
+            if [[ "$arch" == amd64 ]]; then
+              GOARCH="$arch" go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-agent" ./cmd/codexrm-agent
+            fi
+            git archive HEAD web | tar -x -C "$linux"
+            rm -f "$linux/web/app.test.mjs" "$linux/web/sw.test.mjs"
+            cp LICENSE "$linux/"
+            tar -czf "$out/CodexRM-$TAG-linux-$arch.tar.gz" -C "$linux" .
+          done
 
       - uses: actions/setup-java@v6.3.0
         with:
@@ -187,8 +185,8 @@ jobs:
         run: |
           assets=(
             "CodexRM-$TAG-windows-amd64-Setup.exe"
-            "CodexRM-$TAG-windows-amd64-server.zip"
             "CodexRM-$TAG-linux-amd64.tar.gz"
+            "CodexRM-$TAG-linux-arm64.tar.gz"
             "CodexRM-$TAG-android-arm64-debug.apk"
           )
           sha256sum "${assets[@]}" > SHA256SUMS.txt
