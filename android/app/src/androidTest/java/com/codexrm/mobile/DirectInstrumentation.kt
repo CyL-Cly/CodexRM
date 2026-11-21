@@ -28,6 +28,11 @@ class DirectInstrumentation : Instrumentation() {
         var activity: Activity? = null
         try {
             check(targetContext.packageName.endsWith(".p2pqa"))
+            if (args.getString("conversation") == "true") {
+                result.putString("stream", "\n" + ConversationFeaturesCheck.run(this, args) + "\n")
+                finish(Activity.RESULT_OK, result)
+                return
+            }
             check(NativeP2P.available)
             check(!targetContext.getSystemService(KeyguardManager::class.java).isKeyguardLocked) {
                 "Unlock the device normally before running this test"
@@ -65,7 +70,7 @@ class DirectInstrumentation : Instrumentation() {
                 "com.codexrm.mobile.MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             activity = screen
             if (verifyFiles) {
-                result.putString("stream", "\n" + DirectFilesCheck.verify(this, screen) + "\n")
+                result.putString("stream", "\n" + DirectFilesCheck.verify(this, screen, device, args.getString("customDownloads") == "true", args.getString("batchCopy") == "true") + "\n")
                 runOnMainSync { screen.finish() }
                 finish(Activity.RESULT_OK, result)
                 return
@@ -141,6 +146,7 @@ class DirectInstrumentation : Instrumentation() {
             runOnMainSync { screen.finish() }
             finish(Activity.RESULT_OK, result)
         } catch (failure: Throwable) {
+            Log.e("CodexRM-P2P-QA", "Instrumentation failed", failure)
             activity?.let { screen -> runOnMainSync { screen.finish() } }
             result.putString("error", failure.toString())
             finish(Activity.RESULT_CANCELED, result)

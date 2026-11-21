@@ -41,7 +41,7 @@ class ImageFileCacheTest {
         val directory = temporary.newFolder()
         val cache = ImageFileCache(directory)
         val file = cache.write("../../private?token=secret") { it.write(byteArrayOf(1)) }
-        assertEquals(directory.canonicalFile, file.parentFile.canonicalFile)
+        assertEquals(directory.canonicalFile, file.parentFile?.canonicalFile)
         assertTrue(file.name.matches(Regex("[a-f0-9]{64}\\.image")))
         assertNull(cache.read("another-device"))
     }

@@ -46,6 +46,8 @@ android {
     namespace = "com.codexrm.mobile"
     compileSdk = 36
     ndkVersion = "28.2.13676358"
+    val releaseQa = project.hasProperty("codexrm.releaseQa")
+    testBuildType = if (releaseQa) "release" else "debug"
 
     val imageQa = project.hasProperty("codexrm.imageQa")
     val mathQa = project.hasProperty("codexrm.mathQa")
@@ -56,8 +58,8 @@ android {
         minSdk = 28
         targetSdk = 35
         ndk { abiFilters.add("arm64-v8a") }
-        versionCode = 27
-        versionName = "1.0.26"
+        versionCode = 43
+        versionName = "1.0.42"
         testInstrumentationRunner = if (p2pQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {

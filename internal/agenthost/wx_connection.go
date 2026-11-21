@@ -24,9 +24,14 @@ func (h *Host) SetWXLocalRelay(raw string) error {
 	return nil
 }
 
-func (h *Host) runWXConnection(ctx context.Context, version uint64) {
+func (h *Host) runWXConnection(ctx context.Context, version uint64, relay, key string) {
 	cfg := h.base
-	cfg.ServerURL, cfg.EnrollmentKey = h.wxLocalServer, ""
+	h.mu.Lock()
+	selected := h.config
+	h.mu.Unlock()
+	cfg = withLocalSettings(cfg, selected)
+	cfg.ServerURL, cfg.EnrollmentKey = relay, key
+	cfg.OneBotSettingsPath = "" // The primary Agent owns the local OneBot listener.
 	cfg.CheckForUpdate = nil
 	cfg.NoAutoPair = true
 	a, err := agent.NewForServer(cfg)
@@ -67,4 +72,18 @@ func (h *Host) currentWX(ctx context.Context) (*agent.Agent, context.Context, fu
 	requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	stop := context.AfterFunc(h.wxActiveCtx, cancel)
 	return h.wxActive, requestCtx, func() { stop(); cancel() }, nil
+}
+
+func (h *Host) waitWXAgent(ctx context.Context) (*agent.Agent, context.Context, func(), error) {
+	for {
+		a, requestCtx, done, err := h.currentWX(ctx)
+		if err == nil {
+			return a, requestCtx, done, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, nil, err
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 }

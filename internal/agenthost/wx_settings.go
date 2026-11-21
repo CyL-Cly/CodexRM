@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os/exec"
 	"regexp"
 	"runtime"
 	"slices"
@@ -30,11 +29,12 @@ var wxTransport = &http.Client{
 }
 
 type wxAccount struct {
-	ID       string `json:"id"`
-	WxID     string `json:"wxid"`
-	Name     string `json:"name"`
-	LoggedIn bool   `json:"loggedIn"`
-	address  netip.Addr
+	ID           string         `json:"id"`
+	WxID         string         `json:"wxid"`
+	Name         string         `json:"name"`
+	LoggedIn     bool           `json:"loggedIn"`
+	Capabilities wxCapabilities `json:"capabilities"`
+	address      netip.Addr
 }
 
 type wxSettings struct {
@@ -49,10 +49,11 @@ func wxAccounts(ctx context.Context) ([]wxAccount, error) {
 	if !wxSupported {
 		return []wxAccount{}, nil
 	}
-	if _, err := exec.LookPath("docker"); errors.Is(err, exec.ErrNotFound) {
+	docker, err := wxLookPath("docker")
+	if err != nil {
 		return []wxAccount{}, nil
 	}
-	out, err := exec.CommandContext(ctx, "docker", "--host", "unix:///var/run/docker.sock", "ps", "-a", "--format", "{{.Names}}").Output()
+	out, err := wxCommandOutput(ctx, docker, wxDockerArgs("ps", "-a", "--format", "{{.Names}}")...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +82,11 @@ func inspectWXAccount(ctx context.Context, id string) wxAccount {
 	if !wxSupported || !wxContainerName.MatchString(id) {
 		return account
 	}
-	out, err := exec.CommandContext(ctx, "docker", "--host", "unix:///var/run/docker.sock", "inspect", "--type=container", "--format", `{{if and .State.Running (eq .Path "/app/wechat-robot-client")}}{{with index .NetworkSettings.Networks "wechat-robot"}}{{.IPAddress}}{{end}}{{end}}`, id).Output()
+	docker, err := wxLookPath("docker")
+	if err != nil {
+		return account
+	}
+	out, err := wxCommandOutput(ctx, docker, wxDockerArgs("inspect", "--type=container", "--format", `{{if and .State.Running (eq .Path "/app/wechat-robot-client")}}{{with index .NetworkSettings.Networks "wechat-robot"}}{{.IPAddress}}{{end}}{{end}}`, id)...)
 	if err != nil {
 		return account
 	}
@@ -90,6 +95,9 @@ func inspectWXAccount(ctx context.Context, id string) wxAccount {
 		return account
 	}
 	account.address = addr
+	if account.call(ctx, http.MethodGet, "codexrm/capabilities", nil, &account.Capabilities) == nil {
+		account.Capabilities.CodexRM = true
+	}
 	var identity struct {
 		WxID string `json:"Wxid"`
 		Name string `json:"NickName"`
@@ -99,6 +107,9 @@ func inspectWXAccount(ctx context.Context, id string) wxAccount {
 	}
 	if account.WxID != "" {
 		_ = account.call(ctx, http.MethodGet, "is-loggedin", nil, &account.LoggedIn)
+	}
+	if account.LoggedIn && !account.Capabilities.CodexRM {
+		account.Capabilities.CodexRM = account.call(ctx, http.MethodGet, "codexrm/settings", nil, nil) == nil
 	}
 	return account
 }
@@ -119,7 +130,11 @@ func (a wxAccount) call(ctx context.Context, method, path string, value, result 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := wxTransport.Do(req)
+	transport := *wxTransport
+	if path == "contacts/sync" || path == "chat-room/members/sync" || path == "oss-settings/test" {
+		transport.Timeout = 0
+	}
+	resp, err := transport.Do(req)
 	if err != nil {
 		return errors.New("无法访问微信机器人容器")
 	}
@@ -171,6 +186,9 @@ type wxInput struct {
 }
 
 func (h *Host) wxConfigure(ctx context.Context, account wxAccount, input wxInput) error {
+	if input.Enabled && !account.Capabilities.CodexOnly {
+		return errors.New("请先升级机器人客户端至支持仅 Codex 回复的版本")
+	}
 	h.opMu.Lock()
 	defer h.opMu.Unlock()
 	var before wxSettings
@@ -183,11 +201,16 @@ func (h *Host) wxConfigure(ctx context.Context, account wxAccount, input wxInput
 		relay = h.config.Server
 	}
 	h.mu.Unlock()
-	if input.Enabled && !wxLocalRelay(relay) {
-		return errors.New("微信机器人自动接入需要在连接器中配置本机 CodexRM 中继地址")
+	if input.Enabled && !before.Paired && !wxLocalRelay(relay) {
+		if err := h.ensureWXRelay(ctx); err != nil {
+			return err
+		}
+		h.mu.Lock()
+		relay = h.wxLocalServer
+		h.mu.Unlock()
 	}
-	if before.Paired && before.ServerURL != relay && input.Enabled {
-		return errors.New("该微信机器人已授权给另一中继，请先解除原授权")
+	if before.Paired && input.Enabled {
+		relay = before.ServerURL
 	}
 	server := before.ServerURL
 	if input.Enabled {
@@ -199,7 +222,7 @@ func (h *Host) wxConfigure(ctx context.Context, account wxAccount, input wxInput
 	if !input.Enabled || before.Paired {
 		return nil
 	}
-	a, pairCtx, done, err := h.currentWX(ctx)
+	a, pairCtx, done, err := h.waitWXAgent(ctx)
 	if err == nil {
 		defer done()
 		var code string
@@ -213,7 +236,7 @@ func (h *Host) wxConfigure(ctx context.Context, account wxAccount, input wxInput
 	if err != nil {
 		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 6*time.Second)
 		defer cancel()
-		restore := map[string]any{"enabled": before.Enabled, "server_url": server, "workspace_alias": before.WorkspaceAlias}
+		restore := map[string]any{"enabled": before.Enabled, "server_url": before.ServerURL, "workspace_alias": before.WorkspaceAlias}
 		_ = account.call(restoreCtx, http.MethodPost, "codexrm/settings", restore, nil)
 	}
 	return err
@@ -242,7 +265,7 @@ func wxLocalRelay(raw string) bool {
 
 func (h *Host) wxSettings(w http.ResponseWriter, r *http.Request) {
 	method, route := r.Method, r.PathValue("action")
-	allowed := map[string]string{"settings": "GET POST", "access": "GET POST", "commands": "GET POST", "command-enabled": "POST", "command-users": "POST", "disconnect": "POST"}
+	allowed := map[string]string{"settings": "GET POST", "access": "GET POST", "commands": "GET POST", "command-enabled": "POST", "command-users": "POST", "disconnect": "POST", "group": "GET POST", "groups": "GET"}
 	if !slices.Contains(strings.Fields(allowed[route]), method) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -275,10 +298,13 @@ func (h *Host) wxSettings(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]bool{"ok": true})
 		return
 	}
-	paths := map[string]string{"settings": "settings", "access": "access", "commands": "commands", "command-enabled": "commands/enabled", "command-users": "commands/users", "disconnect": "revoke"}
+	paths := map[string]string{"settings": "settings", "access": "access", "commands": "commands", "command-enabled": "commands/enabled", "command-users": "commands/users", "disconnect": "revoke", "group": "group", "groups": "groups"}
 	path := "codexrm/" + paths[route]
 	if route == "access" && method == http.MethodGet {
 		path += "?wechat_id=" + url.QueryEscape(r.URL.Query().Get("friend"))
+	}
+	if route == "group" && method == http.MethodGet {
+		path += "?group_id=" + url.QueryEscape(r.URL.Query().Get("friend"))
 	}
 	var result json.RawMessage
 	var payload any

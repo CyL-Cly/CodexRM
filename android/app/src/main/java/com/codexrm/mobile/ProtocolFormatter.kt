@@ -16,13 +16,16 @@ internal object ProtocolFormatter {
         )
     }
 
-    fun fromItem(item: JSONObject): ChatMessage {
-        val id = item.string("id").ifEmpty { "item-${item.hashCode()}" }
+    fun fromItem(item: JSONObject, stableId: String = ""): ChatMessage {
+        // Identity must survive re-parsing the same page; object identity does not.
+        val id = item.string("id").ifEmpty { stableId.ifEmpty { "item-${item.toString().hashCode()}" } }
         val type = item.string("type")
         val images = MessageImages.fromItem(item)
         return when (type) {
-            "userMessage" -> ChatMessage(id, MessageKind.USER, "", userText(item))
-            "agentMessage" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"), files = ArtifactCard.fromItem(item))
+            "userMessage" -> ChatMessage(id, MessageKind.USER, "", userText(item),
+                questionReplies = AsyncQuestions.repliesIn(item.arrayAt("content")))
+            "agentMessage" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"),
+                files = ArtifactCard.fromItem(item), questions = AsyncQuestions.fromItem(item))
             "planMessage" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"))
             "imageView", "imageGeneration" -> ChatMessage(id, MessageKind.ASSISTANT, "Codex", item.string("text"), item.string("status"))
             "reasoning" -> ChatMessage(id, MessageKind.TOOL, "思考过程", reasoningText(item).bounded())
@@ -47,16 +50,27 @@ internal object ProtocolFormatter {
             )
             "contextCompaction" -> ChatMessage(id, MessageKind.STATUS, "", "上下文已压缩")
             else -> ChatMessage(id, MessageKind.TOOL, type.ifEmpty { "执行事件" }, item.toPrettyString().bounded())
-        }.also { it.images = images }
+        }.also {
+            it.images = images
+            if (type == "userMessage") it.userInput = item.optJSONArray("content")
+        }
     }
 
     fun update(message: ChatMessage, item: JSONObject) {
         val formatted = fromItem(item)
+        message.userInput = formatted.userInput
         message.change(formatted.title, formatted.body, formatted.status, formatted.images, formatted.files)
+        if (message.questions != formatted.questions || message.questionReplies != formatted.questionReplies) {
+            message.questions = formatted.questions
+            message.questionReplies = formatted.questionReplies
+            message.dirty = true
+        }
     }
 
     fun userText(item: JSONObject): String {
         val content = item.arrayAt("content")
+        val replies = AsyncQuestions.repliesIn(content)
+        if (replies.isNotEmpty()) return replies.joinToString("\n\n") { "${it.question}\n${it.answer}" }
         val parts = ArrayList<String>(content.length())
         for (index in 0 until content.length()) {
             val value = content.optJSONObject(index)

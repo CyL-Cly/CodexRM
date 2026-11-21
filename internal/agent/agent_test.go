@@ -76,8 +76,15 @@ func TestUpstream503NotificationPassesThrough(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		a := &Agent{relay: conn}
+		events := newRelayEventQueue(conn)
+		a := &Agent{relay: conn, relayEvents: events}
 		a.forward(raw)
+		select {
+		case frame := <-events.frames:
+			_ = a.writeRelayFrame(conn, frame)
+		default:
+			t.Error("notification was not queued")
+		}
 	}))
 	defer server.Close()
 

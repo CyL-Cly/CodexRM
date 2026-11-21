@@ -19,7 +19,7 @@ import kotlin.math.min
 
 private const val DUAL_UNPREDICTABLE_NAT = "dual_unpredictable_nat"
 
-internal enum class ConnectionState { CONNECTING, ONLINE, OFFLINE }
+internal enum class ConnectionState { CONNECTING, RECONNECTING, ONLINE, OFFLINE }
 internal class RpcOutcomeUnknown(message: String) : IOException(message)
 
 internal fun interface RpcCallback { fun onComplete(result: JSONObject?, error: Exception?) }
@@ -34,6 +34,7 @@ internal class CodexClient(
     context: Context,
     private val device: Device,
     private val listener: Listener,
+    private val relayOnly: Boolean = false,
 ) {
     internal interface Listener {
         fun onState(state: ConnectionState, agent: JSONObject?)
@@ -54,6 +55,7 @@ internal class CodexClient(
     private var nextId = 0
     private var reconnectAttempt = 0
     private var reconnect: Runnable? = null
+    private val welcomeTimeout = Runnable { scheduleReconnect() }
     private var direct: DirectTransport? = null
     private var directId = ""
     private var directActive = false
@@ -73,9 +75,9 @@ internal class CodexClient(
         override fun onAvailable(network: android.net.Network) {
             main.post {
                 if (!active || connectivity?.activeNetwork != network || network == defaultNetwork) return@post
-                val changed = defaultNetwork != null || socket != null
+                val changed = defaultNetwork != null || socket != null || reconnect != null
                 defaultNetwork = network
-                if (changed) scheduleReconnect()
+                if (changed) scheduleReconnect(networkRestored = true)
             }
         }
         override fun onLost(network: android.net.Network) {
@@ -104,17 +106,18 @@ internal class CodexClient(
         defaultNetwork = connectivity?.activeNetwork
         runCatching { connectivity?.registerDefaultNetworkCallback(networkCallback) }
         main.postDelayed(renewDirectLease, 4_000)
+        listener.onState(ConnectionState.CONNECTING, null)
         open()
     }
 
     private fun open() {
         if (!active) return
+        reconnect = null
         directAvailable = false
         directRetry.reset()
         resetDirectStatus()
         rejectPending("连接已中断")
         online = false
-        listener.onState(ConnectionState.CONNECTING, null)
         val currentGeneration = ++generation
         val url = device.serverUrl.trimEnd('/') + "/api/v1/client/ws"
         val request = Request.Builder()
@@ -137,7 +140,7 @@ internal class CodexClient(
                         listener.onState(ConnectionState.OFFLINE, null)
                         listener.onAuthorizationExpired()
                     } else {
-                        listener.onFailure(t.message ?: "WebSocket 连接失败")
+                        Log.d("CodexRM", "Relay WebSocket failed", t)
                         scheduleReconnect()
                     }
                 }
@@ -154,6 +157,8 @@ internal class CodexClient(
                 main.post { if (active && currentGeneration == generation) scheduleReconnect() }
             }
         })
+        // The WebSocket ping timer starts only after the handshake.
+        main.postDelayed(welcomeTimeout, 15_000)
     }
 
     private fun handle(text: String, onDirect: Boolean = false) {
@@ -162,9 +167,10 @@ internal class CodexClient(
         if (onDirect && (!directActive || type != "server_message")) return
         when (type) {
             "welcome", "agent_status" -> {
+                main.removeCallbacks(welcomeTimeout)
+                reconnectAttempt = 0
                 val wasOnline = online
                 online = envelope.string("status") == "connected"
-                if (online) reconnectAttempt = 0
                 listener.onState(if (online) ConnectionState.ONLINE else ConnectionState.OFFLINE, envelope.optJSONObject("agent"))
                 if (!online && wasOnline) {
                     dropDirect()
@@ -223,6 +229,7 @@ internal class CodexClient(
     }
 
     private fun tryDirect() {
+        if (relayOnly) return
         val now = SystemClock.elapsedRealtime()
         if (!active || !online || !directAvailable || direct != null || startTimeout != null || !NativeP2P.available) return
         main.removeCallbacks(retryDirect)
@@ -405,6 +412,10 @@ internal class CodexClient(
         request(method, params, requireDirect = false, timeoutMs = timeoutMs, callback = callback)
     }
 
+    fun requestProviderSettings(operation: String, params: JSONObject, requireDirect: Boolean, callback: RpcCallback) {
+        request("codexrm/provider/$operation", params, requireDirect, timeoutMs = 35_000, callback)
+    }
+
     fun requestDirectFile(operation: String, params: JSONObject, callback: RpcCallback) {
         request("codexrm/directFile/$operation", params, requireDirect = true, timeoutMs = 20_000, callback = callback)
     }
@@ -467,8 +478,9 @@ internal class CodexClient(
         return sent
     }
 
-    private fun scheduleReconnect() {
+    private fun scheduleReconnect(networkRestored: Boolean = false) {
         if (!active) return
+        main.removeCallbacks(welcomeTimeout)
         online = false
         dropDirect()
         resetDirectStatus()
@@ -476,10 +488,16 @@ internal class CodexClient(
         socket?.cancel()
         socket = null
         rejectPending("服务器连接中断")
-        listener.onState(ConnectionState.CONNECTING, null)
+        listener.onState(ConnectionState.RECONNECTING, null)
         reconnect?.let(main::removeCallbacks)
-        val delay = min(30_000L, 1_000L * (1 shl min(5, reconnectAttempt)))
-        reconnectAttempt++
+        val delay = if (networkRestored) {
+            reconnectAttempt = 0
+            0L
+        } else {
+            val retryDelay = min(30_000L, 1_000L * (1 shl reconnectAttempt))
+            reconnectAttempt = min(5, reconnectAttempt + 1)
+            retryDelay
+        }
         val task = Runnable { open() }
         reconnect = task
         main.postDelayed(task, delay)
@@ -500,6 +518,7 @@ internal class CodexClient(
         online = false
         runCatching { connectivity?.unregisterNetworkCallback(networkCallback) }
         main.removeCallbacks(renewDirectLease)
+        main.removeCallbacks(welcomeTimeout)
         dropDirect()
         cancelDirectTimers()
         generation++

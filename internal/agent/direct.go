@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/codexrm/codexrm/internal/appserver"
@@ -56,13 +57,55 @@ func (d *directSession) send(env protocol.Envelope) error {
 	}
 }
 
+type relayEventQueue struct {
+	conn   *websocket.Conn
+	frames chan []byte
+	bytes  atomic.Int64
+}
+
+func newRelayEventQueue(conn *websocket.Conn) *relayEventQueue {
+	return &relayEventQueue{conn: conn, frames: make(chan []byte, 64)}
+}
+
+func (q *relayEventQueue) enqueue(env protocol.Envelope) {
+	frame, err := json.Marshal(env)
+	if err != nil || len(frame) > protocol.MaxEnvelopeSize {
+		log.Print("discarded relay event exceeding the wire limit")
+		return
+	}
+	size := int64(len(frame))
+	if q.bytes.Add(size) <= 2*protocol.MaxEnvelopeSize {
+		select {
+		case q.frames <- frame:
+			return
+		default:
+		}
+	}
+	q.bytes.Add(-size)
+	// Reconnect to refresh client state when the relay cannot keep up.
+	_ = q.conn.Close()
+}
+
+func (a *Agent) writeRelayEvents(ctx context.Context, queue *relayEventQueue) {
+	for ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+			return
+		case frame := <-queue.frames:
+			err := a.writeRelayFrame(queue.conn, frame)
+			queue.bytes.Add(-int64(len(frame)))
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
 func (a *Agent) publishEvent(env protocol.Envelope) {
 	a.eventMu.Lock()
 	defer a.eventMu.Unlock()
-	a.mu.Lock()
-	relay := a.relay
-	a.mu.Unlock()
-	if relay == nil {
+	queue := a.relayEvents
+	if queue == nil {
 		return
 	}
 	delivered := 0
@@ -82,7 +125,7 @@ func (a *Agent) publishEvent(env protocol.Envelope) {
 	if env.ClientID == "" && a.eventClients != nil && delivered == len(a.eventClients) {
 		return
 	}
-	_ = a.write(relay, env)
+	queue.enqueue(env)
 }
 
 func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *websocket.Conn, slots chan struct{}, env protocol.Envelope) {

@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,12 +119,79 @@ func TestLANSettingsPersistAcrossHostRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer occupied.Close()
-	listener, _, err := listenLANSettings(accessPath)
+	listener, _, err := listenPasswordSettings(accessPath, "")
 	if err == nil {
 		listener.Close()
 		t.Fatal("occupied port fell back to a different port")
 	}
 	if saved, err := readSettingsAccess(accessPath); err != nil || saved != first {
 		t.Fatalf("bind failure changed the saved credentials: %v", err)
+	}
+}
+
+func TestLoopbackSettingsKeepPasswordPortAndBind(t *testing.T) {
+	path := filepath.Join(t.TempDir(), settingsAccessFile)
+	listener, password, err := listenPasswordSettings(path, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().(*net.TCPAddr)
+	if !addr.IP.IsLoopback() || password == "" {
+		listener.Close()
+		t.Fatal("password listener must bind only to loopback")
+	}
+	listener.Close()
+	second, saved, err := listenPasswordSettings(path, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if second.Addr().String() != addr.String() || saved != password {
+		t.Fatal("loopback endpoint changed across restart")
+	}
+}
+
+func TestSettingsSessionLogin(t *testing.T) {
+	password := settingsSecret()
+	server := httptest.NewServer(guardSettings(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), "", password, true, true))
+	defer server.Close()
+
+	const login = "/api/settings/login"
+	const settings = "/api/settings"
+	if code, body := request(t, server.URL, "", http.MethodGet, settings, nil); code != http.StatusUnauthorized || !bytes.Contains(body, []byte(`"sessionLogin":true`)) {
+		t.Fatalf("expected login to be offered, got %d %s", code, body)
+	}
+	if code, _ := request(t, server.URL, "wrong", http.MethodPost, login, nil); code != http.StatusUnauthorized {
+		t.Fatalf("incorrect password returned %d", code)
+	}
+	before := time.Now()
+	code, body := request(t, server.URL, password, http.MethodPost, login, nil)
+	var result struct {
+		SessionToken string `json:"sessionToken"`
+	}
+	if err := json.Unmarshal(body, &result); code != http.StatusOK || err != nil || result.SessionToken == "" {
+		t.Fatalf("login failed with status %d, decoding error %v", code, err)
+	}
+	expiry, _, _ := strings.Cut(result.SessionToken, ".")
+	expiresAt, err := strconv.ParseInt(expiry, 10, 64)
+	if err != nil || expiresAt < before.Add(48*time.Hour).Unix() || expiresAt > time.Now().Add(48*time.Hour).Unix() {
+		t.Fatal("expected a session valid for 48 hours from login")
+	}
+	if code, _ := request(t, server.URL, result.SessionToken, http.MethodGet, settings, nil); code != http.StatusNoContent {
+		t.Fatalf("valid session returned %d", code)
+	}
+	if code, _ := request(t, server.URL, result.SessionToken, http.MethodPost, login, nil); code != http.StatusUnauthorized {
+		t.Fatalf("a session attempted to renew itself and returned %d", code)
+	}
+	for _, invalid := range []string{
+		signSettingsSession(password, before.Unix()),
+		signSettingsSession(settingsSecret(), expiresAt),
+		result.SessionToken + "x",
+	} {
+		if code, _ := request(t, server.URL, invalid, http.MethodGet, settings, nil); code != http.StatusUnauthorized {
+			t.Fatalf("invalid session returned %d", code)
+		}
 	}
 }

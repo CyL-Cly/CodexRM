@@ -1,7 +1,9 @@
 package agenthost
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,9 +13,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
+	"time"
 )
 
 const settingsAccessFile = "settings-access.json"
+const settingsSessionLifetime = 48 * time.Hour
 
 type settingsAccess struct {
 	Port     int    `json:"port"`
@@ -24,6 +29,22 @@ func settingsSecret() string {
 	var secret [32]byte
 	rand.Read(secret[:])
 	return base64.RawURLEncoding.EncodeToString(secret[:])
+}
+
+func signSettingsSession(secret string, expiresAt int64) string {
+	expiry := strconv.FormatInt(expiresAt, 10)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte("settings-session:" + expiry))
+	return expiry + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func validSettingsSession(secret, token string, now time.Time) bool {
+	expiry, _, ok := strings.Cut(token, ".")
+	if !ok {
+		return false
+	}
+	expiresAt, err := strconv.ParseInt(expiry, 10, 64)
+	return err == nil && now.Unix() < expiresAt && hmac.Equal([]byte(token), []byte(signSettingsSession(secret, expiresAt)))
 }
 
 func readSettingsAccess(path string) (settingsAccess, error) {
@@ -75,10 +96,10 @@ func createSettingsAccess(path string, access settingsAccess) error {
 	return os.Link(file.Name(), path)
 }
 
-func listenLANSettings(path string) (net.Listener, string, error) {
+func listenPasswordSettings(path, bindHost string) (net.Listener, string, error) {
 	access, err := readSettingsAccess(path)
 	if errors.Is(err, os.ErrNotExist) {
-		listener, listenErr := net.Listen("tcp", ":0")
+		listener, listenErr := net.Listen("tcp", net.JoinHostPort(bindHost, "0"))
 		if listenErr != nil {
 			return nil, "", listenErr
 		}
@@ -95,6 +116,6 @@ func listenLANSettings(path string) (net.Listener, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	listener, err := net.Listen("tcp", ":"+strconv.Itoa(access.Port))
+	listener, err := net.Listen("tcp", net.JoinHostPort(bindHost, strconv.Itoa(access.Port)))
 	return listener, access.Password, err
 }

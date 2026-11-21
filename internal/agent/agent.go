@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/codexrm/codexrm/internal/appserver"
+	"github.com/codexrm/codexrm/internal/desktop"
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/codexrm/codexrm/internal/release"
 	"github.com/google/uuid"
@@ -25,6 +26,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -89,6 +91,8 @@ type Config struct {
 	CheckForUpdate                                                                                                  func() (UpdateResult, error)
 	ServerURL, AppServerURL, AppServerToken, Name, DataDir, InstallationID, EnrollmentKey, CodexPath, Cwd, MockAddr string
 	CCSwitchDB                                                                                                      string
+	ProviderDir                                                                                                     string // Directory for Agent-managed model providers.
+	OneBotSettingsPath                                                                                              string // Optional OneBot 11 configuration; empty disables the local adapter.
 	Mock                                                                                                            bool
 	NoAutoPair                                                                                                      bool
 }
@@ -110,34 +114,44 @@ type approval struct {
 	NonBlocking bool
 }
 type Agent struct {
-	cfg          Config
-	creds        creds
-	credsDirty   bool
-	credsMu      sync.RWMutex
-	enrollMu     sync.Mutex
-	mu           sync.Mutex
-	writeMu      sync.Mutex
-	eventMu      sync.Mutex
-	direct       map[string]*directSession
-	eventClients map[string]bool // nil until this RM supplies a routing snapshot
-	relay        *websocket.Conn
-	owners       map[string]string
-	approvals    map[string]approval
-	queueMu      sync.Mutex
-	queues       map[string]*messageQueue
-	queueCtx     context.Context
-	requests     int
-	updating     bool
-	attachmentMu sync.Mutex
-	uploads      map[string]*attachmentUpload
-	textMu       sync.Mutex
-	textApp      *appserver.Client
-	textVerified bool
-	wxMu         sync.Mutex
-	wxPolicy     map[string]wxPolicy
-	wxThreads    map[string]wxThread
-	connectionMu sync.RWMutex
-	connection   ConnectionSnapshot
+	cfg            Config
+	creds          creds
+	credsDirty     bool
+	credsMu        sync.RWMutex
+	enrollMu       sync.Mutex
+	mu             sync.Mutex
+	writeMu        sync.Mutex
+	eventMu        sync.Mutex
+	direct         map[string]*directSession
+	eventClients   map[string]bool  // nil until this RM supplies a routing snapshot
+	relayEvents    *relayEventQueue // protected by eventMu
+	relay          *websocket.Conn
+	owners         map[string]string
+	approvals      map[string]approval
+	queueMu        sync.Mutex
+	queues         map[string]*messageQueue
+	queueCtx       context.Context
+	requests       int
+	updating       bool
+	attachmentMu   sync.Mutex
+	conversationMu sync.Mutex
+	uploads        map[string]*attachmentUpload
+	providerApp    atomic.Pointer[appserver.Client]
+	oneBotMu       sync.RWMutex
+	oneBotOpMu     sync.Mutex
+	oneBot         *oneBotRuntime
+	oneBotErr      string
+
+	textMu           sync.Mutex
+	textApp          *appserver.Client
+	textVerified     bool
+	wxMu             sync.Mutex
+	wxPolicy         map[string]wxPolicy
+	wxThreads        map[string]wxThread
+	wxHistoryPending map[string]wxHistoryPending
+	wxRecordTurns    map[string]map[*wxRecordTurn]bool
+	connectionMu     sync.RWMutex
+	connection       ConnectionSnapshot
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -298,7 +312,11 @@ func (a *Agent) ensureEnrolled(ctx context.Context) error {
 			return err
 		}
 	}
-	if credentials.Token != "" && (credentials.ExpiresAt == 0 || credentials.ExpiresAt > time.Now().Add(24*time.Hour).Unix()) {
+	return a.enrollLocked(ctx, credentials, false)
+}
+
+func (a *Agent) enrollLocked(ctx context.Context, credentials creds, force bool) error {
+	if !force && credentials.Token != "" && (credentials.ExpiresAt == 0 || credentials.ExpiresAt > time.Now().Add(24*time.Hour).Unix()) {
 		return nil
 	}
 	var out protocol.EnrollResponse
@@ -411,14 +429,22 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.approvals = map[string]approval{}
 		a.mu.Unlock()
 		appCtx, stop := context.WithCancel(ctx)
+		a.providerApp.Store(app)
 		a.queueMu.Lock()
 		a.queues = map[string]*messageQueue{}
 		a.queueCtx = appCtx
 		a.queueMu.Unlock()
 		app.OnNotification(func(raw json.RawMessage) {
+			if a.handleWxHistoryTool(app, raw) {
+				return
+			}
 			a.forward(raw)
 			a.queueNotification(appCtx, app, raw)
 		})
+		if e = a.startConfiguredOneBot(appCtx, app); e != nil {
+			// A local bot configuration must not take down browser access to Codex.
+			log.Printf("OneBot startup failed; continuing without OneBot: %v", e)
+		}
 		go func() {
 			select {
 			case <-app.Done():
@@ -436,9 +462,21 @@ func (a *Agent) Run(ctx context.Context) error {
 				}
 				continue
 			}
+			credential, _ := a.credentials()
 			e = a.session(appCtx, app)
 			if appCtx.Err() != nil {
 				break
+			}
+			var status *httpStatusError
+			if errors.As(e, &status) && status.status == http.StatusUnauthorized {
+				a.enrollMu.Lock()
+				current, _ := a.credentials()
+				if current.Token == credential.Token {
+					if enrollErr := a.enrollLocked(appCtx, current, true); enrollErr != nil {
+						log.Printf("recover agent registration: %v", enrollErr)
+					}
+				}
+				a.enrollMu.Unlock()
 			}
 			log.Printf("relay disconnected: %v; retry in 3s", e)
 			a.setConnection(Retrying, e, time.Now().Add(3*time.Second))
@@ -447,8 +485,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			case <-time.After(3 * time.Second):
 			}
 		}
+		a.providerApp.Store(nil)
+		a.stopOneBot()
 		stop()
 		_ = app.Close()
+		a.clearWxRecordApp(app)
 		if ctx.Err() == nil {
 			log.Printf("Codex exited; restarting in 3s")
 			a.setConnection(Degraded, errors.New("Codex app-server exited"), time.Now().Add(3*time.Second))
@@ -464,13 +505,30 @@ func (a *Agent) write(conn *websocket.Conn, env protocol.Envelope) error {
 	if conn == nil {
 		return errors.New("relay offline")
 	}
+	frame, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	if len(frame) > protocol.MaxEnvelopeSize {
+		return errors.New("relay frame exceeds size limit")
+	}
+	return a.writeRelayFrame(conn, frame)
+}
+
+func (a *Agent) writeRelayFrame(conn *websocket.Conn, frame []byte) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
-	return conn.WriteJSON(env)
+	if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+		log.Printf("relay write: %v", err)
+		_ = conn.Close()
+		return err
+	}
+	return nil
 }
 
 func (a *Agent) forward(raw json.RawMessage) {
+	a.notifyOneBot(raw)
 	var m map[string]json.RawMessage
 	if json.Unmarshal(raw, &m) != nil {
 		return
@@ -505,6 +563,7 @@ func (a *Agent) forward(raw json.RawMessage) {
 		}
 	}
 	if method == "turn/completed" {
+		a.releaseWxRecordTurn(meta.ThreadID, meta.Turn.ID)
 		for key, pending := range a.approvals {
 			if pending.ThreadID == meta.ThreadID && pending.TurnID == meta.Turn.ID &&
 				(!pending.NonBlocking || meta.Turn.Status != "completed") {
@@ -545,15 +604,34 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 		return e
 	}
 	defer conn.Close()
-	conn.SetReadLimit(16 << 20)
+	conn.SetReadLimit(protocol.MaxEnvelopeSize)
+	refreshReadDeadline := func() error { return conn.SetReadDeadline(time.Now().Add(65 * time.Second)) }
+	if err := refreshReadDeadline(); err != nil {
+		return err
+	}
+	conn.SetPongHandler(func(string) error { return refreshReadDeadline() })
+	ping := conn.PingHandler()
+	conn.SetPingHandler(func(payload string) error {
+		if err := refreshReadDeadline(); err != nil {
+			return err
+		}
+		return ping(payload)
+	})
+	events := newRelayEventQueue(conn)
 	a.eventMu.Lock()
 	a.eventClients = nil
+	a.relayEvents = events
 	a.mu.Lock()
 	a.relay = conn
 	a.mu.Unlock()
 	a.eventMu.Unlock()
 	a.setConnection(Connected, nil, time.Time{})
 	defer func() {
+		a.eventMu.Lock()
+		defer a.eventMu.Unlock()
+		if a.relayEvents == events {
+			a.relayEvents = nil
+		}
 		a.mu.Lock()
 		if a.relay == conn {
 			a.relay = nil
@@ -563,6 +641,7 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
+	go a.writeRelayEvents(ctx, events)
 	log.Printf("relay connected as %s (%s)", credentials.AgentID, a.cfg.Name)
 	hello := protocol.P2P("hello", "")
 	hello.LAN = true
@@ -578,8 +657,13 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 		if e = conn.ReadJSON(&env); e != nil {
 			return e
 		}
+		if err := refreshReadDeadline(); err != nil {
+			return err
+		}
 		if env.Type == protocol.TypePing {
-			_ = a.write(conn, protocol.Envelope{Type: protocol.TypePong, PingID: env.PingID})
+			if err := a.write(conn, protocol.Envelope{Type: protocol.TypePong, PingID: env.PingID}); err != nil {
+				return err
+			}
 			continue
 		}
 		if env.Type == protocol.TypeP2P {
@@ -613,9 +697,9 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 	}
 	_ = json.Unmarshal(env.Message, &probe)
 	if probe.Method == "codexrm/update" {
-		a.mu.Lock()
+		a.queueMu.Lock()
 		updating := a.updating
-		a.mu.Unlock()
+		a.queueMu.Unlock()
 		if updating {
 			a.respond(send, env, nil, updateInProgressError)
 			return
@@ -700,7 +784,7 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		return
 	}
 	if req.Method == "codexrm/info" {
-		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "providerModels": true, "messageQueue": true, "images": true, "directFiles": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize}, "desktopControl": runtime.GOOS == "windows", "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
+		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "conversationTools": true, "providerModels": true, "providerManagement": a.supportsProviderManagement(), "sameModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "", "threadModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "" && a.cfg.DataDir != "", "messageQueue": true, "images": true, "directFiles": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize}, "desktopShare": desktop.ReceivesFiles, "desktopControl": runtime.GOOS == "windows", "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
 		a.mu.Lock()
 		pending := []approval{}
 		for _, p := range a.approvals {
@@ -735,6 +819,13 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		}
 		return
 	}
+	if strings.HasPrefix(req.Method, "codexrm/provider/") {
+		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		result, err := a.providerSettingsRPC(callCtx, app, req.Method, req.Params, direct != nil)
+		a.respond(send, env, mustJSON(result), err)
+		return
+	}
 	if req.Method == "codexrm/model/list" {
 		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
@@ -747,6 +838,21 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		defer cancel()
 		result, err := a.threadSnapshot(callCtx, app, params)
 		a.respond(send, env, result, err)
+		return
+	}
+	switch req.Method {
+	case "codexrm/thread/search", "codexrm/thread/pins", "codexrm/thread/pin", "codexrm/thread/related":
+		callCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
+		defer cancel()
+		result, err := a.conversationRPC(callCtx, app, req.Method, params)
+		a.respond(send, env, mustJSON(result), err)
+		return
+	}
+	if req.Method == "codexrm/workspace/diff" {
+		callCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		defer cancel()
+		result, err := a.workspaceDiff(callCtx, app, params)
+		a.respond(send, env, mustJSON(result), err)
 		return
 	}
 	if strings.HasPrefix(req.Method, "codexrm/queue/") {
@@ -767,6 +873,13 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 	if strings.HasPrefix(req.Method, "codexrm/desktop/") {
 		result, err := a.desktopRPC(req.Method)
 		a.respond(send, env, mustJSON(result), err)
+		return
+	}
+	if req.Method == switchProviderMethod {
+		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		result, err := a.callThread(callCtx, app, env.ClientID, req.Method, params)
+		a.respond(send, env, result, err)
 		return
 	}
 	if strings.HasPrefix(req.Method, "codexrm/") {

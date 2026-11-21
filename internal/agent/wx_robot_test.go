@@ -99,6 +99,84 @@ func TestRobotThreadsAreIsolatedAndTextOnly(t *testing.T) {
 	}
 }
 
+func TestRobotAutomationRequiresAccessAndOwnsSeparateThread(t *testing.T) {
+	a, _ := testRobotAgent(t)
+	t.Cleanup(a.closeTextApp)
+	if err := a.setWxPolicy("robot", map[string]any{
+		"access": map[string]any{"wx-author": map[string]any{"enabled": true, "mode": "tools"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	input := []any{map[string]any{"type": "text", "text": "Summarize this"}}
+	params := map[string]any{"wxId": "stranger", "instructions": "Summarize", "input": input}
+	if out, _ := robotCall(t, a, "robot", "codexrm/wx/task/start", params); out["error"] == nil {
+		t.Fatal("unauthorized automation started")
+	}
+	params["wxId"] = "wx-author"
+	out, _ := robotCall(t, a, "robot", "codexrm/wx/task/start", params)
+	result, ok := out["result"].(map[string]any)
+	if !ok || result["threadId"] == "" || result["turnId"] == "" {
+		t.Fatalf("start returned %#v", out)
+	}
+	threadID := result["threadId"].(string)
+	closeParams := map[string]any{"threadId": threadID, "turnId": result["turnId"]}
+	if out, _ := robotCall(t, a, "other", "codexrm/wx/task/close", closeParams); out["error"] == nil {
+		t.Fatal("another robot closed the automation")
+	}
+	if out, _ := robotCall(t, a, "robot", "turn/start", map[string]any{"threadId": threadID, "wxId": "wx-author", "input": input}); out["error"] == nil {
+		t.Fatal("chat could continue the automation thread")
+	}
+	if out, _ := robotCall(t, a, "robot", "codexrm/wx/task/close", closeParams); out["error"] != nil {
+		t.Fatalf("close returned %#v", out)
+	}
+	if _, err := a.ownThread("robot", "", threadID); err == nil {
+		t.Fatal("closed thread was retained")
+	}
+}
+
+func TestRobotSteersOnlyItsActiveTurn(t *testing.T) {
+	a, _ := testRobotAgent(t)
+	t.Cleanup(a.closeTextApp)
+	if err := a.setWxPolicy("cli", map[string]any{
+		"access": map[string]any{
+			"wx-a": map[string]any{"enabled": true, "mode": "text"},
+			"wx-b": map[string]any{"enabled": true, "mode": "text"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	start, _ := robotCall(t, a, "cli", "thread/start", map[string]any{"wxId": "wx-a"})
+	if start["error"] != nil {
+		t.Fatal(start)
+	}
+	threadID := start["result"].(map[string]any)["thread"].(map[string]any)["id"]
+	input := func(text string) []any { return []any{map[string]any{"type": "text", "text": text}} }
+	turn, _ := robotCall(t, a, "cli", "turn/start", map[string]any{
+		"wxId": "wx-a", "threadId": threadID, "input": input("primary"),
+	})
+	if turn["error"] != nil {
+		t.Fatal(turn)
+	}
+	turnID := turn["result"].(map[string]any)["turn"].(map[string]any)["id"]
+	result, _ := robotCall(t, a, "cli", "turn/steer", map[string]any{
+		"wxId": "wx-a", "threadId": threadID, "expectedTurnId": turnID, "input": input("follow-up"),
+	})
+	if result["error"] != nil || result["result"].(map[string]any)["turnId"] != turnID {
+		t.Fatalf("steer did not return the original turn: %#v", result)
+	}
+	for _, tc := range []struct {
+		actor string
+		id    any
+	}{{"wx-b", turnID}, {"wx-a", "stale-turn"}, {"wx-a", ""}} {
+		result, _ := robotCall(t, a, "cli", "turn/steer", map[string]any{
+			"wxId": tc.actor, "threadId": threadID, "expectedTurnId": tc.id, "input": input("rejected"),
+		})
+		if result["error"] == nil {
+			t.Fatalf("unexpected steer for %s/%s: %#v", tc.actor, tc.id, result)
+		}
+	}
+}
+
 func TestRobotNotificationsStayTargeted(t *testing.T) {
 	a, _ := testRobotAgent(t)
 	a.rememberWxThread("thread-a", "robot-client", "wx-a", "text")
@@ -130,7 +208,7 @@ func TestRobotCannotContinueToolThreadAfterDowngrade(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	for _, method := range []string{"turn/start", "thread/resume"} {
+	for _, method := range []string{"turn/start", "turn/steer", "thread/resume"} {
 		result, _ := robotCall(t, a, "cli", method, map[string]any{
 			"wxId": "wx-a", "threadId": "old",
 			"input": []any{map[string]any{"type": "text", "text": "hello"}},
@@ -161,7 +239,7 @@ func TestRobotImagesAndAdminSandbox(t *testing.T) {
 		{"type": "image", "url": "http://127.0.0.1/test.png"},
 		{"type": "image", "url": "data:image/jpeg;base64," + png[len("data:image/png;base64,"):]},
 	} {
-		if _, err := robotInput([]any{input}); err == nil {
+		if _, err := robotInputWithLimit([]any{input}, 2); err == nil {
 			t.Fatal("accepted untrusted image reference")
 		}
 	}

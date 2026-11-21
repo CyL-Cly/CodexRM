@@ -3,6 +3,7 @@ param(
     [string]$Config,
     [string]$ReleaseNotes = '',
     [switch]$LinuxOnly,
+    [string]$WxBotImageLock,
     [switch]$Help
 )
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,7 @@ if ($Help) {
     Write-Host 'build\release-all.cmd [nopause] [-Config PATH] [-ReleaseNotes TEXT] [-LinuxOnly]'
     Write-Host 'Default: build and publish Windows Agent, RM, Web, Android, and the standalone Linux Agent.'
     Write-Host '-LinuxOnly: publish the standalone Linux Agent at the current version without bumping versions.'
+    Write-Host '-WxBotImageLock PATH: embed and include the verified wxbot release manifest.'
     return
 }
 $buildRoot = Split-Path -Parent $PSScriptRoot
@@ -35,7 +37,7 @@ function Publish-LinuxAgent {
     $manifest = Join-Path $dist 'linux-agent-download.json'
     [void][IO.Directory]::CreateDirectory($dist)
 
-    & (Join-Path $PSScriptRoot 'build.ps1') -Linux -Target Agent
+    & (Join-Path $PSScriptRoot 'build.ps1') -Linux -Target Agent -WxBotImageLock $WxBotImageLock
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $staged = $archive + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
@@ -43,6 +45,13 @@ function Publish-LinuxAgent {
         $zip = [IO.Compression.ZipFile]::Open($staged, [IO.Compression.ZipArchiveMode]::Create)
         try {
             [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $buildRoot 'bin\codexrm-agent-linux-amd64'), 'codexrm-agent')
+            if ($WxBotImageLock) {
+                $wxbotLock = [IO.Path]::GetFullPath($WxBotImageLock)
+                if (-not (Test-Path -LiteralPath $wxbotLock -PathType Leaf)) { throw 'wxbot image lock missing.' }
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $wxbotLock, 'wx-images.json')
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $PSScriptRoot 'install-wxbot-bootstrap.sh'), 'install-wxbot-bootstrap.sh')
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $projectRoot 'deploy/codexrm-wx-docker-bootstrap.service'), 'codexrm-wx-docker-bootstrap.service')
+            }
             $writer = New-Object IO.StreamWriter($zip.CreateEntry('README.md').Open())
             try { $writer.WriteLine('Unpack, run chmod +x codexrm-agent, then run ./codexrm-agent --help.') } finally { $writer.Dispose() }
         } finally { $zip.Dispose() }

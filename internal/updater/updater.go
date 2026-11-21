@@ -270,31 +270,42 @@ func (u *Updater) Prepare(ctx context.Context) (result *Plan, resultErr error) {
 	defer func() {
 		u.mu.Lock()
 		defer u.mu.Unlock()
-		u.state.LastError = ""
-		if resultErr != nil {
-			u.state.LastError = resultErr.Error()
-			u.state.ConsecutiveFailures++
-			index := u.state.ConsecutiveFailures - 1
-			if index >= len(retryBackoff) {
-				index = len(retryBackoff) - 1
-			}
-			next := u.now().UTC().Add(retryBackoff[index])
-			u.state.NextRetryAt = &next
-			u.state.Phase = "error"
-		} else {
-			u.state.LastSuccessfulCheck = u.now().UTC()
-			u.state.ConsecutiveFailures = 0
-			next := u.state.LastSuccessfulCheck.Add(CheckInterval)
-			u.state.NextRetryAt = &next
-			u.state.Phase = "up-to-date"
-			if inspected != nil && inspected.VersionCode > u.cfg.VersionCode {
-				u.state.TargetVersion = inspected.VersionName
-				u.state.Phase = "ready"
+		previous := u.state
+		updateState := func() {
+			u.state.LastError = ""
+			if resultErr != nil {
+				u.state.LastError = resultErr.Error()
+				u.state.ConsecutiveFailures++
+				index := u.state.ConsecutiveFailures - 1
+				if index >= len(retryBackoff) {
+					index = len(retryBackoff) - 1
+				}
+				next := u.now().UTC().Add(retryBackoff[index])
+				u.state.NextRetryAt = &next
+				u.state.Phase = "error"
+			} else {
+				u.state.LastSuccessfulCheck = u.now().UTC()
+				u.state.ConsecutiveFailures = 0
+				next := u.state.LastSuccessfulCheck.Add(CheckInterval)
+				u.state.NextRetryAt = &next
+				u.state.Phase = "up-to-date"
+				if inspected != nil && inspected.VersionCode > u.cfg.VersionCode {
+					u.state.TargetVersion = inspected.VersionName
+					u.state.Phase = "ready"
+				}
 			}
 		}
-		if err := writeJSON(u.statePath(), u.state); err != nil && resultErr == nil {
-			result = nil
-			resultErr = err
+		updateState()
+		if err := writeJSON(u.statePath(), u.state); err != nil {
+			if result != nil {
+				result.Discard()
+				result = nil
+			}
+			if resultErr == nil {
+				resultErr = fmt.Errorf("save update state: %w", err)
+				u.state = previous
+				updateState()
+			}
 		}
 	}()
 	u.cleanCompletedUpdates()

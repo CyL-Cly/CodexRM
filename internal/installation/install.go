@@ -160,11 +160,14 @@ func Uninstall(ctx context.Context, root string) error {
 	if err := unregister(root); err != nil {
 		return err
 	}
+	registered := strings.EqualFold(ResolveDir(), root)
 	if err := os.RemoveAll(root); err != nil {
 		return err
 	}
-	if strings.EqualFold(ResolveDir(), root) {
-		return os.Remove(RecordPath())
+	if registered {
+		if err := os.Remove(RecordPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }

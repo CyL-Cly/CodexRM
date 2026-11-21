@@ -3,7 +3,10 @@ package com.codexrm.mobile
 import java.net.URI
 import java.net.URLDecoder
 
-internal data class PairingData(val serverUrl: String, val code: String)
+internal data class PairingData(val serverUrl: String, val code: String) {
+    val requiresCleartextWarning: Boolean
+        get() = serverUrl.startsWith("http://", ignoreCase = true)
+}
 
 internal object PairingLink {
     fun parse(raw: String, fallbackServer: String = ""): PairingData {

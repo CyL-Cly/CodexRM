@@ -13,15 +13,15 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="CodexRM" />
     <title>CodexRM · 远程工作区</title>
-    <link rel="icon" href="/icons/icon.svg?v=20261119-6" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261119-6" />
-    <link rel="manifest" href="/manifest.webmanifest?v=20261119-6" />
-    <link rel="modulepreload" href="/app.js?v=20261119-6" />
-    <script src="/theme.js?v=20261119-6"></script>
-    <link rel="stylesheet" href="/dsh-theme.css?v=20261119-6" />
-    <link rel="stylesheet" href="/styles.css?v=20261119-6" />
-    <script src="/pwa.js?v=20261119-6" defer></script>
-    <script src="/app.js?v=20261119-6" type="module"></script>
+    <link rel="icon" href="/icons/icon.svg?v=20261121-3" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261121-3" />
+    <link rel="manifest" href="/manifest.webmanifest?v=20261121-3" />
+    <link rel="modulepreload" href="/app.js?v=20261121-3" />
+    <script src="/theme.js?v=20261121-3"></script>
+    <link rel="stylesheet" href="/dsh-theme.css?v=20261121-3" />
+    <link rel="stylesheet" href="/styles.css?v=20261121-3" />
+    <script src="/pwa.js?v=20261121-3" defer></script>
+    <script src="/app.js?v=20261121-3" type="module"></script>
   </head>
   <body>
     <div id="app">
@@ -200,8 +200,7 @@
         <div class="workspace">
           <div id="scroll-area" class="scroll-area">
             <section id="welcome" class="welcome">
-              <div class="welcome-headline"><span class="welcome-mark" data-icon="terminal"></span>
-              <h1>探索未至之境</h1><span class="hero-badge">CodexRM</span></div>
+              <h1 id="welcome-title">要构建什么？</h1>
               <p id="welcome-description">
                 连接你的电脑，让 Codex 继续手边的工作。
               </p>
@@ -468,6 +467,13 @@
         <span data-icon="trash"></span>删除对话
       </button>
     </div>
+    <dialog id="async-question-dialog" class="dialog" aria-labelledby="async-question-title">
+      <div class="dialog-header">
+        <h2 id="async-question-title">回答 Codex</h2>
+        <button type="button" class="icon-button" data-close="async-question-dialog" aria-label="关闭" data-icon="close"></button>
+      </div>
+      <div id="async-question-fields"></div>
+    </dialog>
     <dialog id="delete-thread-dialog" class="dialog" aria-labelledby="delete-thread-title" aria-describedby="delete-thread-description">
       <div class="dialog-header">
         <h2 id="delete-thread-title">删除对话？</h2>

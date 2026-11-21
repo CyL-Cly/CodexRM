@@ -89,8 +89,12 @@ func clientIP(r *http.Request) string {
 }
 
 func rateLimit(limiter *ipRateLimiter, next http.HandlerFunc) http.HandlerFunc {
+	return rateLimitKey(limiter, clientIP, next)
+}
+
+func rateLimitKey(limiter *ipRateLimiter, key func(*http.Request) string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		allowed, retry := limiter.allow(clientIP(r))
+		allowed, retry := limiter.allow(key(r))
 		if !allowed {
 			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retry.Seconds()))))
 			fail(w, http.StatusTooManyRequests, "too many requests")

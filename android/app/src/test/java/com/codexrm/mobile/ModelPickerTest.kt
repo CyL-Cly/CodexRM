@@ -14,6 +14,7 @@ class ModelPickerTest {
     @Test fun `models are grouped by provider with a default choice`() {
         val rows = ModelPicker.rows(options, "")
         assertEquals("默认模型", rows.first().title)
+        assertTrue(rows.first().defaultChoice)
         assertEquals(listOf("OpenAI", "Local"), rows.filter { it.header }.map { it.title })
         assertEquals(listOf("gpt-5", "gpt-4.1", "qwen-coder"), rows.mapNotNull { it.option?.model })
     }
@@ -23,5 +24,13 @@ class ModelPickerTest {
         assertEquals(listOf("gpt-5", "gpt-4.1"), ModelPicker.rows(options, "openai").mapNotNull { it.option?.model })
         assertEquals(listOf("qwen-coder"), ModelPicker.rows(options, "离线").mapNotNull { it.option?.model })
         assertTrue(ModelPicker.rows(options, "not-found").none { !it.header && it.option != null })
+    }
+
+    @Test fun `empty search result offers a clear-search action`() {
+        val rows = ModelPicker.rows(options, "not-found")
+        assertEquals(1, rows.size)
+        assertTrue(rows.single().emptyChoice)
+        assertEquals("没有匹配的模型", rows.single().title)
+        assertTrue(ModelPicker.rows(options, "").none { it.emptyChoice })
     }
 }

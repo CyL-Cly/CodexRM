@@ -119,13 +119,13 @@ internal class DeviceStore(context: Context) {
         }
     }
 
-    fun savePendingSends(agentId: String, values: List<PendingSend>) {
-        if (agentId.isEmpty()) return
+    fun savePendingSends(agentId: String, values: List<PendingSend>): Boolean {
+        if (agentId.isEmpty()) return true
         val editor = uiPrefs.edit()
         if (values.isEmpty()) editor.remove("outbox.$agentId")
         else editor.putString("outbox.$agentId", JSONArray(values.map(PendingSend::toJson)).toString())
         // The outbox is the durability boundary before the visible draft is cleared.
-        editor.commit()
+        return editor.commit()
     }
 
     private object Crypto {

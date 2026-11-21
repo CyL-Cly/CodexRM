@@ -122,6 +122,11 @@ func TestQuestionAnswersAndSkipSurviveBrowserReconnect(t *testing.T) {
 // Exercise the installed CLI against a local Responses fixture, including the
 // actual Default-mode tool gate. No account, provider key or real model is used.
 func TestQuestionRoundTripWithLocalCodex(t *testing.T) {
+	t.Run("default request", func(t *testing.T) { testQuestionRoundTripWithLocalCodex(t, false) })
+	t.Run("async message", func(t *testing.T) { testQuestionRoundTripWithLocalCodex(t, true) })
+}
+
+func testQuestionRoundTripWithLocalCodex(t *testing.T, async bool) {
 	executable := os.Getenv("CODEXRM_TEST_CODEX")
 	if executable == "" {
 		t.Skip("set CODEXRM_TEST_CODEX to test the local Codex app-server")
@@ -129,6 +134,9 @@ func TestQuestionRoundTripWithLocalCodex(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	t.Setenv("RUST_LOG", "error")
 	const answerText = "真实 CLI 的测试回答"
+	const asyncAnswer = "<send_user_message_question_reply>\n" +
+		`[{"questionItemId":"[\"request_user_input_async\",\"question-call\",0]","question":"选择答案？","answer":"真实 CLI 的测试回答"}]` +
+		"\n</send_user_message_question_reply>"
 	answers := make(chan string, 4)
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -138,9 +146,11 @@ func TestQuestionRoundTripWithLocalCodex(t *testing.T) {
 		}
 		var body struct {
 			Input []struct {
-				Type   string `json:"type"`
-				CallID string `json:"call_id"`
-				Output string `json:"output"`
+				Type    string          `json:"type"`
+				CallID  string          `json:"call_id"`
+				Output  string          `json:"output"`
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
 			} `json:"input"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -151,6 +161,12 @@ func TestQuestionRoundTripWithLocalCodex(t *testing.T) {
 			if input.Type == "function_call_output" && input.CallID == "question-call" {
 				select {
 				case answers <- input.Output:
+				default:
+				}
+			}
+			if async && input.Role == "user" && strings.Contains(string(input.Content), answerText) {
+				select {
+				case answers <- string(input.Content):
 				default:
 				}
 			}
@@ -167,8 +183,13 @@ func TestQuestionRoundTripWithLocalCodex(t *testing.T) {
 					map[string]any{"label": "调整", "description": "调整任务。"},
 				},
 			}}}
+			name := "request_user_input"
+			if async {
+				name = "request_user_input_async"
+				arguments["questions"] = []any{map[string]any{"title": "选择答案？", "options": []string{"继续", "调整"}}}
+			}
 			emit(map[string]any{"type": "response.output_item.done", "item": map[string]any{
-				"type": "function_call", "call_id": "question-call", "name": "request_user_input", "arguments": string(raw(arguments)),
+				"type": "function_call", "call_id": "question-call", "name": name, "arguments": string(raw(arguments)),
 			}})
 		}
 		emit(map[string]any{"type": "response.completed", "response": map[string]any{
@@ -176,7 +197,11 @@ func TestQuestionRoundTripWithLocalCodex(t *testing.T) {
 		}})
 	}))
 	defer upstream.Close()
-	config := fmt.Sprintf("model = 'gpt-5.4'\nmodel_provider = 'question_test'\n[model_providers.question_test]\nname = 'Local question test'\nbase_url = %q\nwire_api = 'responses'\nrequires_openai_auth = false\n", upstream.URL)
+	model := "gpt-5.4"
+	if async {
+		model = "gpt-6.2-sol"
+	}
+	config := fmt.Sprintf("model = %q\nmodel_provider = 'question_test'\n[model_providers.question_test]\nname = 'Local question test'\nbase_url = %q\nwire_api = 'responses'\nrequires_openai_auth = false\n", model, upstream.URL)
 	if err := os.WriteFile(filepath.Join(os.Getenv("CODEX_HOME"), "config.toml"), []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +209,47 @@ func TestQuestionRoundTripWithLocalCodex(t *testing.T) {
 	rpc(t, c, 1, "thread/start", map[string]any{"approvalPolicy": "never", "sandbox": "read-only"})
 	tid := response(t, c, 1)["thread"].(map[string]any)["id"]
 	rpc(t, c, 2, "turn/start", map[string]any{"threadId": tid, "effort": "low", "input": []any{map[string]any{"type": "text", "text": "Ask the fixture question."}}})
+	if async {
+		asyncItem := func(item map[string]any) bool {
+			return item["id"] == "question-call" && item["type"] == "agentMessage" && item["delivery"] == "async" &&
+				strings.Contains(string(raw(item["questions"])), `"options":["继续","调整"]`)
+		}
+		found := false
+		until(t, c, func(e protocol.Envelope) bool {
+			var msg struct {
+				Method string `json:"method"`
+				Params struct {
+					Item map[string]any `json:"item"`
+				} `json:"params"`
+			}
+			_ = json.Unmarshal(e.Message, &msg)
+			if msg.Method == "item/completed" && asyncItem(msg.Params.Item) {
+				found = true
+			}
+			return msg.Method == "turn/completed"
+		})
+		if !found {
+			t.Fatal("CLI did not send an async question with selectable options")
+		}
+		rpc(t, c, 3, "thread/turns/list", map[string]any{"threadId": tid, "itemsView": "full"})
+		history := response(t, c, 3)
+		if !strings.Contains(string(raw(history)), `"options":["继续","调整"]`) {
+			t.Fatalf("async question missing from history: %s", raw(history))
+		}
+		rpc(t, c, 4, "turn/start", map[string]any{"threadId": tid, "input": []any{map[string]any{"type": "text", "text": asyncAnswer}}})
+		response(t, c, 4)
+		timeout := time.After(5 * time.Second)
+		for {
+			select {
+			case input := <-answers:
+				if strings.Contains(input, answerText) && strings.Contains(input, "questionItemId") {
+					return
+				}
+			case <-timeout:
+				t.Fatal("CLI did not forward the async answer")
+			}
+		}
+	}
 	question := questionEvent(t, c)
 	if question["params"].(map[string]any)["isBlocking"] != false {
 		t.Fatalf("expected the actual Default-mode question: %#v", question)

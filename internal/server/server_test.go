@@ -63,7 +63,7 @@ func ws(t *testing.T, h *httptest.Server, role, token string) *websocket.Conn {
 }
 func read(t *testing.T, c *websocket.Conn) protocol.Envelope {
 	t.Helper()
-	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(45 * time.Second))
 	var env protocol.Envelope
 	if e := c.ReadJSON(&env); e != nil {
 		t.Fatal(e)

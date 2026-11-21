@@ -181,11 +181,10 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 		}
 	}()
 	events := make(chan probe, 1024)
-	publicIPs, localIPs := make(map[netip.Addr]bool), make(map[netip.Addr]bool)
+	localIPs := make(map[netip.Addr]bool)
 	grow := false
 	var ipv4, ipv6 []netip.AddrPort
 	for _, a := range targets {
-		publicIPs[a.Addr()] = true
 		if a.Addr().Is4() {
 			ipv4 = append(ipv4, a)
 			grow = grow || canExpand(a.Addr())
@@ -207,13 +206,15 @@ func (s *Session) punch(ctx context.Context, targets, local []netip.AddrPort, ex
 					return
 				}
 				from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
-				if n != 38 || (!publicIPs[from.Addr()] && !localIPs[from.Addr()]) {
+				if n != 38 || (!from.Addr().IsGlobalUnicast() && !from.Addr().IsLoopback()) {
 					continue
 				}
 				kind := buf[5]
 				if kind == 0 || kind > punchConfirm || !hmac.Equal(expected[kind], buf[:n]) {
 					continue
 				}
+				// The session MAC authenticates an otherwise unknown source. Its observed
+				// address may be the only usable mapping when NAT egress varies by destination.
 				select {
 				case <-stop:
 					return

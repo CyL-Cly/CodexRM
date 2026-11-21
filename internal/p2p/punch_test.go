@@ -161,3 +161,75 @@ func TestMobileUsesOneSocketForFastPath(t *testing.T) {
 		t.Fatalf("fast path socket=%d addr=%v err=%v sockets=%d", i, addr, err, len(s.sockets))
 	}
 }
+
+func TestPunchRejectsUnauthenticatedUnknownSource(t *testing.T) {
+	agentConn, agentAddr := loopbackUDP(t)
+	mobileConn, _ := loopbackUDP(t)
+	agent := &Session{agent: true, id: "peer reflexive", key: bytes.Repeat([]byte{9}, 32), sockets: []*net.UDPConn{agentConn}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := agent.punch(ctx, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.2:9")}, nil, time.Hour, 0, false)
+		done <- err
+	}()
+	bad := agent.packet(1, punchPing)
+	bad[len(bad)-1] ^= 1
+	if _, err := mobileConn.WriteToUDPAddrPort(bad, agentAddr); err != nil {
+		t.Fatal(err)
+	}
+	if err := mobileConn.SetReadDeadline(time.Now().Add(75 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var buf [64]byte
+	if n, _, err := mobileConn.ReadFromUDPAddrPort(buf[:]); err == nil {
+		t.Fatalf("unauthenticated source received %d response bytes", n)
+	} else if e, ok := err.(net.Error); !ok || !e.Timeout() {
+		t.Fatalf("read error = %v, want timeout", err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("punch error = %v, want cancellation", err)
+	}
+}
+
+func TestPunchLearnsAuthenticatedUnknownSource(t *testing.T) {
+	agentConn, agentAddr := loopbackUDP(t)
+	mobileConn, mobileAddr := loopbackUDP(t)
+	key := bytes.Repeat([]byte{9}, 32)
+	agent := &Session{agent: true, id: "peer reflexive", key: key, sockets: []*net.UDPConn{agentConn}}
+	mobile := &Session{id: "peer reflexive", key: key, sockets: []*net.UDPConn{mobileConn}}
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	type result struct {
+		agent  bool
+		socket int
+		addr   netip.AddrPort
+		err    error
+	}
+	results := make(chan result, 2)
+	go func() {
+		i, addr, err := agent.punch(ctx, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.2:9")}, nil, time.Hour, 0, false)
+		results <- result{true, i, addr, err}
+	}()
+	go func() {
+		i, addr, err := mobile.punch(ctx, []netip.AddrPort{agentAddr}, nil, time.Hour, 0, false)
+		results <- result{false, i, addr, err}
+	}()
+	for range 2 {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("authenticated unknown source rejected (agent=%t): %v", r.agent, r.err)
+		}
+		if r.socket != 0 {
+			t.Fatalf("socket = %d, want primary socket", r.socket)
+		}
+		want := mobileAddr
+		if !r.agent {
+			want = agentAddr
+		}
+		if r.addr != want {
+			t.Fatalf("selected address = %v, want %v", r.addr, want)
+		}
+	}
+}

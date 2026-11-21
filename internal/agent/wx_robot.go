@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,22 +16,29 @@ import (
 const textOnlyUnavailable = "仅文本模式不可用"
 
 type wxAccess struct {
+	wxProfile
 	Enabled  bool     `json:"enabled"`
 	Mode     string   `json:"mode"`
 	Commands []string `json:"commands"`
 }
 
 type wxPolicy struct {
-	Workspace string              `json:"workspace,omitempty"`
-	Enabled   []string            `json:"enabled"`
-	Access    map[string]wxAccess `json:"access"`
+	Workspace string                   `json:"workspace,omitempty"`
+	Enabled   []string                 `json:"enabled"`
+	Access    map[string]wxAccess      `json:"access"`
+	Groups    map[string]wxGroupPolicy `json:"groups,omitempty"`
+	Summaries map[string]wxProfile     `json:"summaries,omitempty"`
+	Moments   bool                     `json:"moments,omitempty"`
+	Memory    bool                     `json:"memory,omitempty"`
 }
 
 type wxThread struct {
 	ClientID string
 	WxID     string
 	Backend  string
+	Profile  wxProfile
 	Tainted  bool
+	History  wxHistorySession
 }
 
 type wxCommand struct {
@@ -62,6 +68,13 @@ func (a *Agent) handleRobot(ctx context.Context, app *appserver.Client, send sen
 		return
 	}
 	switch method {
+	case "codexrm/wx/task/start":
+		result, err := a.wxTaskStart(ctx, env.ClientID, params)
+		a.respond(send, env, mustJSON(result), err)
+	case "codexrm/wx/task/close":
+		a.respond(send, env, mustJSON(map[string]bool{"ok": true}), a.wxTaskClose(env.ClientID, params))
+	case "codexrm/wx/history/result":
+		a.respond(send, env, mustJSON(map[string]any{"ok": true}), a.acceptWxHistoryResult(env.ClientID, params))
 	case "codexrm/wx/policy/set":
 		a.respond(send, env, mustJSON(map[string]any{"ok": true}), a.setWxPolicy(env.ClientID, params))
 	case "codexrm/wx/commands/list":
@@ -99,8 +112,19 @@ func (a *Agent) setWxPolicy(clientID string, params map[string]any) error {
 	if policy.Access == nil {
 		policy.Access = map[string]wxAccess{}
 	}
-	if len(policy.Access) > 200 || len(policy.Enabled) > 100 {
+	if len(policy.Access) > 200 || len(policy.Enabled) > 100 || len(policy.Groups) > 200 || len(policy.Summaries) > 2000 {
 		return robotErr("policy is too large")
+	}
+	for id, group := range policy.Groups {
+		if !validWxGroup(id, group) {
+			return robotErr("invalid group settings")
+		}
+	}
+	for id, profile := range policy.Summaries {
+		name, ok := strings.CutSuffix(id, "@chatroom")
+		if !ok || len(id) > 64 || !validWxActor(name) || !validWxProfile(profile) {
+			return robotErr("invalid summary settings")
+		}
 	}
 	known := map[string]bool{}
 	for _, command := range a.wxCommands() {
@@ -112,8 +136,11 @@ func (a *Agent) setWxPolicy(clientID string, params map[string]any) error {
 		}
 	}
 	for wxid, access := range policy.Access {
-		if wxid == "" || len(wxid) > 64 || strings.Contains(wxid, "@chatroom") {
+		if !validWxActor(wxid) || strings.HasPrefix(wxid, "g:") {
 			return robotErr("invalid wxid")
+		}
+		if !validWxProfile(access.wxProfile) {
+			return robotErr("invalid profile")
 		}
 		if access.Mode != "text" && access.Mode != "tools" && access.Mode != "admin" {
 			return robotErr("invalid codex mode")
@@ -327,11 +354,8 @@ func (a *Agent) execWxCommand(ctx context.Context, clientID string, params map[s
 	timeout := time.Duration(command.TimeoutSec) * time.Second
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(callCtx, command.Argv0, args...)
-	cmd.Dir = command.WorkDir
-	cmd.Env = minimalExecEnv()
-	out, err := cmd.CombinedOutput()
-	if len(out) > command.MaxBytes {
+	out, err := appserver.RunBoundedCommand(callCtx, command.Argv0, args, command.WorkDir, minimalExecEnv(), command.MaxBytes)
+	if errors.Is(err, appserver.ErrCommandOutputLimit) {
 		return nil, robotErr("命令输出超限")
 	}
 	if callCtx.Err() == context.DeadlineExceeded {

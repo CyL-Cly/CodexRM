@@ -1,14 +1,17 @@
 package com.codexrm.mobile
 
 import android.content.Context
-import android.text.Spannable
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.app.AlertDialog
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.SpannedString
 import android.text.method.LinkMovementMethod
 import android.text.style.URLSpan
+import android.text.style.ClickableSpan
+import android.text.style.ForegroundColorSpan
 import android.text.util.Linkify
-import android.util.TypedValue
 import android.view.ViewGroup
 import android.widget.TextView
 import io.noties.markwon.AbstractMarkwonPlugin
@@ -19,8 +22,6 @@ import io.noties.markwon.MarkwonVisitor
 import io.noties.markwon.SpannableBuilder
 import io.noties.markwon.core.CoreProps
 import io.noties.markwon.core.MarkwonTheme
-import io.noties.markwon.ext.latex.JLatexMathPlugin
-import io.noties.markwon.ext.latex.JLatexAsyncDrawableSpan
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
 import io.noties.markwon.ext.tables.TablePlugin
 import io.noties.markwon.ext.tables.TableSpan
@@ -29,21 +30,20 @@ import io.noties.markwon.inlineparser.MarkwonInlineParserPlugin
 import io.noties.markwon.image.AsyncDrawableSpan
 import org.commonmark.node.Link
 import org.commonmark.node.Text
+import org.commonmark.node.FencedCodeBlock
 
 internal class Markdown(
     context: Context,
     images: MessageImageLoader,
     download: (ArtifactCard) -> Unit = {},
 ) {
+    private var streaming = false
     private val imagePlugin = MessageImagesPlugin(context, images)
     private val markwon = Markwon.builder(context)
         .usePlugin(imagePlugin)
-        .usePlugin(MarkwonInlineParserPlugin.create(MathParser.inlineFactory()))
-        .usePlugin(MathParser())
-        .usePlugin(JLatexMathPlugin.create(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 14f, context.resources.displayMetrics)) { builder ->
-            builder.inlinesEnabled(true)
-            builder.theme().textColor(Ui.TEXT).blockFitCanvas(false)
-        })
+        .usePlugin(MarkwonInlineParserPlugin.create(MathParser.inlineFactory { streaming }))
+        .usePlugin(MathParser { streaming })
+        .usePlugin(PreparedMath(context))
         .usePlugin(TablePlugin.create { theme ->
             theme.tableBorderColor(Ui.BORDER)
                 .tableBorderWidth(Ui.dp(context, 1))
@@ -51,6 +51,7 @@ internal class Markdown(
                 .tableHeaderRowBackgroundColor(Ui.SURFACE_ALT)
                 .tableOddRowBackgroundColor(Ui.SURFACE)
         })
+        .usePlugin(MathTables(context))
         .usePlugin(StrikethroughPlugin.create())
         .usePlugin(TaskListPlugin.create(Ui.GREEN, Ui.MUTED, Ui.BACKGROUND))
         .usePlugin(object : AbstractMarkwonPlugin() {
@@ -79,6 +80,47 @@ internal class Markdown(
             }
 
             override fun configureVisitor(builder: MarkwonVisitor.Builder) {
+                builder.on(FencedCodeBlock::class.java) { visitor, node ->
+                    val start = visitor.length()
+                    val code = node.literal.removeSuffix("\n")
+                    val language = node.info.orEmpty().substringBefore(' ').ifBlank { "代码" }
+                    visitor.blockStart(node)
+                    val heading = visitor.length()
+                    visitor.builder().append("$language   ·   复制代码")
+                    visitor.setSpans(heading, object : ClickableSpan() {
+                        override fun onClick(widget: android.view.View) {
+                            widget.context.getSystemService(ClipboardManager::class.java)
+                                .setPrimaryClip(ClipData.newPlainText(language, code))
+                        }
+                    })
+                    if (language.equals("mermaid", ignoreCase = true) && !streaming && code.isNotBlank()) {
+                        visitor.builder().append("   ?   ")
+                        val diagram = visitor.length()
+                        visitor.builder().append("预览图表")
+                        visitor.setSpans(diagram, object : ClickableSpan() {
+                            override fun onClick(widget: android.view.View) {
+                                val inline = widget.tag as? InlineMermaid
+                                if (inline == null) MermaidPreview.show(widget.context, code, Ui.dark)
+                                else inline.toggle(code)
+                            }
+                        })
+                    }
+                    val preview = code.lineSequence().take(100).joinToString("\n").take(10_000)
+                    visitor.builder().append('\n').append(highlightCode(preview, node.info.orEmpty())).append('\n')
+                    if (preview.length < code.length) {
+                        val expand = visitor.length()
+                        visitor.builder().append("查看完整代码")
+                        visitor.setSpans(expand, object : ClickableSpan() {
+                            override fun onClick(widget: android.view.View) {
+                                showLongCode(widget.context, language, code, node.info.orEmpty())
+                            }
+                        })
+                        visitor.builder().append('\n')
+                    }
+                    CoreProps.CODE_BLOCK_INFO.set(visitor.renderProps(), node.info.orEmpty())
+                    visitor.setSpansForNodeOptional(node, start)
+                    visitor.blockEnd(node)
+                }
                 builder.on(Text::class.java) { visitor, node ->
                     val start = visitor.length()
                     visitor.builder().append(node.literal)
@@ -101,8 +143,8 @@ internal class Markdown(
         })
         .build()
 
-    fun bind(view: TextView, message: ChatMessage) {
-        val rendered = message.rendered as? Spanned ?: when (message.kind) {
+    fun bind(view: TextView, message: ChatMessage, prepared: Spanned? = null, preserveMathScroll: Boolean = false) {
+        val rendered = prepared ?: message.rendered as? Spanned ?: when (message.kind) {
             MessageKind.TOOL, MessageKind.ERROR, MessageKind.STATUS -> SpannedString(message.body)
             else -> render(message.body, message.id)
         }.also { message.rendered = it }
@@ -110,33 +152,71 @@ internal class Markdown(
             rendered.getSpans(0, rendered.length, TableSpan::class.java).isNotEmpty() ||
             rendered.getSpans(0, rendered.length, AsyncDrawableSpan::class.java).isNotEmpty()
         view.layoutParams.width = if (wide) ViewGroup.LayoutParams.MATCH_PARENT else ViewGroup.LayoutParams.WRAP_CONTENT
-        // These hooks load formula drawables and measure tables, and detach the previous
-        // message's callbacks when ListView reuses a TextView or a streaming update arrives.
+        if (preserveMathScroll) {
+            val previous = view.text as? Spanned
+            val old = previous?.getSpans(0, previous.length, ScrollableMathSpan::class.java).orEmpty()
+            val next = rendered.getSpans(0, rendered.length, ScrollableMathSpan::class.java)
+            for ((before, after) in old.zip(next)) {
+                if (before.drawable.destination == after.drawable.destination) after.restoreOffset(before.offset)
+            }
+        }
+        // Bind table and image hooks and detach image callbacks from the old content.
         markwon.setParsedMarkdown(view, rendered)
     }
 
     fun clear(view: TextView) = markwon.setParsedMarkdown(view, SpannedString(""))
 
-    private fun render(source: String, messageId: String): Spanned {
+    fun render(source: String, messageId: String, streaming: Boolean = false): Spanned {
         imagePlugin.messageId = messageId
-        val text = try { markwon.toMarkdown(source) } finally { imagePlugin.messageId = "" }
-        if (text is Spannable) {
-            for (span in text.getSpans(0, text.length, JLatexAsyncDrawableSpan::class.java)) {
-                // The plugin uses the base span for blocks and a subclass for inline math.
-                // Align inline math to the text baseline rather than the line's padded center.
-                val start = text.getSpanStart(span)
-                val end = text.getSpanEnd(span)
-                val flags = text.getSpanFlags(span)
-                text.removeSpan(span)
-                val replacement = if (span.javaClass == JLatexAsyncDrawableSpan::class.java) {
-                    ScrollableMathSpan(markwon.configuration().theme(), span.drawable)
-                } else {
-                    InlineMathSpan(markwon.configuration().theme(), span.drawable)
-                }
-                text.setSpan(replacement, start, end, flags)
+        this.streaming = streaming
+        return try {
+            markwon.toMarkdown(source)
+        } finally {
+            imagePlugin.messageId = ""
+            this.streaming = false
+        }
+    }
+
+    private fun highlightCode(code: String, info: String): CharSequence {
+        if (info.isBlank() || info == "text" || info == "plaintext" || code.length > 50_000) return code
+        val text = SpannableString(code)
+        for (match in codeToken.findAll(code)) {
+            val color = when {
+                match.groups[1] != null -> Ui.MUTED
+                match.groups[2] != null -> Ui.GREEN
+                else -> Ui.TEXT
             }
+            if (color != Ui.TEXT) text.setSpan(ForegroundColorSpan(color), match.range.first, match.range.last + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
         return text
+    }
+
+    private fun showLongCode(context: Context, language: String, code: String, info: String) {
+        val chunks = code.lineSequence().chunked(80).map { it.joinToString("\n") }.toList()
+        val list = android.widget.ListView(context)
+        list.adapter = object : android.widget.BaseAdapter() {
+            override fun getCount() = chunks.size
+            override fun getItem(position: Int) = chunks[position]
+            override fun getItemId(position: Int) = position.toLong()
+            override fun getView(position: Int, convertView: android.view.View?, parent: ViewGroup): android.view.View {
+                val view = convertView as? TextView ?: Ui.text(context, "", 12f).apply {
+                    typeface = android.graphics.Typeface.MONOSPACE
+                    setTextIsSelectable(true)
+                    val spacing = Ui.dp(context, 14)
+                    setPadding(spacing, Ui.dp(context, 4), spacing, Ui.dp(context, 4))
+                }
+                view.text = highlightCode(getItem(position), info)
+                return view
+            }
+        }
+        AlertDialog.Builder(context).setTitle(language).setView(list)
+            .setNeutralButton("复制代码") { _, _ ->
+                context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(language, code))
+            }.setPositiveButton("关闭", null).show()
+    }
+
+    private companion object {
+        val codeToken = Regex("""(//[^\r\n]*|#[^\r\n]*)|("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\b(?:if|else|for|while|return|function|func|class|def|val|var|let|const|import|from|package|true|false|null|nil)\b)""")
     }
 }
 

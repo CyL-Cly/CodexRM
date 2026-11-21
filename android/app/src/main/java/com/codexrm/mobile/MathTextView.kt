@@ -1,64 +1,57 @@
 package com.codexrm.mobile
 
 import android.content.Context
+import android.text.NoCopySpan
+import android.text.Spannable
 import android.text.Spanned
-import android.view.MotionEvent
-import android.view.ViewConfiguration
+import android.text.style.UpdateAppearance
 import android.widget.TextView
-import kotlin.math.abs
 
-/** Capture horizontal drags only when they start on an overflowing display formula. */
+/** Maps touch coordinates to the drawn viewport of an overflowing span. */
 internal class MathTextView(context: Context) : TextView(context) {
-    private val slop = ViewConfiguration.get(context).scaledTouchSlop
-    private var formula: ScrollableMathSpan? = null
-    private var startX = 0f
-    private var startY = 0f
-    private var lastX = 0f
-    private var dragging = false
+    private val overflowRedraw = object : UpdateAppearance, NoCopySpan {}
 
-    fun scrollableFormulaAt(x: Float, y: Float): ScrollableMathSpan? {
+    var formulaWidth = 0
+        private set
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        formulaWidth = MeasureSpec.getSize(widthMeasureSpec) - totalPaddingLeft - totalPaddingRight
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
+
+    fun horizontalOverflowAt(x: Float, y: Float): HorizontalOverflow? {
         val content = text as? Spanned ?: return null
-        return content.getSpans(0, content.length, ScrollableMathSpan::class.java).firstOrNull {
-            it.scrollRange > 0 && it.viewport.contains(x - totalPaddingLeft + scrollX, y - totalPaddingTop + scrollY)
+        val layoutX = x - totalPaddingLeft + scrollX
+        val layoutY = y - totalPaddingTop + scrollY
+        return content.getSpans(0, content.length, HorizontalOverflow::class.java).firstOrNull {
+            it.scrollRange > 0 && it.viewport.contains(layoutX, layoutY)
         }
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                formula = scrollableFormulaAt(event.x, event.y)
-                startX = event.x; lastX = event.x; startY = event.y; dragging = false
-                if (formula != null) parent?.requestDisallowInterceptTouchEvent(true)
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val target = formula
-                if (target != null) {
-                    val dx = event.x - startX
-                    val dy = event.y - startY
-                    if (!dragging && abs(dy) > slop && abs(dy) >= abs(dx)) {
-                        formula = null
-                        parent?.requestDisallowInterceptTouchEvent(false)
-                    } else if (dragging || (abs(dx) > slop && abs(dx) > abs(dy))) {
-                        if (!dragging) {
-                            val cancel = MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL }
-                            super.onTouchEvent(cancel)
-                            cancel.recycle()
-                        }
-                        target.panBy(lastX - event.x)
-                        lastX = event.x
-                        dragging = true
-                        invalidate()
-                        return true
-                    }
+    fun panOverflow(span: HorizontalOverflow, distance: Float) {
+        if (distance == 0f) return
+        val content = text as? Spannable
+        val start = content?.getSpanStart(span) ?: -1
+        span.panBy(distance)
+        if (content == null || start < 0) {
+            invalidate()
+            return
+        }
+        var redrawStart = start
+        var redrawEnd = content.getSpanEnd(span)
+        if (span is MathTableRow) {
+            // Table rows share the same offset, so invalidate all rows in this table.
+            for (row in content.getSpans(0, content.length, MathTableRow::class.java)) {
+                if (row.table === span.table) {
+                    redrawStart = minOf(redrawStart, content.getSpanStart(row))
+                    redrawEnd = maxOf(redrawEnd, content.getSpanEnd(row))
                 }
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                val handled = dragging
-                formula = null; dragging = false
-                parent?.requestDisallowInterceptTouchEvent(false)
-                if (handled) return true
-            }
         }
-        return super.onTouchEvent(event)
+        // TextView caches hardware display lists for selectable text. Notify its span watcher
+        // so the affected lines redraw without triggering text layout or clearing selection.
+        content.setSpan(overflowRedraw, redrawStart, redrawEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
     }
+
+    fun containsOverflow(span: HorizontalOverflow): Boolean = ((text as? Spanned)?.getSpanStart(span) ?: -1) >= 0
 }

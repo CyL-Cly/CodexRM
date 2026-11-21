@@ -46,4 +46,14 @@ class TranscriptStateTest {
         assertEquals("new error", merged.messages.single { it.id == "error-turn-2" }.body)
         assertEquals(setOf("item-1", "stopped-turn-1"), merged.historyIds)
     }
+
+    @Test fun `id-less items keep a stable identity across overlapping page reparse`() {
+        fun anonymousTurn() = JSONObject().put("id", "turn-1").put("status", "completed")
+            .put("items", JSONArray().put(JSONObject().put("type", "agentMessage").put("text", "same")))
+        val first = TurnRenderer.messages(anonymousTurn(), false)
+        val second = TurnRenderer.messages(JSONObject(anonymousTurn().toString()), false)
+        assertEquals(first.map { it.id }, second.map { it.id })
+        val merged = TranscriptState.prepend(first, second)
+        assertEquals(1, merged.messages.count { it.kind == MessageKind.ASSISTANT })
+    }
 }

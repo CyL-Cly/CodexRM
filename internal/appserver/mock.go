@@ -196,6 +196,54 @@ func (h *mockHub) serve(conn *websocket.Conn, textOnly bool) {
 			}
 			c.reply(id, reply)
 			c.event("thread/started", map[string]any{"thread": copy})
+		case "thread/fork":
+			h.mu.Lock()
+			source := h.threadLocked(tid)
+			if source == nil {
+				h.mu.Unlock()
+				c.rpcError(id, "thread not found")
+				break
+			}
+			thread := clone(source).(map[string]any)
+			turns := thread["turns"].([]any)
+			before, _ := p["beforeTurnId"].(string)
+			last, _ := p["lastTurnId"].(string)
+			if before != "" || last != "" {
+				end := -1
+				for i, value := range turns {
+					turn := value.(map[string]any)
+					if turn["id"] == before {
+						end = i
+						break
+					}
+					if turn["id"] == last {
+						end = i + 1
+						break
+					}
+				}
+				if end < 0 {
+					h.mu.Unlock()
+					c.rpcError(id, "unknown fork turn")
+					break
+				}
+				turns = turns[:end]
+			}
+			threadID := fmt.Sprintf("thread_%d", h.next.Add(1))
+			thread["id"], thread["forkedFromId"], thread["archived"] = threadID, tid, false
+			thread["createdAt"], thread["updatedAt"] = time.Now().Unix(), time.Now().Unix()
+			thread["turns"], thread["status"] = turns, map[string]any{"type": "idle"}
+			if len(turns) == 0 {
+				thread["preview"] = ""
+			}
+			h.threads = append([]map[string]any{thread}, h.threads...)
+			response := clone(thread).(map[string]any)
+			h.mu.Unlock()
+			c.loaded[threadID] = true
+			if p["excludeTurns"] == true {
+				delete(response, "turns")
+			}
+			c.reply(id, map[string]any{"thread": response, "model": response["model"], "modelProvider": response["modelProvider"]})
+			c.event("thread/started", map[string]any{"thread": response})
 		case "thread/resume", "thread/read":
 			h.mu.Lock()
 			t := h.threadLocked(tid)
@@ -251,15 +299,15 @@ func (h *mockHub) serve(conn *websocket.Conn, textOnly bool) {
 			h.mu.Unlock()
 			c.reply(id, map[string]any{})
 			c.event("thread/name/updated", map[string]any{"threadId": tid, "threadName": p["name"]})
-		case "thread/archive":
+		case "thread/archive", "thread/unarchive":
 			h.mu.Lock()
 			t := h.threadLocked(tid)
 			if t != nil {
-				t["archived"] = true
+				t["archived"] = msg.Method == "thread/archive"
 			}
 			h.mu.Unlock()
 			c.reply(id, map[string]any{})
-			c.event("thread/archived", map[string]any{"threadId": tid})
+			c.event(msg.Method+"d", map[string]any{"threadId": tid})
 		case "turn/interrupt":
 			h.mu.Lock()
 			cancel := h.active[tid]

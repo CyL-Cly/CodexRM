@@ -36,6 +36,24 @@ internal class AttachmentStore(context: Context) {
         return local.takeIf { it.parentFile == directory.canonicalFile && it.isFile }
     }
 
+    fun cleanupStaleFiles() {
+        worker.execute {
+            val retained = mutableSetOf<String>()
+            for (value in prefs.all.values) {
+                val drafts = runCatching { JSONArray(value as? String ?: return@execute) }.getOrNull() ?: return@execute
+                for (index in 0 until drafts.length()) {
+                    drafts.optJSONObject(index)?.string("localPath")?.let(retained::add)
+                }
+            }
+            val cutoff = System.currentTimeMillis() - 24 * 60 * 60 * 1000L
+            directory.listFiles()?.forEach { file ->
+                if (file.isFile && file.absolutePath !in retained && file.lastModified() in 1 until cutoff) {
+                    file.delete()
+                }
+            }
+        }
+    }
+
     fun remove(key: String, file: JSONObject) {
         localFile(file)?.delete()
         save(key, load(key).filter { it.string("draftId") != file.string("draftId") })

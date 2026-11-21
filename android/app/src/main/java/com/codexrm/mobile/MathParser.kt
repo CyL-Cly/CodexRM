@@ -19,9 +19,9 @@ import org.commonmark.parser.block.MatchedBlockParser
 import org.commonmark.parser.block.ParserState
 
 /** Math is parsed within CommonMark, so code fences, code spans and link destinations stay literal. */
-internal class MathParser : AbstractMarkwonPlugin() {
+internal class MathParser(private val streaming: () -> Boolean = { false }) : AbstractMarkwonPlugin() {
     override fun configureParser(builder: Parser.Builder) {
-        builder.customBlockParserFactory(DisplayMathParser.Factory())
+        builder.customBlockParserFactory(DisplayMathParser.Factory(streaming))
     }
 
     override fun configureVisitor(builder: MarkwonVisitor.Builder) {
@@ -33,15 +33,15 @@ internal class MathParser : AbstractMarkwonPlugin() {
     }
 
     companion object {
-        fun inlineFactory(): MarkwonInlineParser.FactoryBuilder = MarkwonInlineParser.factoryBuilderNoDefaults().apply {
-            addInlineProcessor(MathInlineProcessor('$'))
-            addInlineProcessor(MathInlineProcessor('\\'))
+        fun inlineFactory(streaming: () -> Boolean = { false }): MarkwonInlineParser.FactoryBuilder = MarkwonInlineParser.factoryBuilderNoDefaults().apply {
+            addInlineProcessor(MathInlineProcessor('$', streaming))
+            addInlineProcessor(MathInlineProcessor('\\', streaming))
             includeDefaults()
         }
     }
 }
 
-private class MathInlineProcessor(private val character: Char) : InlineProcessor() {
+private class MathInlineProcessor(private val character: Char, private val streaming: () -> Boolean) : InlineProcessor() {
     override fun specialCharacter(): Char = character
 
     override fun parse(): Node? {
@@ -84,6 +84,12 @@ private class MathInlineProcessor(private val character: Char) : InlineProcessor
             }
             end++
         }
+        // With explicit delimiters we can hold the unfinished TeX at one
+        // placeholder. A lone dollar is ambiguous in ordinary prose.
+        if (streaming() && !singleDollar) {
+            index = input.length
+            return text("…")
+        }
         // Keep backslashes in unfinished \(...\) and \[...\] expressions during streaming.
         if (character == '\\') {
             index = start
@@ -95,7 +101,7 @@ private class MathInlineProcessor(private val character: Char) : InlineProcessor
 
 private class DisplayMathBlock : CustomBlock()
 
-private class DisplayMathParser(private val opening: String, private val closing: String) : AbstractBlockParser() {
+private class DisplayMathParser(private val opening: String, private val closing: String, private val streaming: () -> Boolean) : AbstractBlockParser() {
     private val node = DisplayMathBlock()
     private val lines = ArrayList<String>()
     private var closed = false
@@ -119,12 +125,12 @@ private class DisplayMathParser(private val opening: String, private val closing
         node.appendChild(if (latex.isNotEmpty()) {
             JLatexMathBlock().apply { latex(latex) }
         } else {
-            // Streaming and incomplete expressions remain readable until their closing delimiter arrives.
-            Paragraph().apply { appendChild(Text(source)) }
+            // Keep the unfinished block at one line during streaming.
+            Paragraph().apply { appendChild(Text(if (!closed && streaming()) "…" else source)) }
         })
     }
 
-    class Factory : AbstractBlockParserFactory() {
+    class Factory(private val streaming: () -> Boolean) : AbstractBlockParserFactory() {
         override fun tryStart(state: ParserState, matchedBlockParser: MatchedBlockParser): BlockStart? {
             if (state.indent >= 4) return BlockStart.none()
             val content = state.line.subSequence(state.nextNonSpaceIndex, state.line.length).toString()
@@ -137,7 +143,7 @@ private class DisplayMathParser(private val opening: String, private val closing
             // A closing delimiter followed by prose belongs to the inline parser.
             val rest = content.drop(opening.length).trimEnd()
             if (rest.contains(closing) && !rest.endsWith(closing)) return BlockStart.none()
-            return BlockStart.of(DisplayMathParser(opening, closing)).atIndex(state.nextNonSpaceIndex)
+            return BlockStart.of(DisplayMathParser(opening, closing, streaming)).atIndex(state.nextNonSpaceIndex)
         }
     }
 }

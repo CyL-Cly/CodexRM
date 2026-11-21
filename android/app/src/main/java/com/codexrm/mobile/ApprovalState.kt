@@ -10,15 +10,16 @@ internal data class ApprovalScope(
 
 internal object ApprovalFilter {
     /**
-     * A request is shown only in the thread it belongs to; a new chat shows no
-     * thread-level requests. turnId is enforced only when both sides are known:
-     * non-blocking questions and requests without a turnId stay answerable,
-     * matching the web client, while a stale turn can never leak into a new one.
+     * A request is shown only in the exact thread it belongs to; a new chat shows
+     * no thread-level requests. Missing thread ownership is quarantined rather than
+     * guessed, because approving it in an unrelated chat would act on the original
+     * request ID. turnId is enforced only when both sides are known, matching the
+     * web client, while a stale turn can never leak into a new one.
      */
     fun visible(scope: ApprovalScope?, agentId: String, threadId: String, turnId: String): Boolean {
         if (scope == null || threadId.isEmpty()) return false
         if (scope.agentId != agentId) return false
-        if (scope.threadId.isNotEmpty() && scope.threadId != threadId) return false
+        if (scope.threadId.isEmpty() || scope.threadId != threadId) return false
         return scope.turnId.isEmpty() || turnId.isEmpty() || scope.turnId == turnId
     }
 

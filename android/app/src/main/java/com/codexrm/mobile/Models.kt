@@ -1,5 +1,6 @@
 package com.codexrm.mobile
 
+import org.json.JSONArray
 import org.json.JSONObject
 
 internal data class Device(
@@ -98,7 +99,11 @@ internal data class ChatMessage(
     var status: String = "",
     var images: List<MessageImage> = emptyList(),
     var files: List<ArtifactCard> = emptyList(),
+    var questions: List<AsyncQuestion> = emptyList(),
+    var questionReplies: List<AsyncQuestionReply> = emptyList(),
 ) {
+    var turnId: String = ""
+    var userInput: JSONArray? = null
     @Volatile var rendered: CharSequence? = null
     @Volatile var dirty = true
     fun change(title: String = this.title, body: String = this.body, status: String = this.status, images: List<MessageImage> = this.images, files: List<ArtifactCard> = this.files) {

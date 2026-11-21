@@ -21,6 +21,7 @@
 - 模型选择器支持按供应商分组和搜索，选中模型后可选思考强度；工作区写入、只读、完整访问权限模式；按设备/工作区保存偏好。
 - 按设备、会话及新会话工作区绑定草稿和附件；设备/线程切换立即重绑，连接期间的输入不会被延迟恢复覆盖。新会话在进程重建后的 bootstrap/cwd 绑定完成时恢复草稿。发送在途记录独立持久化，进程回收后标记“发送状态未确认”，先同步核对，不自动重发，避免丢稿或重复执行。初始化失败可在页内重试；明暗主题；前台断线重连和当前会话重同步。
 - 侧栏左下角“…”菜单内手动检查更新，显示版本说明和下载进度；校验 APK 大小、SHA-256、包名与版本后自动覆盖安装，支持取消下载及未知来源授权。
+- 长按当前工作区路径打开 P2P 文件管理。电脑和手机目录在竖屏、横屏均并排显示。可从电脑下载或批量复制文件到手机，手机侧通过系统目录选择器授权。
 
 ## 体积与性能设计
 
@@ -50,7 +51,7 @@ build.bat nopause -PublishOnly
 build.bat -Help
 ```
 
-产物位于仓库的 `build/dist/CodexRM-Android-v版本号-版本代码.apk` 和 `build/dist/android-update.json`，Gradle 日志位于 `android/build.log`。构建或打包失败会恢复原版本文件；上传或清单发布失败保留新版本及产物，使用 `-PublishOnly` 重试，不再递增版本。`-BuildOnly` 不要求发布配置、Go 或 SSH；加 `-KeepVersion` 可保留当前版本号。
+产物位于仓库的 `build/dist/CodexRM-Android-v版本号-版本代码.apk` 和 `build/dist/android-update.json`，Gradle 日志位于 `android/build.log`。构建或打包失败会恢复原版本文件；上传或清单发布失败保留新版本及产物，使用 `-PublishOnly` 重试，不再递增版本。`-BuildOnly` 需要 Go 构建原生 P2P 库，无需发布配置或 SSH；加 `-KeepVersion` 可保留当前版本号。
 
 脚本优先使用 `JAVA_EXE`、`JAVA_HOME` 或已安装的 Android Studio JBR，也可用 `-JavaExe` 指定。需要构建代理时设置 `BUILD_PROXY=127.0.0.1:8848`，或传入 `-BuildProxy 127.0.0.1:8848`；`direct` 表示直连。`-Config`、`-OutputDirectory` 可指定配置和产物目录，重试发布时沿用相同目录。运行 `-Help` 查看参数。
 
@@ -88,9 +89,10 @@ adb install -r .\app\build\outputs\apk\androidTest\debug\app-debug-androidTest.a
 adb shell am instrument -w -r com.codexrm.mobile.imageqa.test/com.codexrm.mobile.ImageRenderingInstrumentation
 ```
 
-公式 runner 也支持隔离的 minified Release 验收（本机测试签名）：`.\gradlew.bat assembleRelease assembleReleaseAndroidTest '-Pcodexrm.mathQa' '-Pcodexrm.testSign'`，随后安装 Release 目标包和 `androidTest\release` 包，并将上面的 instrumentation 包名改为 `com.codexrm.mobile.mathqa.test`。
+公式 runner 也支持隔离的 minified Release 验收（本机测试签名）：`.\gradlew.bat assembleRelease assembleReleaseAndroidTest '-Pcodexrm.releaseQa' '-Pcodexrm.mathQa' '-Pcodexrm.testSign'`，随后安装 Release 目标包和 `androidTest\release` 包，并将上面的 instrumentation 包名改为 `com.codexrm.mobile.mathqa.test`。
 
 ## 使用
+
 
 侧栏打开时，Android 14+ 的系统边缘返回手势会让侧栏和遮罩随进度收起；取消手势会恢复侧栏。设备列表展开时，第一次返回先收起列表。返回键和 Android 13 及以下仍在确认返回后收起侧栏。
 

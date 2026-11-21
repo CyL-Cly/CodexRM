@@ -20,14 +20,14 @@ class ApprovalStateTest {
         assertFalse(ApprovalFilter.visible(null, "agent-a", "thread-a", "turn-a"))
     }
 
-    @Test fun `incomplete ownership stays answerable instead of hanging the task`() {
-        // Codex may omit turnId, or a request may arrive before turn/started.
-        // Hiding it entirely would leave the task waiting forever, which is
-        // worse than showing it in the thread it belongs to.
+    @Test fun `missing thread ownership is quarantined instead of leaking across threads`() {
+        // A request without threadId must never be guessed into whichever chat is open.
+        assertFalse(ApprovalFilter.visible(scope.copy(threadId = ""), "agent-a", "thread-a", "turn-a"))
+        assertFalse(ApprovalFilter.visible(scope.copy(threadId = ""), "agent-a", "thread-b", "turn-a"))
+        // Missing turnId is still answerable inside the exact owning thread.
         assertTrue(ApprovalFilter.visible(scope.copy(turnId = ""), "agent-a", "thread-a", "turn-a"))
         assertTrue(ApprovalFilter.visible(scope.copy(turnId = ""), "agent-a", "thread-a", ""))
         assertTrue(ApprovalFilter.visible(scope, "agent-a", "thread-a", ""))
-        assertTrue(ApprovalFilter.visible(scope.copy(threadId = ""), "agent-a", "thread-a", "turn-a"))
     }
 
     @Test fun `batch cannot cross agents or threads`() {

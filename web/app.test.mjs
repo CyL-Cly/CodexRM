@@ -75,7 +75,7 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
     document, localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     window: { innerWidth: 1200, innerHeight: 800, addEventListener(type, listener) { windowListeners.set(type, listener); } },
     location: { origin: "http://localhost", href: `http://localhost/?keep=1${hash}`, protocol: "http:", pathname: "/", search: "?keep=1", hash },
-    history, URL, URLSearchParams, console, navigator, Blob, Uint8Array, btoa, atob,
+    history, URL, URLSearchParams, console, navigator, Blob, Uint8Array, TextEncoder, btoa, atob,
     matchMedia: () => ({ matches: false }),
     fetch: async (path, options) => {
       if (path === "/api/v1/client/claim") claims.push(JSON.parse(options.body));
@@ -103,7 +103,7 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
   return { context, elements, claims, profiles, contextRequests, history, document, documentListeners, windowListeners, timers,
     advance,
     profile: vm.runInContext("({browserClientProfile, syncClientProfile})", context),
-    app: vm.runInContext("({state, workspaceGroups, renderThreads, setHome, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, closeCodexDesktop, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams, makeOutboxEntry, stageOutbox, bindOutbox, clearOutbox, syncOutbox, keepOutboxDraft, renderPersistentNotice, addAttachments, currentAttachments, userContent, messageInput, readAttachment, itemHTML, requestThreadDeletion, archiveThread, openThread, olderTurns, scheduleSnapshot, bootstrap, resetView, selectDevice, settings, updateAgent, createDeviceButton})", context) };
+    app: vm.runInContext("({state, workspaceGroups, renderThreads, renderWorkspacePath, setHome, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, closeCodexDesktop, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams, makeOutboxEntry, stageOutbox, bindOutbox, clearOutbox, syncOutbox, keepOutboxDraft, renderPersistentNotice, addAttachments, currentAttachments, userContent, messageInput, readAttachment, itemHTML, groupOperationItems, operationGroupHTML, rememberDisclosure, disclosureOpen, renderMessages, requestThreadDeletion, archiveThread, openThread, olderTurns, scheduleSnapshot, bootstrap, resetView, selectDevice, settings, updateAgent, createDeviceButton})", context) };
 }
 
 const deferred = () => {
@@ -120,6 +120,110 @@ function newThreadApp(storage = new Map()) {
   });
   return harness;
 }
+
+test("home uses a task-focused hero and live device/workspace context", () => {
+  const { app, elements } = newThreadApp();
+  app.state.devices[0].agent.serverName = "Workstation";
+  app.state.info.cwd = "E:\\repo\\CodexRM";
+  app.state.info.os = "windows";
+  app.renderWorkspacePath();
+  assert.match(readFileSync(new URL("index.html", import.meta.url), "utf8"), /<h1 id="welcome-title">要构建什么？<\/h1>/);
+  assert.equal(elements.get("welcome-description").textContent, "在 CodexRM 中开始，任务由 Workstation 执行。");
+  app.state.browserOnline = false;
+  app.renderWorkspacePath();
+  assert.match(elements.get("welcome-description").textContent, /浏览器已离线/);
+  app.state.browserOnline = true;
+  app.state.online = false;
+  app.renderWorkspacePath();
+  assert.match(elements.get("welcome-description").textContent, /等待本地连接器上线/);
+  const empty = loadApp();
+  empty.app.renderWorkspacePath();
+  assert.equal(empty.elements.get("welcome-description").textContent, "连接你的电脑，让 Codex 继续手边的工作。");
+});
+
+test("consecutive operations use one closed card headed by the latest operation", () => {
+  const { app } = loadApp();
+  const items = [
+    { id: "think", type: "reasoning", reasoningText: "先检查实现" },
+    { id: "command", type: "commandExecution", command: "pnpm test", aggregatedOutput: "ok", status: "completed", exitCode: 0 },
+    { id: "search", type: "webSearch", query: "latest <query>", action: {}, status: "已完成" },
+    { id: "reply", type: "agentMessage", text: "处理完成" },
+    { id: "single", type: "fileChange", changes: [], status: "completed" },
+  ];
+  const groups = app.groupOperationItems(items);
+  assert.equal(groups.length, 3);
+  assert.equal(groups[0].operation, true);
+  assert.deepEqual(Array.from(groups[0].items, (item) => item.id), ["think", "command", "search"]);
+  assert.deepEqual(Array.from(groups[1].items, (item) => item.id), ["reply"]);
+  assert.deepEqual(Array.from(groups[2].items, (item) => item.id), ["single"]);
+
+  const html = app.operationGroupHTML(groups[0].items);
+  assert.match(html, /^<details class="operation-group" data-detail="operations:think"/);
+  assert.doesNotMatch(html, /^<details[^>]*\sopen[\s>]/);
+  assert.match(html, /<span class="operation-group-title[^"]*">搜索 · latest &lt;query&gt;<\/span>/);
+  assert.match(html, /<span class="operation-group-meta">3 条操作 · 已完成<\/span>/);
+  assert.ok(html.indexOf('data-item-id="think"') < html.indexOf('data-item-id="command"'));
+  assert.ok(html.indexOf('data-item-id="command"') < html.indexOf('data-item-id="search"'));
+  assert.doesNotMatch(html.match(/<summary[^>]*>.*?<\/summary>/s)[0], /pnpm test/);
+});
+
+test("active reasoning shimmers and completed reasoning collapses unless the user chose otherwise", () => {
+  const { app } = loadApp();
+  const item = { id: "think", type: "reasoning", reasoningText: "先检查实现" };
+  const active = app.itemHTML(item, undefined, true);
+  assert.match(active, /data-active="true" open/);
+  assert.match(active, /aria-expanded="true"/);
+  assert.match(active, /class="reasoning-title thinking-shimmer" role="status">正在思考/);
+  const completed = app.itemHTML(item, undefined, false);
+  assert.match(completed, /data-active="false"/);
+  assert.doesNotMatch(completed, /^<details[^>]*\sopen[\s>]/);
+  assert.match(completed, /<span class="reasoning-title" role="status">已思考<\/span>/);
+  assert.match(completed, /先检查实现/);
+  app.rememberDisclosure("think", true);
+  assert.match(app.itemHTML(item, undefined, false), /^<details[^>]*\sopen[\s>]/);
+  app.rememberDisclosure("think", false);
+  assert.doesNotMatch(app.itemHTML(item, undefined, true), /^<details[^>]*\sopen[\s>]/);
+});
+
+test("operation groups auto-expand only while active and preserve manual disclosure", () => {
+  const { app } = loadApp();
+  const items = [
+    { id: "think", type: "reasoning", reasoningText: "分析输入" },
+    { id: "command", type: "commandExecution", command: "node test.mjs", status: "inProgress" },
+  ];
+  const active = app.operationGroupHTML(items, true);
+  assert.match(active, /data-active="true" open/);
+  assert.match(active, /aria-expanded="true" aria-controls="operations:think-body"/);
+  assert.match(active, /operation-group-title thinking-shimmer/);
+  assert.match(active, /2 条操作 · 执行中/);
+  const completed = app.operationGroupHTML(items, false);
+  assert.doesNotMatch(completed, /^<details[^>]*\sopen[\s>]/);
+  assert.match(completed, /aria-expanded="false"/);
+  app.rememberDisclosure("operations:think", true);
+  assert.match(app.operationGroupHTML(items, false), /^<details[^>]*\sopen[\s>]/);
+  app.rememberDisclosure("operations:think", false);
+  assert.doesNotMatch(app.operationGroupHTML(items, true), /^<details[^>]*\sopen[\s>]/);
+});
+
+test("streaming completion collapses auto-opened groups but never overrides a manual choice", () => {
+  const { app, elements } = loadApp();
+  app.state.current = { id: "thread" };
+  app.state.turns = [{ id: "turn", status: "inProgress", items: [
+    { id: "think", type: "reasoning", reasoningText: "分析" },
+    { id: "command", type: "commandExecution", command: "node test.mjs", status: "inProgress" },
+  ] }];
+  app.renderMessages();
+  assert.match(elements.get("messages").innerHTML, /data-detail="operations:think" data-active="true" open/);
+  app.rememberDisclosure("operations:think", false);
+  app.renderMessages();
+  assert.match(elements.get("messages").innerHTML, /data-detail="operations:think" data-active="true">/);
+  app.state.turns[0].status = "completed";
+  app.renderMessages();
+  assert.match(elements.get("messages").innerHTML, /data-detail="operations:think" data-active="false">/);
+  app.rememberDisclosure("operations:think", true);
+  app.renderMessages();
+  assert.match(elements.get("messages").innerHTML, /data-detail="operations:think" data-active="false" open/);
+});
 
 test("429 exhaustion enables Continue in the same thread and suppresses duplicate clicks", async () => {
   const { app, context, elements } = newThreadApp();
@@ -293,7 +397,7 @@ function providerApp(storage) {
   const providers = [
     { id: "", runtimeId: "", name: "Current", models: [model("shared")] },
     { id: "ccswitch_a", runtimeId: "ccswitch_a", name: "A", models: [model("shared"), model("alternate")] },
-    { id: "ccswitch_b", runtimeId: "ccswitch_b", name: "B", models: [model("shared")] },
+    { id: "ccswitch_b", runtimeId: "ccswitch_b", name: "B", models: [model("shared"), model("other")] },
   ];
   loaded.context.rpc = async () => ({ providers });
   return { ...loaded, providers };
@@ -312,14 +416,14 @@ test("the model menu combines the active catalog and searches CC Switch notes", 
   const labels = (group) => group.children.map((child) => child.textContent || child.children[0]?.textContent);
   assert.equal(groups().length, 2);
   assert.deepEqual(labels(groups()[0]), ["Sub2API", "日常使用", "shared", "alternate"]);
-  assert.deepEqual(labels(groups()[1]), ["Sub2API", "备用账号", "shared"]);
+  assert.deepEqual(labels(groups()[1]), ["Sub2API", "备用账号", "shared", "other"]);
   assert.equal(groups()[0].children[2].getAttribute("aria-checked"), "true");
   elements.get("model-search").value = "备用账号";
   elements.get("model-search").oninput();
-  assert.deepEqual(groups().map(labels), [["Sub2API", "备用账号", "shared"]]);
+  assert.deepEqual(groups().map(labels), [["Sub2API", "备用账号", "shared", "other"]]);
 });
 
-test("provider changes create a new thread while model changes retain the current supplier", async () => {
+test("same-provider model changes keep the chat and unsupported changes never open a new chat", async () => {
   const { app, elements } = providerApp();
   await app.loadModels();
   app.state.current = { id: "thread-a", modelProvider: "ccswitch_a", model: "shared", cwd: "/project" };
@@ -330,8 +434,53 @@ test("provider changes create a new thread while model changes retain the curren
   assert.equal(app.turnParams("test").model, "alternate");
   elements.get("model").value = app.modelKey("ccswitch_b", "shared");
   elements.get("model").onchange();
-  assert.equal(app.state.current, null);
-  assert.equal(app.selectedModel().providerId, "ccswitch_b");
+  assert.equal(app.state.current.id, "thread-a");
+  assert.equal(app.selectedModel().providerId, "ccswitch_a");
+});
+
+test("switching to a different model and endpoint keeps the chat, history and draft", async () => {
+  const { app, context, elements } = providerApp();
+  await app.loadModels();
+  app.state.info.threadModelProviderSwitch = true;
+  app.state.current = { id: "thread-a", modelProvider: "ccswitch_a", model: "shared" };
+  app.state.turns = [{ id: "previous", items: [] }];
+  app.selectThreadModel({ thread: app.state.current });
+  elements.get("effort").value = "high";
+  elements.get("prompt").value = "draft";
+  const calls = [];
+  context.rpc = async (method, params) => {
+    calls.push([method, { ...params }]);
+    if (method === "codexrm/thread/switchProvider") return { providerId: "ccswitch_b", model: "other" };
+    return { turn: { id: "next", status: "inProgress", items: [] } };
+  };
+  elements.get("model").value = app.modelKey("ccswitch_b", "other");
+  await elements.get("model").onchange();
+  assert.deepEqual(calls[0], ["codexrm/thread/switchProvider", { threadId: "thread-a", providerId: "ccswitch_b", model: "other" }]);
+  assert.equal(app.state.current.id, "thread-a");
+  assert.equal(app.threadProviderId(), "ccswitch_b");
+  assert.equal(app.state.turns[0].id, "previous");
+  assert.equal(elements.get("prompt").value, "draft");
+  assert.equal(app.state.current.model, "other");
+  await app.submit();
+  assert.deepEqual(calls.map(([method]) => method), ["codexrm/thread/switchProvider", "turn/start"]);
+  assert.equal(calls[1][1].threadId, "thread-a");
+  assert.equal(calls[1][1].model, "other");
+});
+
+test("a failed same-model endpoint switch keeps the old provider and draft", async () => {
+  const { app, context, elements } = providerApp();
+  await app.loadModels();
+  app.state.info.sameModelProviderSwitch = true;
+  app.state.current = { id: "thread-a", modelProvider: "ccswitch_a", model: "shared" };
+  app.selectThreadModel({ thread: app.state.current });
+  elements.get("prompt").value = "draft";
+  context.rpc = async () => { throw new Error("busy"); };
+  elements.get("model").value = app.modelKey("ccswitch_b", "shared");
+  await elements.get("model").onchange();
+  assert.equal(app.state.current.id, "thread-a");
+  assert.equal(app.selectedModel().providerId, "ccswitch_a");
+  assert.equal(elements.get("prompt").value, "draft");
+  assert.equal(app.state.loading, false);
 });
 
 test("refresh preserves an unsent model and effort selection within the current supplier", async () => {
@@ -372,7 +521,8 @@ test("a missing supplier remains distinct from the current Codex configuration",
   assert.equal(app.selectedModel().providerId, "ccswitch_a");
   elements.get("model").value = app.modelKey("", "shared");
   elements.get("model").onchange();
-  assert.equal(app.state.current, null, "current Codex model must start a new thread instead of using the missing supplier");
+  assert.equal(app.state.current.id, "thread-a");
+  assert.equal(app.selectedModel().providerId, "ccswitch_a");
 });
 
 test("new chats select an available default instead of leaving the model empty", async () => {
@@ -499,7 +649,7 @@ test("the DSH model menu searches providers and models and applies model and eff
   elements.get("choose-effort").onclick();
   elements.get("effort-choices").children.at(-1).onclick();
   assert.equal(elements.get("effort").value, "high");
-  assert.equal(elements.get("model-effort-label").textContent, "深入");
+  assert.equal(elements.get("model-effort-label").textContent, "high");
   app.newChat();
   assert.equal(app.selectedModel().model, "alternate");
   assert.equal(elements.get("effort").value, "high");
@@ -636,7 +786,7 @@ test("agent reconnects and background success remain visible until the user retu
   tick(app.state.connectionNoticeTimer);
   assert.equal(elements.get("connection-notice").hidden, true);
   app.disconnectSocket();
-  assert.equal(app.state.reconnecting, false);
+  assert.equal(app.state.connectionStatus, "");
   assert.equal(app.state.pingID, null);
   assert.equal(elements.get("connection-notice").hidden, true);
 });
@@ -645,10 +795,10 @@ test("a stalled connection attempt has a deadline and manual connections clear r
   const { app, sockets, tick, elements } = connectionApp();
   tick(app.state.connectionTimer);
   assert.equal(sockets.length, 2);
-  assert.equal(app.state.reconnecting, true);
+  assert.equal(app.state.connectionStatus, "reconnecting");
   app.connect();
   assert.equal(sockets.length, 3);
-  assert.equal(app.state.reconnecting, false);
+  assert.equal(app.state.connectionStatus, "");
   sockets[2].open();
   sockets[2].receive({ type: "welcome", status: "connected" });
   assert.equal(elements.get("connection-notice").hidden, true);
@@ -1327,6 +1477,50 @@ test("questions can be explicitly skipped without fabricating empty answers", ()
   assert.deepEqual(sent[0].message, { id: "skip-question", result: { answers: {} } });
 });
 
+test("async questions submit the selected answer in the original thread and recognize it in history", async () => {
+  const { app, context, elements } = loadApp();
+  const { openAsyncQuestions, questionStatuses } = vm.runInContext("({ openAsyncQuestions, questionStatuses })", context);
+  const item = {
+    type: "agentMessage", id: "call_1", delivery: "async", text: "选择？\n- 第一项\n- 第二项",
+    questions: [{ title: "选择？", options: ["第一项", "第二项"] }, { title: "补充要求？" }],
+  };
+  app.state.current = { id: "thread" };
+  app.state.online = true;
+  app.state.turns = [{ id: "turn", status: "completed", items: [item] }];
+  elements.get("prompt").value = "未发送草稿";
+  const calls = [];
+  context.rpc = async (method, params) => {
+    calls.push({ method, params });
+    return { turn: { id: "next" } };
+  };
+  assert.match(app.itemHTML(item), /data-answer-question="call_1"/);
+  openAsyncQuestions(item);
+  const fields = elements.get("async-question-fields");
+  const form = fields.querySelectorAll("form")[0];
+  await form.requestSubmit();
+  assert.equal(calls.length, 0);
+  const radios = fields.querySelectorAll("input");
+  radios[0].checked = false;
+  radios[1].checked = true;
+  radios[1].onchange();
+  fields.querySelectorAll("textarea")[1].value = "保留\n换行";
+  await Promise.all([form.requestSubmit(), form.requestSubmit()]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "turn/start");
+  assert.equal(calls[0].params.threadId, "thread");
+  assert.equal(elements.get("prompt").value, "未发送草稿");
+  const { input } = calls[0].params;
+  assert.deepEqual(JSON.parse(input[0].text.split("\n")[1]), [
+    { questionItemId: '["request_user_input_async","call_1",0]', question: "选择？", answer: "第二项" },
+    { questionItemId: '["request_user_input_async","call_1",1]', question: "补充要求？", answer: "保留\n换行" },
+  ]);
+  const restored = loadApp();
+  const restoredStatuses = vm.runInContext("questionStatuses", restored.context);
+  assert.equal(restoredStatuses([item, { type: "userMessage", content: input }]).get(item.id), "已回答");
+  assert.equal(restored.app.userContent(input).text, "选择？\n第二项\n\n补充要求？\n保留\n换行");
+  assert.equal(questionStatuses([item]).get(item.id), "已回答");
+});
+
 test("nonblocking questions remain answerable after completion until resolved or interrupted", () => {
   const { app } = loadApp();
   app.state.current = { id: "thread" };
@@ -1473,6 +1667,8 @@ test("outbox persists complete send context until explicit RPC success and prese
   const turn = deferred();
   context.rpc = () => turn.promise;
   const sending = app.submit();
+  const notice = elements.get("connection-notice");
+  assert.equal(notice.hidden, true, "waiting for the send response does not show a connection notice");
   const stored = JSON.parse(storage.get("codexrm.outbox.v1"));
   assert.equal(stored.length, 1);
   assert.ok(stored[0].id);
@@ -1489,6 +1685,7 @@ test("outbox persists complete send context until explicit RPC success and prese
   await sending;
   assert.deepEqual(JSON.parse(storage.get("codexrm.outbox.v1")), []);
   assert.equal(elements.get("prompt").value, "new edit");
+  assert.equal(notice.hidden, true, "waiting for the AI reply does not show a connection notice");
 });
 
 test("an interrupted first turn reloads bound to its new thread without resending", async () => {
@@ -1526,6 +1723,7 @@ test("an interrupted first turn reloads bound to its new thread without resendin
   buttons[2].onclick();
   assert.equal(reloaded.elements.get("prompt").value, "possibly sent\n\nnew edit");
   assert.deepEqual(JSON.parse(storage.get("codexrm.outbox.v1")), []);
+  assert.equal(notice.hidden, true, "clearing the outbox dismisses its notice");
   void sending;
 });
 
@@ -2167,7 +2365,10 @@ test("loading dragover and drop both reject files with a visible reason", async 
 
 function loadAgenthost() {
   class Element {
-    constructor() { this.children = []; this.dataset = {}; this.value = ""; this.hidden = false; }
+    constructor() {
+      this.children = []; this.dataset = {}; this.value = ""; this.hidden = false;
+      this.classList = { toggle() {} };
+    }
     get childElementCount() { return this.children.length; }
     append(...nodes) { this.children.push(...nodes); }
     replaceChildren(...nodes) { this.children = nodes; }
@@ -2184,10 +2385,12 @@ function loadAgenthost() {
   let deviceCalls = 0;
   const settings = { server: "https://server.example", status: "已连接", version: "1.2.3", packaged: false };
   const context = vm.createContext({
-    document, location: { hash: "#token" }, console, URL, Date, JSON, Error, Promise,
+    document, location: { hash: "#token" }, console, URL, Date, JSON, Error, Promise, Headers, FormData,
+    window: { settingsNavigation: { init() {}, lock() {} } },
     Option: class Option { constructor(text, value) { this.text = text; this.value = value; } },
     navigator: { clipboard: { writeText: async () => {} } }, confirm: () => true,
     setInterval(callback) { interval = callback; },
+    setTimeout() {}, clearTimeout() {},
     fetch: async (path) => {
       if (path === "/api/settings") {
         settingsCalls++;

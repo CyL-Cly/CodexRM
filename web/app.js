@@ -68,7 +68,7 @@ const state = {
   generation: 0,
   online: false,
   browserOnline: globalThis.navigator?.onLine !== false,
-  reconnecting: false,
+  connectionStatus: "",
   pairingExpired: false,
   backgroundSuspended: false,
   visibilityTimer: null,
@@ -171,6 +171,7 @@ function restoreDraft() {
   resizePrompt();
 }
 if (!Array.isArray(state.outbox)) state.outbox = [];
+const pendingOutbox = new WeakSet();
 function makeOutboxEntry({ id, createdAt, agentId, threadId = null, cwd = "", draftKey, text, files = [], mode = "auto", afterTurnId }) {
   return {
     id, createdAt, agentId, threadId, cwd, draftKey, text, mode,
@@ -190,6 +191,7 @@ function stageOutbox(text, files, mode, afterTurnId) {
     draftKey: draftKey(), text, files, mode, afterTurnId,
   });
   state.outbox.push(entry);
+  pendingOutbox.add(entry);
   persistOutbox();
   return entry;
 }
@@ -496,6 +498,8 @@ function cancelThreadCreation() {
   state.sending = false;
 }
 function userContent(content = []) {
+  const replies = asyncQuestionReplies(content);
+  if (replies.length) return { text: replies.map(({ question, answer }) => `${question}\n${answer}`).join("\n\n"), files: [] };
   const files = [];
   const text = [];
   for (const c of content) {
@@ -696,6 +700,25 @@ function folderName(path = "") {
       .pop() || path
   );
 }
+function renderHomeContext() {
+  const description = $("welcome-description");
+  const device = currentDevice();
+  if (!device) {
+    description.textContent = "连接你的电脑，让 Codex 继续手边的工作。";
+    return;
+  }
+  if (!state.online || !state.browserOnline) {
+    description.textContent = state.browserOnline
+      ? "等待本地连接器上线；未发送的草稿会保留在此浏览器中。"
+      : "浏览器已离线；恢复网络后可继续，草稿不会丢失。";
+    return;
+  }
+  const path = selectedCwd();
+  const deviceName = device.agent.serverName || "你的电脑";
+  description.textContent = path
+    ? `在 ${folderName(path)} 中开始，任务由 ${deviceName} 执行。`
+    : `在 ${deviceName} 上选择工作区，开始下一个任务。`;
+}
 function renderWorkspacePath() {
   const path = state.current?.cwd || selectedCwd();
   const select = $("workspace-select");
@@ -709,6 +732,7 @@ function renderWorkspacePath() {
     list.find((w) => pathKey(w.path) === pathKey(path))?.path || "";
   select.title = path ? `${path} · 切换后新建会话` : "选择工作区";
   select.disabled = state.sending || state.loading || !state.online;
+  renderHomeContext();
 }
 async function loadWorkspaces() {
   const generation = state.generation;
@@ -884,17 +908,19 @@ function announceTurn(message) {
   region.textContent = message;
 }
 function connectionNotice(status = "") {
-  state.reconnecting = status === "reconnecting";
+  state.connectionStatus = status;
   clearTimeout(state.connectionNoticeTimer);
-  renderPersistentNotice(status);
+  renderPersistentNotice();
   if (status === "success" && !document.hidden) {
     state.connectionNoticeTimer = setTimeout(() => connectionNotice(), 4500);
   }
 }
-function renderPersistentNotice(status = $("connection-notice").dataset.status || "") {
+function renderPersistentNotice() {
+  const status = state.connectionStatus;
   const notice = $("connection-notice");
   const text = $("connection-notice-text");
-  const entry = state.outbox.find((item) => item.agentId === state.selected) || state.outbox[0];
+  const unconfirmed = state.outbox.filter((item) => !pendingOutbox.has(item));
+  const entry = unconfirmed.find((item) => item.agentId === state.selected) || unconfirmed[0];
   const actions = state.noticeActions ||= document.createElement("span");
   if (!notice.contains(actions)) notice.append(actions);
   actions.replaceChildren();
@@ -1126,7 +1152,7 @@ function pingSocket() {
 }
 function resumeConnection() {
   if (!state.browserOnline || document.hidden || !currentDevice() || state.pairingExpired) return;
-  if ($("connection-notice").dataset.status === "success") connectionNotice("success");
+  if (state.connectionStatus === "success") connectionNotice("success");
   if (state.socket?.readyState === WebSocket.OPEN) {
     pingSocket();
     if (!state.loaded) void bootstrap(state.generation);
@@ -1189,7 +1215,7 @@ function connect({ reconnect = false } = {}) {
       clearTimeout(state.connectionTimer);
       const wasOnline = state.online;
       state.online = envelope.status === "connected";
-      if (state.online && state.reconnecting) connectionNotice("success");
+      if (state.online && state.connectionStatus === "reconnecting") connectionNotice("success");
       else if (!state.online && wasOnline) connectionNotice("reconnecting");
       if (envelope.agent) {
         device.agent = envelope.agent;
@@ -1361,7 +1387,7 @@ function renderConnection() {
       ? device?.agent.serverName || "已连接"
     : state.pairingExpired
       ? "配对已过期"
-      : state.reconnecting
+      : state.connectionStatus === "reconnecting"
         ? "重连中…"
         : device
           ? "设备离线"
@@ -2200,6 +2226,7 @@ function renderModels(preferred = $("model").value) {
   renderEfforts();
 }
 function threadProviderId(thread = state.current) {
+  if (thread?.codexrmProvider) return thread.codexrmProvider;
   const runtimeId = thread?.modelProvider;
   return state.providers.find((p) => p.runtimeId && p.runtimeId === runtimeId)?.id ||
     (runtimeId?.startsWith("ccswitch_") ? runtimeId : "");
@@ -2211,7 +2238,7 @@ function selectThreadModel(result, preferred = "", effort = result.reasoningEffo
     state.providers.push({
       id: providerId, runtimeId: result.thread.modelProvider,
       name: "当前会话供应商（目录不可用）", unavailable: true,
-      warning: "未在 CCSwitch 中找到此供应商；选择其他供应商将创建新会话", models: [],
+      warning: "未在这台电脑上找到此供应商", models: [],
     });
   }
   if (model && !state.models.some((m) => m.key === modelKey(providerId, model))) {
@@ -2231,19 +2258,10 @@ function renderEfforts(previous = $("effort").value) {
   $("effort").replaceChildren(new Option("默认思考", ""));
   const model =
     selectedModel() || state.models.find((m) => !m.providerId && m.isDefault);
-  const names = {
-    none: "不启用",
-    minimal: "极简",
-    low: "较少",
-    medium: "适中",
-    high: "深入",
-    xhigh: "更深入",
-    max: "最大",
-    ultra: "Ultra",
-  };
+  // 请勿翻译模型和思考强度名
   for (const r of model?.supportedReasoningEfforts || []) {
     const value = r.reasoningEffort;
-    $("effort").append(new Option(names[value] || value, value));
+    $("effort").append(new Option(value, value));
   }
   if ([...$("effort").options].some((o) => o.value === previous))
     $("effort").value = previous;
@@ -2253,6 +2271,7 @@ function renderEfforts(previous = $("effort").value) {
 function renderModelControl() {
   const model = selectedModel();
   const effort = [...$("effort").options].find((option) => option.value === $("effort").value)?.textContent || "默认思考";
+  // 请勿翻译模型和思考强度名
   $("model-label").textContent = model?.displayName || model?.model || (state.modelsLoading ? "加载模型…" : "当前 Codex 配置");
   $("model-effort-label").textContent = $("effort").value ? effort : "";
   $("model-trigger").title = model ? `${model.providerName} · ${model.displayName || model.model} · ${effort}` : "选择供应商与模型";
@@ -2528,6 +2547,14 @@ function onEvent(msg) {
     removeArchivedThread(p.threadId);
     return;
   }
+  if (method === "codexrm/thread/providerChanged") {
+    if (state.current?.id !== p.threadId) return;
+    const effort = state.current.model === p.model ? $("effort").value : "";
+    state.current.codexrmProvider = p.providerId;
+    state.current.model = p.model;
+    selectThreadModel({ thread: state.current }, "", effort);
+    return;
+  }
   if (method === "codexrm/thread/detached" || method === "codexrm/thread/loaded") {
     if (state.current?.id !== p.threadId) return;
     clearTimeout(state.snapshotTimer);
@@ -2731,53 +2758,241 @@ function markdown(text = "", itemId = "") {
   if (code) html += `<pre><code>${escapeHTML(buffer.join("\n"))}</code></pre>`;
   return html;
 }
-function itemHTML(item) {
+const asyncReplyStart = "<send_user_message_question_reply>";
+const asyncReplyEnd = "</send_user_message_question_reply>";
+const submittingQuestions = new Set();
+const acceptedQuestions = new Set();
+
+function asyncQuestions(item) {
+  if (item.type !== "agentMessage" || item.delivery !== "async" || !item.id || !Array.isArray(item.questions)) return [];
+  return item.questions.flatMap((question, index) => {
+    if (typeof question?.title !== "string" || !question.title.trim()) return [];
+    const options = Array.isArray(question.options) ? question.options.filter((option) => typeof option === "string" && option.trim()) : [];
+    return [{ id: JSON.stringify(["request_user_input_async", item.id, index]), question: question.title, options }];
+  });
+}
+
+function asyncQuestionReplies(input) {
+  if (input?.length !== 1 || input[0].type !== "text") return [];
+  let text = input[0].text?.trim() || "";
+  const separator = "\n## My request for Codex:\n";
+  if (text.startsWith("# Context from my IDE setup:\n") && text.includes(separator))
+    text = text.split(separator).at(-1).trim();
+  if (!text.startsWith(asyncReplyStart) || !text.endsWith(asyncReplyEnd)) return [];
+  try {
+    const parsed = JSON.parse(text.slice(asyncReplyStart.length, -asyncReplyEnd.length));
+    return (Array.isArray(parsed) ? parsed : [parsed]).filter((reply) =>
+      typeof reply?.questionItemId === "string" && typeof reply.question === "string" && typeof reply.answer === "string");
+  } catch { return []; }
+}
+
+function asyncQuestionScope(itemId) {
+  return JSON.stringify([state.device?.id, state.current?.id, itemId]);
+}
+
+function questionStatuses(items) {
+  const answered = new Set(items.filter((item) => item.type === "userMessage")
+    .flatMap((item) => asyncQuestionReplies(item.content)).map((reply) => reply.questionItemId));
+  const queued = new Set((state.messageQueues.get(state.current?.id)?.entries || [])
+    .flatMap((entry) => asyncQuestionReplies(entry.input)).map((reply) => reply.questionItemId));
+  const statuses = new Map();
+  for (const item of items) {
+    const questions = asyncQuestions(item);
+    if (!questions.length) continue;
+    const key = asyncQuestionScope(item.id);
+    if (submittingQuestions.has(key)) statuses.set(item.id, "正在提交…");
+    else if (acceptedQuestions.has(key) || questions.some((question) => answered.has(question.id))) statuses.set(item.id, "已回答");
+    else if (questions.some((question) => queued.has(question.id))) statuses.set(item.id, "回答已排队");
+  }
+  return statuses;
+}
+
+function openAsyncQuestions(item) {
+  const questions = asyncQuestions(item);
+  const threadId = state.current?.id;
+  if (!questions.length || !threadId) return;
+  if (!state.online || state.loading || state.readOnly) return toast("当前会话暂时无法发送");
+  const scope = asyncQuestionScope(item.id);
+  const dialog = $("async-question-dialog");
+  const fields = $("async-question-fields");
+  fields.replaceChildren();
+  renderUserInput(fields, item.id, {
+    questions: questions.map((question) => ({ ...question, options: question.options.map((label) => ({ label })) })),
+  }, async (answers, submit) => {
+    if (asyncQuestionScope(item.id) !== scope || !state.online || state.loading || state.readOnly) {
+      toast("当前会话暂时无法发送");
+      return;
+    }
+    const items = state.turns.flatMap((turn) => turn.items || []);
+    if (!items.some((entry) => entry.id === item.id) || questionStatuses(items).has(item.id)) return;
+    const running = state.turns.some((turn) => turn.status === "inProgress");
+    if (running && !state.info?.messageQueue) return toast("任务结束后可提交回答");
+    const replies = questions.map(({ id, question }) => {
+      let size = 0;
+      let title = "";
+      const encoder = new TextEncoder();
+      for (const character of question) {
+        size += encoder.encode(character).length;
+        if (size > 512) break;
+        title += character;
+      }
+      return { questionItemId: id, question: title.replace(/[\r\n]/g, " "), answer: answers[id].answers[0] };
+    });
+    const text = `${asyncReplyStart}\n${JSON.stringify(replies)}\n${asyncReplyEnd}`;
+    submittingQuestions.add(scope);
+    submit.disabled = true;
+    renderMessages();
+    try {
+      const result = await rpc(running ? "codexrm/queue/add" : "turn/start", turnParams(text));
+      if (!running) acceptedQuestions.add(scope);
+      if (asyncQuestionScope(item.id) !== scope) return;
+      if (running) acceptMessageQueue(result);
+      dialog.close();
+      toast(running ? "回答已排队" : "回答已发送");
+    } catch (error) {
+      if (asyncQuestionScope(item.id) !== scope) return;
+      if (error.uncertain) {
+        dialog.close();
+        toast("提交状态未确认，请查看会话和排队消息");
+        openThread(threadId, true).catch(showError);
+      } else showError(error);
+    } finally {
+      submittingQuestions.delete(scope);
+      if (asyncQuestionScope(item.id) === scope) {
+        submit.disabled = false;
+        renderMessages();
+      }
+    }
+  });
+  dialog.showModal();
+}
+
+const standaloneItemTypes = new Set([
+  "userMessage",
+  "agentMessage",
+  "planMessage",
+  "imageView",
+  "imageGeneration",
+  "contextCompaction",
+]);
+function isOperationItem(item) {
+  return !standaloneItemTypes.has(item?.type);
+}
+function groupOperationItems(items) {
+  const groups = [];
+  for (const item of items) {
+    const operation = isOperationItem(item);
+    const previous = groups.at(-1);
+    if (previous && previous.operation === operation) previous.items.push(item);
+    else groups.push({ operation, items: [item] });
+  }
+  return groups;
+}
+function operationTitle(item) {
+  switch (item.type) {
+    case "reasoning": return "思考过程";
+    case "commandExecution": return item.command || "运行命令";
+    case "fileChange": return `文件变更 · ${(item.changes || []).length} 个文件`;
+    case "diff": return "查看本轮变更";
+    case "plan": return "执行计划";
+    case "mcpToolCall":
+    case "dynamicToolCall":
+      return `${item.server || "MCP"} / ${item.tool || "工具"}`;
+    case "webSearch": return `搜索 · ${item.query || ""}`;
+    default: return item.type || "执行事件";
+  }
+}
+function operationStatus(item) {
+  if (item.type === "commandExecution") {
+    return item.status === "completed"
+      ? `退出码 ${item.exitCode ?? 0}`
+      : item.status === "declined" ? "已拒绝" : "执行中";
+  }
+  if (item.type === "diff") return "Diff";
+  if (["fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)) return item.status || "";
+  return "";
+}
+const disclosureOverrides = new Map();
+function rememberDisclosure(id, open) {
+  if (!id) return;
+  disclosureOverrides.delete(id);
+  disclosureOverrides.set(id, open);
+  for (const old of [...disclosureOverrides.keys()].slice(0, Math.max(0, disclosureOverrides.size - 100)))
+    disclosureOverrides.delete(old);
+}
+function disclosureOpen(id, active) {
+  return disclosureOverrides.get(id) ?? active;
+}
+function syncDisclosureSummary(details) {
+  const summary = details.querySelector("[data-disclosure-summary]");
+  if (!summary) return;
+  summary.setAttribute("aria-expanded", String(details.open));
+  const title = details.querySelector(".operation-group-title, .reasoning-title")?.textContent || "详细内容";
+  summary.setAttribute("aria-label", `${details.open ? "收起" : "展开"}：${title}`);
+}
+function operationGroupHTML(items, active = false) {
+  const latest = items.at(-1);
+  const id = `operations:${items[0].id}`;
+  const open = disclosureOpen(id, active);
+  const title = active && latest.type === "reasoning" ? "正在思考" : operationTitle(latest);
+  const status = [`${items.length} 条操作`, operationStatus(latest) || (active ? "进行中" : "")].filter(Boolean).join(" · ");
+  const label = `${open ? "收起" : "展开"}：${title}`;
+  return `<details class="operation-group" data-detail="${escapeHTML(id)}" data-active="${active}"${open ? " open" : ""}><summary data-focus-id="detail:${escapeHTML(id)}" data-disclosure-summary aria-expanded="${open}" aria-controls="${escapeHTML(id)}-body" aria-label="${escapeHTML(label)}"><span class="operation-group-title${active ? " thinking-shimmer" : ""}">${escapeHTML(title)}</span><span class="operation-group-meta">${escapeHTML(status)}</span></summary><div id="${escapeHTML(id)}-body" class="operation-group-items">${items.map((item) => messageItemHTML(item, undefined, active && item === latest)).join("")}</div></details>`;
+}
+function messageItemHTML(item, questionStatus, active = false) {
+  return `<div class="message-item" data-item-id="${escapeHTML(item.id)}">${itemHTML(item, questionStatus, active)}</div>`;
+}
+
+function itemHTML(item, questionStatus, active = false) {
   const type = item.type;
   if (type === "userMessage") {
     const content = userContent(item.content);
     const images = historyItemImages(item, content.files.filter((file) => visionMimeTypes.has(file.mimeType)).map((file) => file.path));
     return `<div class="message user"><div class="user-bubble">${content.text ? `<div>${escapeHTML(content.text)}</div>` : ""}${content.files.length ? `<div class="message-attachments">${content.files.map(attachmentHTML).join("")}</div>` : ""}${images}</div></div>`;
   }
-  if (type === "agentMessage")
-    return `<article class="message assistant"><div class="message-label"><span class="mini-mark">${icon("terminal")}</span>Codex</div><div class="markdown">${markdown(item.text || "", item.id)}</div><div class="message-tools"><button data-copy="${escapeHTML(item.id)}" data-focus-id="copy:${escapeHTML(item.id)}" aria-label="复制回复">复制回复</button></div></article>`;
+  if (type === "agentMessage") {
+    const answer = asyncQuestions(item).length
+      ? `<button type="button" data-answer-question="${escapeHTML(item.id)}" data-focus-id="answer:${escapeHTML(item.id)}" ${questionStatus ? "disabled" : ""}>${questionStatus || "回答问题"}</button>`
+      : "";
+    return `<article class="message assistant"><div class="message-label"><span class="mini-mark">${icon("terminal")}</span>Codex</div><div class="markdown">${markdown(item.text || "", item.id)}</div><div class="message-tools">${answer}<button data-copy="${escapeHTML(item.id)}" data-focus-id="copy:${escapeHTML(item.id)}" aria-label="复制回复">复制回复</button></div></article>`;
+  }
   if (type === "reasoning") {
     const text =
       item.reasoningText ||
       [...(item.summary || []), ...(item.content || [])]
         .map((x) => (typeof x === "string" ? x : x.text || ""))
         .join("\n");
-    return text
-      ? `<details class="reasoning" data-detail="${escapeHTML(item.id)}"><summary data-focus-id="detail:${escapeHTML(item.id)}">思考过程</summary><div class="markdown">${markdown(text, item.id)}</div></details>`
-      : "";
+    if (!text && !active) return "";
+    const open = disclosureOpen(item.id, active);
+    const title = active ? "正在思考" : "已思考";
+    const label = `${open ? "收起" : "展开"}：${title}`;
+    const content = text ? markdown(text, item.id) : '<p class="reasoning-pending">等待思考内容…</p>';
+    return `<details class="reasoning" data-detail="${escapeHTML(item.id)}" data-active="${active}"${open ? " open" : ""}><summary data-focus-id="detail:${escapeHTML(item.id)}" data-disclosure-summary aria-expanded="${open}" aria-controls="${escapeHTML(item.id)}-content" aria-label="${escapeHTML(label)}"><span class="reasoning-title${active ? " thinking-shimmer" : ""}" role="status">${title}</span></summary><div id="${escapeHTML(item.id)}-content" class="markdown">${content}</div></details>`;
   }
   if (type === "commandExecution")
     return toolHTML(
       item.id,
-      item.command || "运行命令",
+      operationTitle(item),
       item.aggregatedOutput || "",
-      item.status === "completed"
-        ? `退出码 ${item.exitCode ?? 0}`
-        : item.status === "declined"
-          ? "已拒绝"
-          : "执行中",
+      operationStatus(item),
     );
   if (type === "fileChange")
     return toolHTML(
       item.id,
-      `文件变更 · ${(item.changes || []).length} 个文件`,
+      operationTitle(item),
       (item.changes || [])
         .map((c) => `${c.path}\n${c.diff || ""}`)
         .join("\n\n"),
-      item.status || "",
+      operationStatus(item),
     );
   if (type === "diff")
     return item.diff
-      ? toolHTML(item.id, "查看本轮变更", item.diff, "Diff")
+      ? toolHTML(item.id, operationTitle(item), item.diff, operationStatus(item))
       : "";
   if (type === "plan")
     return toolHTML(
       item.id,
-      "执行计划",
+      operationTitle(item),
       item.plan
         ?.map(
           (p) =>
@@ -2797,21 +3012,21 @@ function itemHTML(item) {
     const details = item.result || item.contentItems || item.arguments || {};
     return images + toolHTML(
       item.id,
-      `${item.server || "MCP"} / ${item.tool || "工具"}`,
+      operationTitle(item),
       JSON.stringify(details, function (key, value) {
         if (typeof value !== "string") return value;
         const encodedImage = (key === "blob" || key === "data") && cachedImageTypes.has(this.mimeType);
         return encodedImage || /^data:image\//i.test(value) ? "[图片]" : value;
       }, 2),
-      item.status || "",
+      operationStatus(item),
     );
   }
   if (type === "webSearch")
     return toolHTML(
       item.id,
-      `搜索 · ${item.query || ""}`,
+      operationTitle(item),
       JSON.stringify(item.action || {}, null, 2),
-      item.status || "",
+      operationStatus(item),
     );
   if (type === "contextCompaction")
     return '<div class="turn-status">上下文已压缩</div>';
@@ -2833,12 +3048,17 @@ function renderMessages() {
   const root = $("messages");
   const focusId = captureFocus(root);
   const items = state.turns.flatMap((turn) => turn.items || []);
+  const statuses = questionStatuses(items);
   const layout = JSON.stringify([
     !!state.historyCursor,
     state.readOnly,
     state.detached,
     state.turns.map((turn) => [
-      (turn.items || []).map((item) => item.id),
+      (turn.items || []).map((item) => [
+        item.id,
+        isOperationItem(item) ? operationTitle(item) : "",
+        isOperationItem(item) ? operationStatus(item) : "",
+      ]),
       turn.error || null,
       !!turn.codexrmHistoryOmitted,
       displayedTurnStatus(turn),
@@ -2848,16 +3068,21 @@ function renderMessages() {
     let incremental = true;
     for (const item of items) {
       const cached = messageRender.items.get(item.id);
-      if (cached?.source === item && !dirtyMessageItems.has(item.id)) continue;
+      const status = statuses.get(item.id);
+      if (cached?.source === item && cached.status === status && !dirtyMessageItems.has(item.id)) continue;
       if (!cached?.node?.isConnected) {
         incremental = false;
         break;
       }
       const details = cached.node.querySelector("details");
       const wasOpen = details?.open;
-      cached.node.innerHTML = itemHTML(item);
-      if (wasOpen) cached.node.querySelector("details").open = true;
+      cached.node.innerHTML = itemHTML(item, status, cached.active);
+      const updated = cached.node.querySelector("details");
+      if (updated?.matches(".operation-group, .reasoning")) updated.open = disclosureOpen(updated.dataset.detail, cached.active);
+      else if (wasOpen && updated) updated.open = true;
+      syncDisclosureSummary(updated || cached.node);
       cached.source = item;
+      cached.status = status;
     }
     if (incremental) {
       dirtyMessageItems.clear();
@@ -2880,9 +3105,16 @@ function renderMessages() {
     html += '<div class="turn-status">会话已分离，正在自动同步最新状态。</div>';
   const rendered = new Map();
   for (const turn of state.turns) {
-    for (const item of turn.items || []) {
-      html += `<div class="message-item" data-item-id="${escapeHTML(item.id)}">${itemHTML(item)}</div>`;
-      rendered.set(item.id, { source: item, node: null });
+    const turnItems = turn.items || [];
+    const latestItem = turnItems.at(-1);
+    const turnActive = displayedTurnStatus(turn) === "inProgress";
+    for (const group of groupOperationItems(turnItems)) {
+      const groupActive = turnActive && group.items.at(-1) === latestItem;
+      if (group.operation && group.items.length > 1) html += operationGroupHTML(group.items, groupActive);
+      else for (const item of group.items) html += messageItemHTML(item, statuses.get(item.id), turnActive && item === latestItem);
+      for (const item of group.items) {
+        rendered.set(item.id, { source: item, status: statuses.get(item.id), active: turnActive && item === latestItem, node: null });
+      }
     }
     if (turn.codexrmHistoryOmitted)
       html += '<div class="turn-status">这一轮内容过大，请在 Codex 桌面端查看完整内容。</div>';
@@ -2902,7 +3134,8 @@ function renderMessages() {
     if (cached) cached.node = node;
   });
   root.querySelectorAll("details").forEach((n) => {
-    if (open.has(n.dataset.detail)) n.open = true;
+    if (!n.matches(".operation-group, .reasoning") && open.has(n.dataset.detail)) n.open = true;
+    syncDisclosureSummary(n);
   });
   messageRender.layout = layout;
   messageRender.items = rendered;
@@ -2911,6 +3144,12 @@ function renderMessages() {
   restoreFocus(root, focusId);
 }
 $("messages").addEventListener("click", async (event) => {
+  const disclosureSummary = event.target.closest("[data-disclosure-summary]");
+  if (disclosureSummary) {
+    const details = disclosureSummary.parentElement;
+    rememberDisclosure(details.dataset.detail, !details.open);
+    return;
+  }
   const attachmentButton = event.target.closest("[data-attachment]");
   if (attachmentButton) {
     attachmentButton.disabled = true;
@@ -2928,6 +3167,12 @@ $("messages").addEventListener("click", async (event) => {
     olderTurns().catch(showError);
     return;
   }
+  const answerButton = event.target.closest("[data-answer-question]");
+  if (answerButton) {
+    const item = state.turns.flatMap((turn) => turn.items || []).find((entry) => entry.id === answerButton.dataset.answerQuestion);
+    if (item) openAsyncQuestions(item);
+    return;
+  }
   const button = event.target.closest("[data-copy]");
   if (!button) return;
   const item = state.turns
@@ -2940,6 +3185,9 @@ $("messages").addEventListener("click", async (event) => {
     toast("当前浏览器无法直接复制，请选择文本复制");
   }
 });
+$("messages").addEventListener("toggle", (event) => {
+  if (event.target.matches?.("details[data-detail]")) syncDisclosureSummary(event.target);
+}, true);
 function isPermissionRequest(msg) {
   return ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"].includes(msg.method);
 }
@@ -2955,23 +3203,26 @@ function answerRequest(id, result, error) {
   renderApprovals();
   return true;
 }
-function renderUserInput(card, id, params) {
-  const note = document.createElement("p");
-  note.textContent = params.isBlocking === false
-    ? "你可以继续操作，准备好后再提交回答。"
-    : "提交回答后，Codex 会继续处理任务。";
-  card.append(note);
+function renderUserInput(card, id, params, submitAsyncAnswers) {
+  if (!submitAsyncAnswers) {
+    const note = document.createElement("p");
+    note.textContent = params.isBlocking === false
+      ? "你可以继续操作，准备好后再提交回答。"
+      : "提交回答后，Codex 会继续处理任务。";
+    card.append(note);
+  }
   const form = document.createElement("form");
   form.className = "question-form";
   const fields = params.questions.map((question, index) => {
     const group = document.createElement("fieldset");
     group.className = "question-group";
     const legend = document.createElement("legend");
-    legend.textContent = question.header || `问题 ${index + 1}`;
+    legend.textContent = submitAsyncAnswers ? question.question : question.header || `问题 ${index + 1}`;
     const prompt = document.createElement("p");
     prompt.className = "question-prompt";
     prompt.textContent = question.question;
-    group.append(legend, prompt);
+    group.append(legend);
+    if (!submitAsyncAnswers) group.append(prompt);
     const custom = document.createElement(question.isSecret ? "input" : "textarea");
     if (question.isSecret) {
       custom.type = "password";
@@ -3028,13 +3279,15 @@ function renderUserInput(card, id, params) {
       }
       answers[question.id] = { answers: [answer] };
     }
-    answerRequest(id, { answers });
+    if (submitAsyncAnswers) return submitAsyncAnswers(answers, submit);
+    else answerRequest(id, { answers });
   };
   const skip = document.createElement("button");
   skip.type = "button";
   skip.textContent = "跳过";
   skip.onclick = () => answerRequest(id, { answers: {} });
-  actions.append(submit, skip);
+  actions.append(submit);
+  if (!submitAsyncAnswers) actions.append(skip);
   form.append(actions);
   card.append(form);
 }
@@ -3191,7 +3444,10 @@ function acceptMessageQueue(queue) {
   const previous = state.messageQueues.get(queue.threadId);
   if (previous && previous.version > queue.version) return;
   state.messageQueues.set(queue.threadId, queue);
-  if (state.current?.id === queue.threadId) renderConnection();
+  if (state.current?.id === queue.threadId) {
+    renderConnection();
+    renderMessages();
+  }
 }
 async function loadMessageQueue(threadId) {
   const generation = state.generation;
@@ -3302,8 +3558,7 @@ async function sendFollowup(text, mode) {
     clearOutbox(pendingSend);
     if (generation === state.generation && state.current?.id === threadId) saveModelPreference();
   } catch (e) {
-    if (e.uncertain) renderPersistentNotice();
-    else {
+    if (!e.uncertain) {
       clearOutbox(pendingSend);
       if (optimistic) turn.items = turn.items.filter((i) => i !== optimistic);
       restoreSentDraft(key, original, files);
@@ -3311,10 +3566,11 @@ async function sendFollowup(text, mode) {
     }
     if (generation === state.generation) showError(e);
   } finally {
+    pendingOutbox.delete(pendingSend);
     if (generation === state.generation) {
       state.sending = false;
       renderConnection();
-    }
+    } else renderPersistentNotice();
   }
 }
 async function submit(event, mode = "auto") {
@@ -3444,20 +3700,19 @@ async function submit(event, mode = "auto") {
     if (operation?.cancelled) {
       clearOutbox(pendingSend);
       restoreCreatingDraft(operation);
-    } else if (error.uncertain) {
-      renderPersistentNotice();
-    } else {
+    } else if (!error.uncertain) {
       clearOutbox(pendingSend);
       if (creating) restoreCreatingDraft(operation);
     }
     if (generation === state.generation && !operation?.cancelled) showError(error);
   } finally {
+    pendingOutbox.delete(pendingSend);
     const ownsSend = !creating || (!operation.cancelled && (operation.turnStarted || state.creating === operation));
     if (generation === state.generation && ownsSend) {
       if (state.creating === operation) state.creating = null;
       state.sending = false;
       renderConnection();
-    }
+    } else renderPersistentNotice();
   }
 }
 function resizePrompt() {
@@ -3960,13 +4215,51 @@ $("search").oninput = () => {
   closeThreadMenu();
   renderThreads();
 };
-$("model").onchange = () => {
+$("model").onchange = async () => {
+  const model = selectedModel();
+  const thread = state.current;
+  const previousEffort = $("effort").value;
+  if (thread && model && model.providerId !== threadProviderId(thread)) {
+    const { native, active } = activeModelProvider();
+    const target = state.providers.find((p) => p.id === model.providerId);
+    const endpoint = target === native ? active : target;
+    const runtimeId = thread.modelProvider;
+    const sameModel = model.model === thread.model;
+    const canSwitch = state.info?.threadModelProviderSwitch || (sameModel && state.info?.sameModelProviderSwitch);
+    if (canSwitch &&
+        (thread.codexrmProvider || runtimeId?.startsWith("ccswitch_") || (runtimeId && runtimeId === native?.switchableRuntimeId)) &&
+        endpoint?.runtimeId?.startsWith("ccswitch_")) {
+      const generation = state.generation;
+      state.loading = true;
+      renderConnection();
+      try {
+        const result = await rpc("codexrm/thread/switchProvider", {
+          threadId: thread.id, providerId: endpoint.id, model: model.model,
+        });
+        if (generation !== state.generation || state.current?.id !== thread.id) return;
+        state.current.codexrmProvider = result.providerId;
+        state.current.model = result.model;
+        selectThreadModel({ thread: state.current }, "", sameModel ? previousEffort : model.defaultReasoningEffort);
+        saveModelPreference();
+        toast("已在当前会话切换模型");
+      } catch (error) {
+        if (generation !== state.generation || state.current?.id !== thread.id) return;
+        selectThreadModel({ thread: state.current }, "", previousEffort);
+        toast(`无法切换接入点：${error.message}`);
+      } finally {
+        if (generation === state.generation && state.current?.id === thread.id) {
+          state.loading = false;
+          renderConnection();
+        }
+      }
+      return;
+    }
+    selectThreadModel({ thread }, "", previousEffort);
+    toast("当前 Agent 或供应商不支持在此会话中切换到该模型");
+    return;
+  }
   renderEfforts();
   saveModelPreference();
-  if (state.current && (selectedModel()?.providerId || "") !== threadProviderId()) {
-    newChat();
-    toast("已切换供应商，发送消息将创建新会话");
-  }
 };
 $("effort").onchange = () => {
   saveModelPreference();
@@ -4135,7 +4428,7 @@ function handleOffline() {
 }
 function handleOnline() {
   state.browserOnline = true;
-  connectionNotice(state.reconnecting ? "reconnecting" : "");
+  connectionNotice(state.connectionStatus === "reconnecting" ? "reconnecting" : "");
   renderConnection();
   resumeConnection();
 }

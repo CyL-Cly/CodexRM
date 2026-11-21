@@ -28,7 +28,7 @@ Nightly 工作流每天新加坡时间 00:23 检查默认分支前一整天的�
 
 ## 一键发布到 Cloudreve
 
-全平台发布使用 `build\release-all.cmd`，先构建 Android 正式 APK，再发布 Windows Agent、部署 Linux RM 和 Web、发布 Android 更新，最后上传 Linux amd64 Agent 独立包，并将本地生成的 `build/dist/linux-agent-download.json` 发布到 RM 的 `/linux-update.json`。Windows MSIX 不在此流程内。
+正式发布默认使用 `build\release-all.cmd`，将当前工作区的改动一起发布。脚本先构建 Android 正式 APK，再发布 Windows Agent、部署 Linux RM 和 Web、发布 Android 更新，最后上传 Linux amd64 Agent 独立包，并将本地生成的 `build/dist/linux-agent-download.json` 发布到 RM 的 `/linux-update.json`。Windows MSIX 不在此流程内。
 
 ```cmd
 build\release-all.cmd nopause -ReleaseNotes "修复连接问题"
@@ -125,7 +125,9 @@ $publish = Get-Content build/publish.config.json -Raw | ConvertFrom-Json
 build\scripts\publish-manifest.ps1 -Manifest build\dist\android-update.json -Name android-update.json -RM $publish.rm
 ```
 
-发布工具保留上一份 `android-update.json.previous`，不会覆盖 Windows 的 `update.json`。每次发布必须递增 Android `versionCode`，且新 APK 与已安装版本签名一致；Debug 签名只能用于测试。
+发布工具保留上一份 `android-update.json.previous`，不会覆盖 Windows 的 `update.json`。每次发布必须递增 Android `versionCode`，且新 APK 与已安装版本签名一致；向新渠道分发时应使用渠道指定的正式签名。
+
+2026-11-21 发布 Android 1.0.42（43）。会话打开失败时保留草稿，切换设备时按原设备保存待发消息，完整加载后再更新会话列表。双栏文件管理会记录启动目录，缩小文件分享范围，并避免复制和移动时覆盖同名目标。通过原更新渠道下载后，复核了 APK 大小、SHA-256 和与 1.0.41 一致的签名。
 
 ## 版本更新日志
 

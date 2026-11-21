@@ -39,6 +39,9 @@ internal object ComposerText {
         submitted.isEmpty() -> current
         current.isEmpty() -> submitted
         current == submitted || current.startsWith(submitted) -> current
+        // Edits inserted before the submission still contain its text; prepending
+        // it again would produce two copies of the same command on retry.
+        submitted in current -> current
         else -> "$submitted\n\n$current"
     }
 }

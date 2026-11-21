@@ -48,9 +48,17 @@ func (a *Agent) ensureTextApp(ctx context.Context) (*appserver.Client, error) {
 		_ = app.Close()
 		return nil, robotErr(textOnlyUnavailable)
 	}
-	app.OnNotification(func(raw json.RawMessage) { a.onTextNotification(raw) })
+	app.OnNotification(func(raw json.RawMessage) {
+		if !a.handleWxHistoryTool(app, raw) {
+			a.onTextNotification(raw)
+		}
+	})
 	a.textApp = app
 	a.textVerified = true
+	go func() {
+		<-app.Done()
+		a.clearWxRecordApp(app)
+	}()
 	return app, nil
 }
 
@@ -126,16 +134,23 @@ func sandboxIsReadOnly(value any) bool {
 }
 
 func (a *Agent) robotThread(ctx context.Context, main *appserver.Client, clientID, method string, params map[string]any) (json.RawMessage, error) {
-	wxid, _ := params["wxId"].(string)
-	if wxid == "" || strings.Contains(wxid, "@chatroom") {
-		return nil, robotErr("invalid wxid")
-	}
 	policy := a.currentPolicy(clientID)
-	mode, ok := accessMode(policy, wxid)
+	actor, _ := params["wxId"].(string)
+	group, _ := params["groupId"].(string)
+	profile := policy.Access[actor].wxProfile
+	if group != "" {
+		profile = policy.Groups[group].wxProfile
+	}
+	wxid, mode, ok := wxThreadIdentity(policy, method, params)
+	localOneBot := clientID == oneBotClientID
+	delete(params, "oneBot")
+	delete(params, "wxId")
+	delete(params, "groupId")
+	delete(params, "groupRevision")
 	if !ok {
 		return nil, robotErr("无权使用 Codex")
 	}
-	if mode == "admin" && !a.wxAdmin(clientID, wxid) {
+	if mode == "admin" && !a.robotAdmin(clientID, wxid) {
 		return nil, robotErr("管理员权限未在 Agent 上绑定")
 	}
 	threadID, _ := params["threadId"].(string)
@@ -148,7 +163,7 @@ func (a *Agent) robotThread(ctx context.Context, main *appserver.Client, clientI
 		if owned.Tainted {
 			return nil, robotErr(textOnlyUnavailable)
 		}
-		if mode != owned.Backend && (method == "turn/start" || method == "thread/resume") {
+		if (mode != owned.Backend || profile != owned.Profile) && (method == "turn/start" || method == "turn/steer" || method == "thread/resume") {
 			return nil, robotErr("无权操作该会话")
 		}
 		backend = owned.Backend
@@ -161,20 +176,82 @@ func (a *Agent) robotThread(ctx context.Context, main *appserver.Client, clientI
 		}
 		target = textApp
 	}
-	if err := constrainRobotParams(method, params, a.cfg.Cwd, backend); err != nil {
+	cwd, err := a.wxWorkspace(profile.Workspace)
+	if err != nil {
 		return nil, err
+	}
+	historyKey, _ := params["wxHistoryKey"].(string)
+	delete(params, "wxHistoryKey")
+	delete(params, "dynamicTools")
+	if group != "" && !localOneBot && method == "thread/start" {
+		params["dynamicTools"] = []any{wxHistoryTool()}
+	}
+	if localOneBot {
+		err = constrainRobotParamsLimit(method, params, cwd, backend, 1+maxOneBotImages)
+	} else {
+		err = constrainRobotParams(method, params, cwd, backend, group != "" && historyKey != "")
+	}
+	if err != nil {
+		return nil, err
+	}
+	groupTools := group != "" && backend == "tools" && !localOneBot
+	if groupTools {
+		if err := a.constrainGroupTools(method, clientID, wxid, cwd, params); err != nil {
+			return nil, err
+		}
+	}
+	var recordDir string
+	if method == "turn/start" || method == "turn/steer" {
+		withGroupHistory := method == "turn/start" && group != "" && historyKey != ""
+		recordDir, err = a.applyWxRecord(clientID, wxid, backend, params, withGroupHistory)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		delete(params, "wxRecord")
+	}
+	delete(params, "model")
+	delete(params, "baseInstructions")
+	delete(params, "developerInstructions")
+	if method == "thread/start" || method == "thread/resume" || method == "turn/start" {
+		if profile.Model != "" {
+			params["model"] = profile.Model
+		}
+		if method == "turn/start" {
+			params["cwd"] = cwd
+		}
+	}
+	if method == "thread/start" && profile.Prompt != "" {
+		params["developerInstructions"] = profile.Prompt
+	}
+	if method == "turn/steer" {
+		params = map[string]any{
+			"threadId": threadID, "expectedTurnId": params["expectedTurnId"], "input": params["input"],
+		}
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	var raw json.RawMessage
-	var err error
 	if method == "codexrm/thread/snapshot" {
 		raw, err = a.threadSnapshot(callCtx, target, params)
 	} else {
+		if group != "" && method == "turn/start" {
+			a.setWxHistorySession(target, threadID, historyKey)
+		}
+		pin := a.pinWxRecord(target, threadID, recordDir)
 		raw, err = a.callThread(callCtx, target, clientID, method, params)
+		if err != nil && group != "" && method == "turn/start" {
+			a.setWxHistorySession(target, threadID, "")
+		}
+		a.bindWxRecordTurn(threadID, pin, raw)
 	}
 	if err != nil {
 		return nil, err
+	}
+	if groupTools && (method == "thread/start" || method == "thread/resume") {
+		if err := verifyWxGroupTools(raw); err != nil {
+			return nil, err
+		}
 	}
 	if method == "thread/start" {
 		var started struct {
@@ -185,12 +262,20 @@ func (a *Agent) robotThread(ctx context.Context, main *appserver.Client, clientI
 		if json.Unmarshal(raw, &started) != nil || started.Thread.ID == "" {
 			return nil, robotErr("thread start failed")
 		}
-		a.rememberWxThread(started.Thread.ID, clientID, wxid, backend)
+		a.rememberWxThread(started.Thread.ID, clientID, wxid, backend, profile)
 	}
 	return raw, nil
 }
 
-func constrainRobotParams(method string, params map[string]any, cwd, mode string) error {
+func constrainRobotParams(method string, params map[string]any, cwd, mode string, history ...bool) error {
+	maxItems := 0
+	if method == "turn/start" && len(history) > 0 && history[0] {
+		maxItems = 13
+	}
+	return constrainRobotParamsLimit(method, params, cwd, mode, maxItems)
+}
+
+func constrainRobotParamsLimit(method string, params map[string]any, cwd, mode string, inputLimit int) error {
 	delete(params, "permissions")
 	delete(params, "runtimeWorkspaceRoots")
 	delete(params, "collaborationMode")
@@ -214,12 +299,22 @@ func constrainRobotParams(method string, params map[string]any, cwd, mode string
 			config["web_search"] = "disabled"
 		}
 		params["config"] = config
-	case "turn/start":
-		input, err := robotInput(params["input"])
+	case "turn/start", "turn/steer":
+		maxItems := inputLimit
+		if maxItems == 0 {
+			maxItems = 2
+		}
+		input, err := robotInputWithLimit(params["input"], maxItems)
 		if err != nil {
 			return err
 		}
 		params["input"] = input
+		if method == "turn/steer" {
+			if turnID, _ := params["expectedTurnId"].(string); strings.TrimSpace(turnID) == "" {
+				return robotErr("expectedTurnId is required")
+			}
+			return nil
+		}
 		params["approvalPolicy"] = "never"
 		switch mode {
 		case "admin":
@@ -233,9 +328,9 @@ func constrainRobotParams(method string, params map[string]any, cwd, mode string
 	return nil
 }
 
-func robotInput(value any) ([]any, error) {
+func robotInputWithLimit(value any, maxItems int) ([]any, error) {
 	items, ok := value.([]any)
-	if !ok || len(items) == 0 || len(items) > 2 {
+	if !ok || len(items) == 0 || len(items) > maxItems {
 		return nil, robotErr("参数错误")
 	}
 	input := make([]any, 0, len(items))
@@ -283,13 +378,17 @@ func validRobotImage(url string) bool {
 	}
 }
 
-func (a *Agent) rememberWxThread(id, clientID, wxid, backend string) {
+func (a *Agent) rememberWxThread(id, clientID, wxid, backend string, profiles ...wxProfile) {
 	a.wxMu.Lock()
 	defer a.wxMu.Unlock()
 	if a.wxThreads == nil {
 		a.wxThreads = map[string]wxThread{}
 	}
-	a.wxThreads[id] = wxThread{ClientID: clientID, WxID: wxid, Backend: backend}
+	var profile wxProfile
+	if len(profiles) > 0 {
+		profile = profiles[0]
+	}
+	a.wxThreads[id] = wxThread{ClientID: clientID, WxID: wxid, Backend: backend, Profile: profile}
 }
 
 func (a *Agent) ownThread(clientID, wxid, threadID string) (wxThread, error) {
@@ -316,7 +415,17 @@ func (a *Agent) onTextNotification(raw json.RawMessage) {
 			} `json:"item"`
 		} `json:"params"`
 	}
-	if json.Unmarshal(raw, &note) != nil || !textToolEvent(note.Method, note.Params.Item.Type) {
+	if json.Unmarshal(raw, &note) != nil {
+		return
+	}
+	if !textToolEvent(note.Method, note.Params.Item.Type) {
+		a.wxMu.Lock()
+		thread := a.wxThreads[note.Params.ThreadID]
+		a.wxMu.Unlock()
+		if thread.Backend == "task" {
+			a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: thread.ClientID, Message: raw})
+			return
+		}
 		a.forward(raw)
 		return
 	}
@@ -340,6 +449,7 @@ func (a *Agent) onTextNotification(raw json.RawMessage) {
 	if wasTainted {
 		return
 	}
+	a.invalidateOneBotThread(threadID)
 	if owner != "" {
 		a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: owner, Message: mustJSON(map[string]any{
 			"method": "codexrm/wx/textonly/blocked",

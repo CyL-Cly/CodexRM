@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,11 +14,13 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/codexrm/codexrm/internal/desktop"
 	"github.com/google/uuid"
 )
 
 const attachmentMaxSize = 20 << 20
 const attachmentChunkSize = 256 << 10
+const desktopShareMaxSize = 512 << 20
 
 type attachment struct {
 	ID       string `json:"id"`
@@ -28,10 +31,12 @@ type attachment struct {
 }
 
 type attachmentUpload struct {
-	File    attachment
-	Owner   string
-	Offset  int64
-	Updated time.Time
+	File      attachment
+	Owner     string
+	Offset    int64
+	Updated   time.Time
+	Downloads string
+	Sender    string
 }
 
 func attachmentName(name string) string {
@@ -57,9 +62,9 @@ func attachmentName(name string) string {
 	return name
 }
 
-func attachmentNumber(params map[string]any, key string) (int64, error) {
+func attachmentNumber(params map[string]any, key string, limit int64) (int64, error) {
 	v, ok := params[key].(float64)
-	if !ok || v < 0 || v > attachmentMaxSize || v != float64(int64(v)) {
+	if !ok || v < 0 || v > float64(limit) || v != float64(int64(v)) {
 		return 0, fmt.Errorf("invalid %s", key)
 	}
 	return int64(v), nil
@@ -67,15 +72,49 @@ func attachmentNumber(params map[string]any, key string) (int64, error) {
 
 // Attachment RPCs use small frames on the existing authenticated relay. Files
 // stay on the Agent computer so Codex can read them after a browser disconnect.
+func removeAbandonedParts(root string, cutoff time.Time) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if id, err := uuid.Parse(entry.Name()); err != nil || id.String() != entry.Name() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, file := range files {
+			if !file.Type().IsRegular() || !strings.HasPrefix(file.Name(), "file-") || !strings.HasSuffix(file.Name(), ".part") {
+				continue
+			}
+			if info, err := file.Info(); err == nil && info.ModTime().Before(cutoff) {
+				_ = os.Remove(filepath.Join(dir, file.Name()))
+			}
+		}
+		_ = os.Remove(dir) // Never remove completed attachments or unrelated data.
+	}
+}
+
 func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any, error) {
 	a.attachmentMu.Lock()
 	defer a.attachmentMu.Unlock()
-	if a.uploads == nil {
-		a.uploads = map[string]*attachmentUpload{}
-	}
 	root, err := filepath.Abs(filepath.Join(a.cfg.DataDir, "attachments"))
 	if err != nil {
 		return nil, err
+	}
+	if a.uploads == nil {
+		a.uploads = map[string]*attachmentUpload{}
+		cutoff := time.Now().Add(-24 * time.Hour)
+		removeAbandonedParts(root, cutoff)
+		if downloads, err := desktop.Downloads(); err == nil {
+			removeAbandonedParts(filepath.Join(downloads, ".codexrm-incoming"), cutoff)
+		}
 	}
 	for id, upload := range a.uploads {
 		if time.Since(upload.Updated) > 30*time.Minute {
@@ -86,9 +125,32 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 	}
 	if method == "codexrm/attachment/begin" {
 		name, _ := params["name"].(string)
-		size, err := attachmentNumber(params, "size")
-		if err != nil || size > attachmentMaxSize {
-			return nil, fmt.Errorf("每个附件最大 20 MB")
+		downloads, sender := "", ""
+		limit := int64(attachmentMaxSize)
+		if params["destination"] == "downloads" {
+			downloads, err = desktop.Downloads()
+			if err != nil {
+				return nil, err
+			}
+			limit = desktopShareMaxSize
+			sender, _ = params["sender"].(string)
+			sender = strings.TrimSpace(strings.Map(func(r rune) rune {
+				if unicode.IsControl(r) {
+					return -1
+				}
+				return r
+			}, sender))
+			if runes := []rune(sender); len(runes) > 80 {
+				sender = string(runes[:80])
+			}
+			if sender == "" {
+				sender = "已配对设备"
+			}
+			root = filepath.Join(downloads, ".codexrm-incoming")
+		}
+		size, err := attachmentNumber(params, "size", limit)
+		if err != nil {
+			return nil, fmt.Errorf("单个文件最大 %d MB", limit>>20)
 		}
 		if len(a.uploads) >= 30 {
 			return nil, fmt.Errorf("同时上传的附件过多，请稍后重试")
@@ -105,7 +167,7 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		if err := f.Close(); err != nil {
 			return nil, err
 		}
-		a.uploads[file.ID] = &attachmentUpload{File: file, Owner: owner, Updated: time.Now()}
+		a.uploads[file.ID] = &attachmentUpload{File: file, Owner: owner, Updated: time.Now(), Downloads: downloads, Sender: sender}
 		return map[string]any{"id": file.ID, "chunkSize": attachmentChunkSize}, nil
 	}
 	id, _ := params["id"].(string)
@@ -127,7 +189,7 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		if file.ID != id || file.Path != path {
 			return nil, fmt.Errorf("invalid attachment metadata")
 		}
-		offset, err := attachmentNumber(params, "offset")
+		offset, err := attachmentNumber(params, "offset", file.Size)
 		if err != nil || offset > file.Size {
 			return nil, fmt.Errorf("invalid attachment offset")
 		}
@@ -162,7 +224,7 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		delete(a.uploads, id)
 		return map[string]any{}, nil
 	case "codexrm/attachment/chunk":
-		offset, err := attachmentNumber(params, "offset")
+		offset, err := attachmentNumber(params, "offset", upload.File.Size)
 		if err != nil || offset != upload.Offset {
 			return nil, fmt.Errorf("附件上传位置不匹配，请重试")
 		}
@@ -192,6 +254,16 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		if upload.Offset != upload.File.Size {
 			return nil, fmt.Errorf("附件尚未上传完成")
 		}
+		if upload.Downloads != "" {
+			file, err := finishDesktopShare(upload)
+			if err != nil {
+				return nil, err
+			}
+			delete(a.uploads, id)
+			desktop.ShowReceivedFile(upload.Sender, file.Name, file.Path, file.Size)
+			file.Path = ""
+			return file, nil
+		}
 		f, err := os.Open(upload.File.Path + ".part")
 		if err != nil {
 			return nil, err
@@ -220,4 +292,34 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 	default:
 		return nil, fmt.Errorf("unknown attachment method: %s", method)
 	}
+}
+
+func finishDesktopShare(upload *attachmentUpload) (attachment, error) {
+	file := upload.File
+	name := file.Name
+	// Windows treats these base names as devices even when an extension follows.
+	base := strings.ToUpper(strings.TrimRight(strings.SplitN(name, ".", 2)[0], " "))
+	if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
+		((strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && strings.Contains("1 2 3 4 5 6 7 8 9 ¹ ² ³", base[3:]) && len([]rune(base[3:])) == 1) {
+		name = "_" + name
+	}
+	ext := filepath.Ext(name)
+	for index := 0; index < 10_000; index++ {
+		candidate := name
+		if index > 0 {
+			candidate = fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(name, ext), index, ext)
+		}
+		path := filepath.Join(upload.Downloads, candidate)
+		err := desktop.MoveReceivedFile(upload.File.Path+".part", path)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return attachment{}, err
+		}
+		_ = os.Remove(filepath.Dir(upload.File.Path))
+		file.Name, file.Path = candidate, path
+		return file, nil
+	}
+	return attachment{}, fmt.Errorf("下载文件夹中同名文件过多")
 }

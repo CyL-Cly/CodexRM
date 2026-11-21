@@ -7,6 +7,8 @@ internal data class ModelPickerRow(
     val notes: String = "",
     val option: ModelOption? = null,
     val header: Boolean = false,
+    val defaultChoice: Boolean = false,
+    val emptyChoice: Boolean = false,
 )
 
 internal object ModelPicker {
@@ -14,7 +16,7 @@ internal object ModelPicker {
         val needle = query.trim().lowercase(Locale.ROOT)
         val result = ArrayList<ModelPickerRow>()
         if (needle.isEmpty() || "默认模型 default".contains(needle)) {
-            result += ModelPickerRow("默认模型", "使用当前 Codex 配置")
+            result += ModelPickerRow("默认模型", "新会话使用当前 Codex 配置", defaultChoice = true)
         }
         val matches = options.filter { option ->
             needle.isEmpty() || listOf(
@@ -32,6 +34,11 @@ internal object ModelPicker {
                 result += ModelPickerRow(option.displayName, option.providerNotes, option)
             }
         }
+        if (result.isEmpty()) result += ModelPickerRow(
+            "没有匹配的模型",
+            "点击清除搜索并查看全部模型",
+            emptyChoice = true,
+        )
         return result
     }
 }

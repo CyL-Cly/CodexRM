@@ -42,16 +42,16 @@ func lookup(h C.int64_t) *mobileSession {
 	return registry.m[h]
 }
 
-func (s *mobileSession) emit(sig *protocol.P2PSignal) bool {
+func (s *mobileSession) emit(ctx context.Context, sig *protocol.P2PSignal) bool {
 	b, _ := json.Marshal(protocol.Envelope{Type: protocol.TypeP2P, P2P: sig})
-	return s.emitBytes(b)
+	return s.emitBytes(ctx, b)
 }
 
-func (s *mobileSession) emitBytes(b []byte) bool {
+func (s *mobileSession) emitBytes(ctx context.Context, b []byte) bool {
 	select {
 	case s.incoming <- b:
 		return true
-	case <-s.ctx.Done():
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -63,7 +63,10 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 	defer func() {
 		if s.ctx.Err() == nil {
 			b, _ := json.Marshal(map[string]string{"type": "native_direct_failure", "reason": failure})
-			s.emitBytes(b)
+			select {
+			case s.incoming <- b:
+			default:
+			}
 		}
 	}()
 	attempt, cancel := context.WithTimeout(s.ctx, protocol.P2PAttempt)
@@ -75,7 +78,7 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 		return
 	}
 	defer prepared.Close()
-	if !s.emit(offer) {
+	if !s.emit(attempt, offer) {
 		return
 	}
 	var remote protocol.P2PSignal
@@ -86,10 +89,10 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 	case remote = <-s.offer:
 	}
 	link, err := prepared.Connect(attempt, remote, s.ready, func() error {
-		if s.emit(protocol.P2P("ready", s.id)) {
+		if s.emit(attempt, protocol.P2P("ready", s.id)) {
 			return nil
 		}
-		return s.ctx.Err()
+		return attempt.Err()
 	})
 	if err != nil {
 		switch {
@@ -107,10 +110,10 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 	}
 	defer link.Close()
 	log.Printf("CodexRM P2P: QUIC established (lan=%t ipv6=%t)", link.IsLAN(), link.IsIPv6())
-	if link.IsLAN() && !s.emitBytes([]byte(`{"type":"native_direct_lan"}`)) {
+	if link.IsLAN() && !s.emitBytes(attempt, []byte(`{"type":"native_direct_lan"}`)) {
 		return
 	}
-	if !s.emit(protocol.P2P("activate", s.id)) {
+	if !s.emit(attempt, protocol.P2P("activate", s.id)) {
 		return
 	}
 	select {
@@ -136,7 +139,7 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 	}()
 	for {
 		b, err := link.Read()
-		if err != nil || !s.emitBytes(b) {
+		if err != nil || !s.emitBytes(s.ctx, b) {
 			return
 		}
 	}

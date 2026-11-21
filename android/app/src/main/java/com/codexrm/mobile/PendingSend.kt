@@ -69,6 +69,12 @@ internal class OutboxState(initial: List<PendingSend> = emptyList()) {
     fun values(): List<PendingSend> = entries.values.toList()
     fun get(id: String): PendingSend? = entries[id]
 
+    /** Roll back an in-memory mutation when its durable write failed. */
+    fun restore(values: List<PendingSend>) {
+        entries.clear()
+        values.forEach { entries[it.id] = it }
+    }
+
     fun begin(value: PendingSend) {
         entries[value.id] = value.copy(stage = PendingSendStage.WAITING)
     }

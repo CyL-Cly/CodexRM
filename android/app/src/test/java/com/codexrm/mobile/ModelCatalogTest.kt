@@ -31,6 +31,22 @@ class ModelCatalogTest {
         assertEquals(listOf("ccswitch_a", "ccswitch_b"), options.filter { it.model == "shared" }.map { it.providerId })
     }
 
+    @Test fun `different model names can switch between third-party endpoints`() {
+        val catalog = ModelCatalog(JSONObject(fixture))
+        val thread = JSONObject().put("modelProvider", "ccswitch_a").put("model", "cc-only")
+        val model = catalog.options("ccswitch_a").first { it.providerId == "ccswitch_b" }
+        assertEquals("ccswitch_b", catalog.switchEndpoint(thread, model))
+        thread.put("modelProvider", "openai")
+        assertEquals(null, catalog.switchEndpoint(thread, model))
+    }
+
+    @Test fun `model available through current configuration keeps the saved endpoint`() {
+        val catalog = ModelCatalog(JSONObject(fixture))
+        val selected = catalog.selectedOption(catalog.options("ccswitch_a"), "ccswitch_a", "native-only")
+        assertEquals("ccswitch_a", selected?.providerId)
+        assertEquals("native-only", selected?.model)
+    }
+
     @Test fun `without confirmed match current configuration stays selectable`() {
         val json = JSONObject(fixture)
         json.getJSONArray("providers").getJSONObject(0).remove("aliasOf")

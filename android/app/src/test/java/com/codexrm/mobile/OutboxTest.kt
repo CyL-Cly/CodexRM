@@ -54,5 +54,16 @@ class OutboxTest {
         assertEquals(PendingSendStage.UNCONFIRMED, recovered.values().single().stage)
         assertEquals(" original \n\nnew edit", OutboxRecovery.draft("new edit", recovered.values()))
         assertEquals(" original \nnew edit", OutboxRecovery.draft(" original \nnew edit", recovered.values()))
+        assertEquals("new edit\n original ", OutboxRecovery.draft("new edit\n original ", recovered.values()))
+    }
+
+    @Test fun `failed durable restore rolls back the in-memory state`() {
+        val state = OutboxState()
+        val original = pending()
+        state.begin(original)
+        val before = state.values()
+        state.confirmed("send-1")
+        state.restore(before)
+        assertEquals(listOf(original.copy(stage = PendingSendStage.WAITING)), state.values())
     }
 }

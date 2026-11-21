@@ -194,6 +194,7 @@ internal class ScannerActivity : Activity(), TextureView.SurfaceTextureListener 
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun openSession(device: CameraDevice, currentGeneration: Int) {
         val imageReader = reader ?: return
         val preview = previewSurface ?: return

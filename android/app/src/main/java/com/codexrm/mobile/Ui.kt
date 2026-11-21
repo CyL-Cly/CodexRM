@@ -28,8 +28,8 @@ internal object Ui {
     var SURFACE = 0xff202020.toInt(); private set
     var SURFACE_ALT = 0xff292929.toInt(); private set
     var TEXT = 0xffececec.toInt(); private set
-    var MUTED = 0xff919191.toInt(); private set
-    var DIM = 0xff636363.toInt(); private set
+    var MUTED = 0xffa3a3a3.toInt(); private set
+    var DIM = 0xff919191.toInt(); private set
     var BORDER = 0xff2b2b2b.toInt(); private set
     var ACCENT = 0xffd7e7dc.toInt(); private set
     var ACCENT_TEXT = 0xff14271b.toInt(); private set
@@ -40,13 +40,13 @@ internal object Ui {
         this.dark = dark
         if (dark) {
             BACKGROUND = 0xff151515.toInt(); SIDEBAR = 0xff101010.toInt(); SURFACE = 0xff202020.toInt()
-            SURFACE_ALT = 0xff292929.toInt(); TEXT = 0xffececec.toInt(); MUTED = 0xff919191.toInt()
-            DIM = 0xff636363.toInt(); BORDER = 0xff2b2b2b.toInt(); ACCENT = 0xffd7e7dc.toInt()
+            SURFACE_ALT = 0xff292929.toInt(); TEXT = 0xffececec.toInt(); MUTED = 0xffa3a3a3.toInt()
+            DIM = 0xff919191.toInt(); BORDER = 0xff2b2b2b.toInt(); ACCENT = 0xffd7e7dc.toInt()
             ACCENT_TEXT = 0xff14271b.toInt(); GREEN = 0xff75bd92.toInt(); DANGER = 0xffed9c96.toInt()
         } else {
             BACKGROUND = Color.WHITE; SIDEBAR = 0xfff7f7f8.toInt(); SURFACE = 0xfff3f3f4.toInt()
-            SURFACE_ALT = 0xffebebee.toInt(); TEXT = 0xff242426.toInt(); MUTED = 0xff737377.toInt()
-            DIM = 0xff96969c.toInt(); BORDER = 0xffe5e5e8.toInt(); ACCENT = 0xff244c37.toInt()
+            SURFACE_ALT = 0xffebebee.toInt(); TEXT = 0xff242426.toInt(); MUTED = 0xff64646a.toInt()
+            DIM = 0xff696970.toInt(); BORDER = 0xffe5e5e8.toInt(); ACCENT = 0xff244c37.toInt()
             ACCENT_TEXT = Color.WHITE; GREEN = 0xff36815a.toInt(); DANGER = 0xffbd443d.toInt()
         }
         configureSystemBars(activity, dark)
@@ -58,6 +58,7 @@ internal object Ui {
     }
 
     @TargetApi(30)
+    @Suppress("DEPRECATION")
     private fun configureSystemBars30(activity: Activity, dark: Boolean, background: Int) {
         activity.window.setDecorFitsSystemWindows(false)
         activity.window.statusBarColor = Color.TRANSPARENT
@@ -151,7 +152,7 @@ internal object Ui {
     fun input(context: Context, hint: String, multiLine: Boolean = false): EditText = EditText(context).apply {
         this.hint = hint; setHintTextColor(MUTED); setTextColor(TEXT); textSize = 16f
         backgroundTintList = ColorStateList.valueOf(BORDER)
-        minHeight = dp(context, 48)
+        minHeight = dp(context, 48); minimumHeight = dp(context, 48)
         setPadding(dp(context, 4), dp(context, 8), dp(context, 4), dp(context, 8))
         if (multiLine) {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES

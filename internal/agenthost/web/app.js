@@ -1,20 +1,32 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
-let token = location.hash.slice(1);
+const settingsSessionKey = "codexrm.settingsSession";
+function readSettingsSession() {
+  try { return localStorage.getItem(settingsSessionKey) || ""; } catch { return ""; }
+}
 // URL fragments are never sent in HTTP requests or referrers. Keeping the
 // capability here also lets the user refresh this page during this agent run.
+let token = location.hash.slice(1) || readSettingsSession();
+let sessionLogin = false;
 let saved = null;
 let busy = false;
 let pairingExpiresAt = 0;
 let pairingTimer = null;
+let noticeTimer = null;
 const notice = (message, error = false) => {
-  $("notice").textContent = message;
-  $("notice").className = error ? "notice error" : "notice";
-  $("notice").hidden = !message;
+  clearTimeout(noticeTimer);
+  const element = $("notice");
+  element.textContent = message;
+  element.className = error ? "toast error" : "toast";
+  element.hidden = !message;
+  if (message) noticeTimer = setTimeout(() => { element.hidden = true; }, error ? 6000 : 3000);
 };
 async function api(path, options = {}) {
-  const headers = { "Content-Type": "application/json" };
-  if (token) headers.Authorization = `Bearer ${token}`;
+  const headers = new Headers(options.headers);
+  if (!(typeof FormData !== "undefined" && options.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (token && !headers.has("Authorization")) headers.set("Authorization", `Bearer ${token}`);
   const response = await fetch(path, { ...options, headers, cache: "no-store" });
   const text = await response.text();
   let data;
@@ -22,6 +34,7 @@ async function api(path, options = {}) {
   if (!response.ok) {
     const error = new Error(data.error || "操作失败，请稍后重试");
     error.passwordRequired = response.status === 401 && data.passwordRequired === true;
+    error.sessionLogin = data.sessionLogin === true;
     throw error;
   }
   return data;
@@ -36,6 +49,8 @@ function status(data) {
   if (data.updatePending) update = "更新已就绪，等待所有进行中的对话和排队消息结束后自动安装。";
   $("update-status").textContent = update || "启动时检查更新，之后每 20 小时自动检查一次。";
   $("status").textContent = data.status || "状态未知";
+  $("overview-connection").textContent = data.status || "状态未知";
+  $("overview-connection").classList.toggle("metric-online", data.status === "已连接");
   $("status").className = `status ${data.status === "已连接" ? "connected" : data.status === "连接失败" ? "failed" : ""}`;
   $("connection-error").textContent = data.status === "已连接" ? "" : data.error || "";
   const phases = { connecting: "正在连接中继", connected: "中继已连接", retrying: "正在等待重试", degraded: "连接受限，部分功能可能不可用" };
@@ -45,6 +60,7 @@ function status(data) {
 }
 function apply(data) {
   $("server").value = data.server || "";
+  $("overview-server").textContent = data.server || "尚未配置服务器";
   $("update-card").hidden = !["windows-agent", "linux-agent"].includes(data.updateMode);
   $("linux-update-card").hidden = data.updateMode !== "linux-manual";
   $("package-settings").hidden = !data.packaged;
@@ -77,6 +93,7 @@ function requireSaved() {
 async function devices() {
   requireSaved();
   const rows = await api("/api/devices");
+  $("overview-devices").textContent = rows.filter(row => row.deviceType !== "robot").length;
   const deviceList = $("devices");
   deviceList.replaceChildren();
   for (const row of rows) {
@@ -142,6 +159,7 @@ $("settings-form").addEventListener("submit", (event) => {
     const data = await api("/api/settings", { method: "PUT", body: JSON.stringify(input) });
     apply(data);
     clearPairing();
+    $("overview-devices").textContent = "—";
     $("devices").replaceChildren();
     notice("设置已保存，Agent 正在连接服务器。");
   });
@@ -241,22 +259,27 @@ async function initializeSettings(data) {
   apply(data);
   $("login-form").hidden = true;
   $("settings-content").hidden = false;
+  window.settingsNavigation.init(data);
+  if (window.initOneBotPanel) window.initOneBotPanel(data);
   notice("");
   const wxCard = $("wx-card");
   const showWx = data.wxSupported === true;
-  if (wxCard) wxCard.hidden = !showWx;
   if (wxCard && showWx) {
     bindWxSettings();
-    refreshWxAccounts().catch(error => { $("wx-status").textContent = error.message; });
+    if (!window.refreshWxPanel) refreshWxAccounts().catch(error => { $("wx-status").textContent = error.message; });
   }
   if (data.server) {
     try { await devices(); } catch (error) { notice(error.message, true); }
   }
 }
 function showLogin() {
+  if (token && token === readSettingsSession()) {
+    try { localStorage.removeItem(settingsSessionKey); } catch { /* Storage is optional. */ }
+  }
   token = "";
   saved = null;
   $("settings-content").hidden = true;
+  window.settingsNavigation.lock();
   clearPairing();
   $("devices").replaceChildren();
   const wxConfig = $("wx-config");
@@ -268,9 +291,16 @@ function showLogin() {
 $("login-form").addEventListener("submit", (event) => {
   event.preventDefault();
   action($("login"), async () => {
-    token = $("settings-password").value.trim();
+    const password = $("settings-password").value.trim();
     $("settings-password").value = "";
     try {
+      if (sessionLogin) {
+        const login = await api("/api/settings/login", { method: "POST", headers: { Authorization: `Bearer ${password}` } });
+        token = login.sessionToken;
+        try { localStorage.setItem(settingsSessionKey, token); } catch { /* Storage is optional. */ }
+      } else {
+        token = password;
+      }
       await initializeSettings(await api("/api/settings"));
     } catch (error) {
       showLogin();
@@ -287,7 +317,10 @@ async function refreshSettings() {
     else status(data);
   } catch (error) {
     const hadToken = !!token;
-    if (error.passwordRequired) showLogin();
+    if (error.passwordRequired) {
+      sessionLogin = error.sessionLogin;
+      showLogin();
+    }
     else $("status").textContent = "Agent 已退出或页面已失效";
     if (!error.passwordRequired || hadToken) notice(error.message, true);
   }
@@ -317,8 +350,10 @@ async function refreshWxAccounts() {
     option.disabled = !row.loggedIn;
     select.add(option);
   }
-  select.disabled = !rows.length;
+  select.disabled = !rows.some(row => row.loggedIn);
   if (old && rows.some(row => row.id === old.id && row.wxid === old.wxid && row.loggedIn)) select.value = old.id;
+  else select.value = rows.find(row => row.loggedIn)?.id || "";
+  window.settingsNavigation.syncWxScope();
   await loadWxSettings();
 }
 async function loadWxSettings() {
@@ -388,7 +423,7 @@ function bindWxSettings() {
   if (wxSettingsBound) return;
   wxSettingsBound = true;
   $("wx-account").addEventListener("change", loadWxSettings);
-  $("wx-refresh").addEventListener("click", () => action($("wx-refresh"), refreshWxAccounts));
+  $("wx-refresh").addEventListener("click", () => action($("wx-refresh"), () => window.refreshWxPanel ? window.refreshWxPanel() : refreshWxAccounts()));
   $("wx-form").addEventListener("submit", event => {
     event.preventDefault();
     action($("wx-save"), async () => {
@@ -415,13 +450,14 @@ function bindWxSettings() {
     $("wx-friend-enabled").checked = access.enabled;
     $("wx-friend-mode").value = ["tools", "admin"].includes(access.mode) ? access.mode : "text";
     $("wx-friend-commands").replaceChildren(...wxCommands.map(command => new Option(command.name, command.name, false, (access.commands || []).includes(command.name))));
-    $("wx-friend-form").hidden = false;
+    if (window.showWXProfile) await window.showWXProfile("friend", access, () => account === selectedWxAccount() && wxFriend === friend);
+    if (account === selectedWxAccount() && wxFriend === friend) $("wx-friend-form").hidden = false;
   }));
   $("wx-friend-form").addEventListener("submit", event => {
     event.preventDefault();
     action($("wx-save-friend"), async () => {
       if (!wxFriend) throw new Error("请先读取好友权限");
-      await wxAPI("access", selectedWxAccount(), { wechat_id: wxFriend, enabled: $("wx-friend-enabled").checked, mode: $("wx-friend-mode").value, commands: Array.from($("wx-friend-commands").selectedOptions, option => option.value) });
+      await wxAPI("access", selectedWxAccount(), { wechat_id: wxFriend, enabled: $("wx-friend-enabled").checked, mode: $("wx-friend-mode").value, ...(window.readWXProfile?.("friend") || {}), commands: Array.from($("wx-friend-commands").selectedOptions, option => option.value) });
       notice("已保存好友权限。");
     });
   });

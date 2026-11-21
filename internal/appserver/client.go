@@ -17,6 +17,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const defaultWriteTimeout = 15 * time.Second
+
 // Client multiplexes RPC calls and server-initiated approvals over stdio or WS.
 type managedProcess interface {
 	Kill() error
@@ -24,16 +26,19 @@ type managedProcess interface {
 }
 
 type Client struct {
-	mu       sync.Mutex
-	writeMu  sync.Mutex
-	once     sync.Once
-	nextID   atomic.Int64
-	pending  map[string]chan reply
-	notify   func(json.RawMessage)
-	closed   chan struct{}
-	read     func() ([]byte, error)
-	write    func([]byte) error
-	shutdown func() error
+	mu           sync.Mutex
+	writeGate    chan struct{}
+	once         sync.Once
+	nextID       atomic.Int64
+	pending      map[string]chan reply
+	notify       func(json.RawMessage)
+	closed       chan struct{}
+	shutdownDone chan struct{}
+	read         func() ([]byte, error)
+	write        func([]byte) error
+	shutdown     func() error
+	writeTimeout time.Duration
+	closeErr     error
 }
 type reply struct {
 	message json.RawMessage
@@ -48,7 +53,11 @@ type RPCError struct {
 
 func (e *RPCError) Error() string { return e.Message }
 func newClient() *Client {
-	return &Client{pending: map[string]chan reply{}, closed: make(chan struct{})}
+	return &Client{
+		pending: map[string]chan reply{}, closed: make(chan struct{}),
+		shutdownDone: make(chan struct{}), writeGate: make(chan struct{}, 1),
+		writeTimeout: defaultWriteTimeout,
+	}
 }
 func Dial(ctx context.Context, rawURL string, token ...string) (*Client, error) {
 	var accessToken string
@@ -155,17 +164,31 @@ func launchStdio(ctx context.Context, executable, cwd string, textOnly bool) (*C
 		c.read = func() ([]byte, error) { return readStdioMessage(reader) }
 	}
 	c.write = func(b []byte) error { _, e := stdin.Write(append(b, '\n')); return e }
-	c.shutdown = func() error { _ = stdin.Close(); return process.Kill() }
+	c.shutdown = func() error {
+		err := process.Kill() // Exit the reader before closing a potentially blocked pipe.
+		_ = stdin.Close()
+		return err
+	}
 	go func() { _ = cmd.Wait(); _ = c.Close(); _ = process.Close() }()
 	go c.readLoop()
 	return c, nil
 }
 
 func (c *Client) Done() <-chan struct{} { return c.closed }
+func (c *Client) initiateClose() {
+	c.once.Do(func() {
+		close(c.closed)
+		go func() {
+			c.closeErr = c.shutdown()
+			close(c.shutdownDone)
+		}()
+	})
+}
+
 func (c *Client) Close() error {
-	var err error
-	c.once.Do(func() { close(c.closed); err = c.shutdown() })
-	return err
+	c.initiateClose()
+	<-c.shutdownDone
+	return c.closeErr
 }
 func (c *Client) OnNotification(fn func(json.RawMessage)) { c.mu.Lock(); c.notify = fn; c.mu.Unlock() }
 func (c *Client) readLoop() {
@@ -214,14 +237,48 @@ func (c *Client) readLoop() {
 	}
 }
 func (c *Client) WriteRaw(raw json.RawMessage) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	return c.writeRaw(context.Background(), raw)
+}
+
+func (c *Client) writeRaw(ctx context.Context, raw json.RawMessage) error {
+	ctx, cancel := context.WithTimeout(ctx, c.writeTimeout)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closed:
+		return errors.New("app-server connection closed")
+	case c.writeGate <- struct{}{}:
+	}
+	if err := ctx.Err(); err != nil {
+		<-c.writeGate
+		return err
+	}
 	select {
 	case <-c.closed:
+		<-c.writeGate
 		return errors.New("app-server connection closed")
 	default:
 	}
-	return c.write(raw)
+	done := make(chan error, 1)
+	go func() {
+		err := c.write(raw)
+		if err != nil {
+			c.initiateClose()
+		}
+		<-c.writeGate
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		// A canceled write may have left a partial frame on the connection.
+		c.initiateClose()
+		return ctx.Err()
+	case <-c.closed:
+		return errors.New("app-server connection closed")
+	}
 }
 func (c *Client) Notify(method string, params any) error {
 	b, e := json.Marshal(map[string]any{"method": method, "params": params})
@@ -241,7 +298,7 @@ func (c *Client) Call(ctx context.Context, method string, params any) (json.RawM
 	if err != nil {
 		return nil, err
 	}
-	if err = c.WriteRaw(raw); err != nil {
+	if err = c.writeRaw(ctx, raw); err != nil {
 		return nil, err
 	}
 	select {

@@ -26,9 +26,22 @@ import java.util.concurrent.TimeUnit
 // Native-device regression checks, run with -Pcodexrm.imageQa in an isolated app.
 // Uses the platform runner API so production gains no test or UI dependencies.
 class ImageRenderingInstrumentation : Instrumentation() {
-    override fun onCreate(arguments: Bundle?) { super.onCreate(arguments); start() }
+    private lateinit var args: Bundle
+    override fun onCreate(arguments: Bundle?) { super.onCreate(arguments); args = arguments ?: Bundle(); start() }
 
     override fun onStart() {
+        if (args.getString("conversationUpgrade") == "true") {
+            ConversationUpgradeCheck.run(this, args)
+            return
+        }
+        if (args.getString("pairingWarning") == "true") {
+            PairingWarningCheck.run(this)
+            return
+        }
+        if (args.getString("uiReview") == "true") {
+            UiReviewCheck.run(this)
+            return
+        }
         var activity: Activity? = null
         var images: MessageImageLoader? = null
         try {

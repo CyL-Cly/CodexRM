@@ -34,10 +34,15 @@ type peer struct {
 	id, agentID, clientID string
 	role                  protocol.Role
 	deviceType            string
+	token                 string
 	conn                  *websocket.Conn
-	send                  chan protocol.Envelope
+	send                  chan []byte
+	sendMu                sync.Mutex
+	queuedBytes           atomic.Int64
 	closed                chan struct{}
 	once                  sync.Once
+	dispatchMu            sync.Mutex
+	revoked               bool
 	expires               time.Time
 	ip                    string
 	directIP              netip.Addr
@@ -49,7 +54,26 @@ type peer struct {
 	lastDirect            time.Time
 }
 
-func (p *peer) close() { p.once.Do(func() { close(p.closed); _ = p.conn.Close() }) }
+const maxPeerQueueBytes = 2 * protocol.MaxEnvelopeSize
+
+func (p *peer) close() {
+	p.once.Do(func() {
+		p.sendMu.Lock()
+		close(p.closed)
+		for {
+			select {
+			case frame := <-p.send:
+				p.queuedBytes.Add(-int64(len(frame)))
+			default:
+				p.sendMu.Unlock()
+				if p.conn != nil {
+					_ = p.conn.Close()
+				}
+				return
+			}
+		}
+	})
+}
 
 type Server struct {
 	cfg             Config
@@ -66,7 +90,8 @@ type Server struct {
 	verifyPublic    string
 	verifyMore      []string
 
-	beforeClientUpgrade func() // coordinates authorization/revocation interleavings in tests
+	beforeClientUpgrade  func() // coordinates authorization/revocation interleavings in tests
+	beforeClientDispatch func() // coordinates post-heartbeat RPC dispatch interleavings in tests
 }
 
 func New(cfg Config) (*Server, error) {
@@ -83,15 +108,20 @@ func New(cfg Config) (*Server, error) {
 	if cfg.UpdateDir == "" {
 		cfg.UpdateDir = filepath.Join(cfg.DataDir, "updates")
 	}
-	st, err := store.Open(filepath.Join(cfg.DataDir, "state.json"))
+	st, err := store.OpenExclusive(filepath.Join(cfg.DataDir, "state.json"))
 	if err != nil {
 		return nil, err
 	}
+	if cfg.PublicEnrollment {
+		st.LimitPublicEnrollment()
+	}
 	if _, err := st.PruneInactiveClients(time.Now(), nil); err != nil {
+		_ = st.Close()
 		return nil, err
 	}
 	s := &Server{cfg: cfg, store: st, agents: map[string]*peer{}, clients: map[string]*peer{}, byAgent: map[string]map[string]*peer{}, maintenanceDone: make(chan struct{}), stun: stun}
 	if err := s.startVerifier(); err != nil {
+		_ = st.Close()
 		return nil, err
 	}
 	go s.maintainClients()
@@ -134,8 +164,14 @@ func (s *Server) Handler() http.Handler {
 	enrollLimiter := newIPRateLimiter(30, 10)
 	claimLimiter := newIPRateLimiter(10, 5)
 	pair := s.pair
+	enroll := rateLimit(enrollLimiter, s.enroll)
+	claim := rateLimit(claimLimiter, s.claim)
 	if s.cfg.PublicEnrollment {
-		pair = rateLimit(newIPRateLimiter(12, 6), pair)
+		enrollmentBudget := newIPRateLimiter(90, 30)
+		persistenceBudget := newIPRateLimiter(240, 60)
+		enroll = rateLimitKey(enrollmentBudget, func(*http.Request) string { return "global" }, enroll)
+		pair = rateLimitKey(persistenceBudget, func(*http.Request) string { return "global" }, rateLimit(newIPRateLimiter(12, 6), pair))
+		claim = rateLimitKey(persistenceBudget, func(*http.Request) string { return "global" }, claim)
 	}
 	mux.HandleFunc("GET /update.json", s.updateManifest)
 	mux.HandleFunc("GET /android-update.json", s.androidUpdateManifest)
@@ -144,13 +180,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "service": "codexrm", "version": protocol.Version})
 	})
-	mux.HandleFunc("POST /api/v1/agent/enroll", rateLimit(enrollLimiter, s.enroll))
+	mux.HandleFunc("POST /api/v1/agent/enroll", enroll)
 	mux.HandleFunc("POST /api/v1/agent/pair", pair)
 	mux.HandleFunc("GET /api/v1/agent/pair/status", s.pairStatus)
 	mux.HandleFunc("GET /api/v1/agent/clients", s.listClients)
 	mux.HandleFunc("DELETE /api/v1/agent/clients/{clientID}", s.deleteClient)
 	mux.HandleFunc("GET /api/v1/agent/ws", s.agentWS)
-	mux.HandleFunc("POST /api/v1/client/claim", rateLimit(claimLimiter, s.claim))
+	mux.HandleFunc("POST /api/v1/client/claim", claim)
 	mux.HandleFunc("POST /api/v1/client/profile", s.clientProfile)
 	mux.HandleFunc("POST /api/v1/client/revoke", s.revoke)
 	mux.HandleFunc("GET /api/v1/client/ws", s.clientWS)
@@ -165,6 +201,11 @@ func (s *Server) Handler() http.Handler {
 		if !sameOrigin(r) {
 			fail(w, 403, "origin not allowed")
 			return
+		}
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			controller := http.NewResponseController(w)
+			_ = controller.SetWriteDeadline(time.Now().Add(2 * time.Minute))
+			defer controller.SetWriteDeadline(time.Time{})
 		}
 		mux.ServeHTTP(w, r)
 	})
@@ -204,6 +245,15 @@ func bearer(r *http.Request) string {
 func secureEqual(a, b string) bool {
 	return a != "" && b != "" && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
+func forwardedEnrollment(r *http.Request) bool {
+	for _, key := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP", "Via"} {
+		if len(r.Header.Values(key)) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case s.cfg.PublicEnrollment:
@@ -216,7 +266,7 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	default:
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() || r.Header.Get("X-Forwarded-For") != "" {
+		if ip == nil || !ip.IsLoopback() || forwardedEnrollment(r) {
 			fail(w, 403, "remote enrollment requires server --enroll-key")
 			return
 		}
@@ -234,7 +284,9 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	}
 	rec, err := s.store.EnrollAgent(req, bearer(r))
 	if err != nil {
-		if errors.Is(err, store.ErrUnauthorized) {
+		if errors.Is(err, store.ErrCapacity) {
+			fail(w, http.StatusTooManyRequests, err.Error())
+		} else if errors.Is(err, store.ErrUnauthorized) {
 			fail(w, 401, "installation already registered; existing agent token required")
 		} else {
 			fail(w, 500, err.Error())
@@ -251,17 +303,22 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 	}
 	rec, err := s.store.StartPairing(a.AgentID, true)
 	if err != nil {
+		if errors.Is(err, store.ErrCapacity) {
+			fail(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
 		fail(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 200, protocol.PairStartResponse{PairingCode: rec.PairingCode, ManualPairingCode: rec.ManualPairingCode, EnvironmentID: rec.EnvironmentID, ExpiresAt: rec.ExpiresAt.Unix()})
 }
 func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
-	if _, e := s.store.AuthenticateAgent(bearer(r)); e != nil {
+	agent, e := s.store.AuthenticateAgent(bearer(r))
+	if e != nil {
 		fail(w, 401, "unauthorized")
 		return
 	}
-	claimed, err := s.store.PairingStatus(r.URL.Query().Get("code"))
+	claimed, err := s.store.PairingStatus(agent.AgentID, r.URL.Query().Get("code"))
 	if err != nil {
 		fail(w, 404, "pairing not found")
 		return
@@ -293,6 +350,8 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 			status = 410
 		case errors.Is(err, store.ErrAlreadyClaimed):
 			status = 409
+		case errors.Is(err, store.ErrCapacity):
+			status = http.StatusTooManyRequests
 		}
 		fail(w, status, err.Error())
 		return
@@ -345,21 +404,55 @@ func (s *Server) clientProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
+
+// removeClient linearizes revocation with the final RPC authorization check
+// and enqueue. For a live peer, lock order is dispatchMu, s.mu, then store.mu.
+func (s *Server) removeClient(clientID, agentID string, remove func() error) error {
+	for {
+		s.mu.RLock()
+		p := s.clients[clientID]
+		s.mu.RUnlock()
+		if p != nil {
+			p.dispatchMu.Lock()
+		}
+		s.mu.Lock()
+		if s.clients[clientID] != p {
+			s.mu.Unlock()
+			if p != nil {
+				p.dispatchMu.Unlock()
+			}
+			continue
+		}
+		if p != nil && p.agentID != agentID {
+			s.mu.Unlock()
+			p.dispatchMu.Unlock()
+			return store.ErrNotFound
+		}
+		if p != nil {
+			p.revoked = true
+			p.close()
+		}
+		err := remove()
+		s.mu.Unlock()
+		if p != nil {
+			p.dispatchMu.Unlock()
+		}
+		return err
+	}
+}
+
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request) {
 	c, err := s.store.AuthenticateClient(bearer(r))
 	if err != nil {
 		fail(w, 401, "unauthorized")
 		return
 	}
-	if err = s.store.RevokeClient(c.Token); err != nil {
+	err = s.removeClient(c.ClientID, c.AgentID, func() error {
+		return s.store.RevokeClient(c.Token)
+	})
+	if err != nil {
 		fail(w, 500, err.Error())
 		return
-	}
-	s.mu.RLock()
-	p := s.clients[c.ClientID]
-	s.mu.RUnlock()
-	if p != nil {
-		p.close()
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -387,15 +480,12 @@ func (s *Server) deleteClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientID := r.PathValue("clientID")
-	if err = s.store.DeleteClient(a.AgentID, clientID); err != nil {
+	err = s.removeClient(clientID, a.AgentID, func() error {
+		return s.store.DeleteClient(a.AgentID, clientID)
+	})
+	if err != nil {
 		fail(w, 404, "client not found")
 		return
-	}
-	s.mu.RLock()
-	p := s.clients[clientID]
-	s.mu.RUnlock()
-	if p != nil {
-		p.close()
 	}
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
@@ -430,10 +520,17 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.R
 	if err != nil {
 		return
 	}
-	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, deviceType: deviceType, conn: conn, send: make(chan protocol.Envelope, 256), closed: make(chan struct{}), expires: expires}
+	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, deviceType: deviceType, token: token, conn: conn, send: make(chan []byte, 256), closed: make(chan struct{}), expires: expires}
 	p.ip = clientIP(r)
 	p.directIP = s.directIP(r)
 	s.mu.Lock()
+	select {
+	case <-s.maintenanceDone:
+		s.mu.Unlock()
+		p.close()
+		return
+	default:
+	}
 	if role == protocol.RoleAgent {
 		a, authErr := s.store.AuthenticateAgent(token)
 		if authErr != nil || a.AgentID != agentID {
@@ -492,20 +589,43 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.R
 	go s.writePump(p)
 	s.readPump(p)
 }
-func (s *Server) send(p *peer, env protocol.Envelope) {
-	select {
-	case <-p.closed:
-		return
-	default:
+
+// send reports whether the envelope fits the wire limit. When a client
+// request does not fit, its sender must receive the error, not the Agent.
+func (s *Server) send(p *peer, env protocol.Envelope) bool {
+	frame, err := json.Marshal(env)
+	if err != nil || len(frame) > protocol.MaxEnvelopeSize {
+		return false
 	}
-	select {
-	case <-p.closed:
-	case p.send <- env:
-	default:
+	if !p.enqueue(frame) {
 		log.Printf("disconnect slow peer %s", p.id)
 		p.close()
 	}
+	return true
 }
+
+func (p *peer) enqueue(frame []byte) bool {
+	p.sendMu.Lock()
+	defer p.sendMu.Unlock()
+	select {
+	case <-p.closed:
+		return true
+	default:
+	}
+	size := int64(len(frame))
+	if p.queuedBytes.Add(size) > maxPeerQueueBytes {
+		p.queuedBytes.Add(-size)
+		return false
+	}
+	select {
+	case p.send <- frame:
+		return true
+	default:
+		p.queuedBytes.Add(-size)
+		return false
+	}
+}
+
 func (s *Server) writePump(p *peer) {
 	defer p.close()
 	ticker := time.NewTicker(20 * time.Second)
@@ -514,9 +634,11 @@ func (s *Server) writePump(p *peer) {
 		select {
 		case <-p.closed:
 			return
-		case env := <-p.send:
+		case frame := <-p.send:
 			_ = p.conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
-			if p.conn.WriteJSON(env) != nil {
+			err := p.conn.WriteMessage(websocket.TextMessage, frame)
+			p.queuedBytes.Add(-int64(len(frame)))
+			if err != nil {
 				return
 			}
 		case <-ticker.C:
@@ -558,7 +680,7 @@ func (s *Server) readPump(p *peer) {
 			s.broadcastStatus(p.agentID)
 		}
 	}()
-	p.conn.SetReadLimit(16 << 20)
+	p.conn.SetReadLimit(protocol.MaxEnvelopeSize)
 	_ = p.conn.SetReadDeadline(time.Now().Add(65 * time.Second))
 	p.conn.SetPongHandler(func(string) error {
 		if err := s.recordClientHeartbeat(p); err != nil {
@@ -567,8 +689,14 @@ func (s *Server) readPump(p *peer) {
 		return p.conn.SetReadDeadline(time.Now().Add(65 * time.Second))
 	})
 	for {
+		// Read the bounded frame before parsing JSON so a receiver spending
+		// time decoding a large payload does not extend the sender's write.
+		_, frame, err := p.conn.ReadMessage()
+		if err != nil {
+			return
+		}
 		var env protocol.Envelope
-		if p.conn.ReadJSON(&env) != nil {
+		if err := json.Unmarshal(frame, &env); err != nil {
 			return
 		}
 		if err := s.recordClientHeartbeat(p); err != nil {
@@ -608,13 +736,6 @@ func (s *Server) readPump(p *peer) {
 				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "文件管理仅支持 P2P 直连", StreamID: env.StreamID})
 				continue
 			}
-			s.mu.RLock()
-			a := s.agents[p.agentID]
-			s.mu.RUnlock()
-			if a == nil {
-				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "agent offline", StreamID: env.StreamID})
-				continue
-			}
 			env.ClientID = p.clientID
 			env.ClientKind = ""
 			if p.deviceType == protocol.DeviceTypeRobot {
@@ -622,7 +743,10 @@ func (s *Server) readPump(p *peer) {
 			}
 			env.SkipDirect, env.P2P = nil, nil
 			env.SeqID = s.seq.Add(1)
-			s.send(a, env)
+			if s.beforeClientDispatch != nil {
+				s.beforeClientDispatch()
+			}
+			s.dispatchClientRPC(p, env)
 		} else if env.Type == protocol.TypeServerMessage {
 			env.SeqID = s.seq.Add(1)
 			s.mu.RLock()
@@ -657,11 +781,36 @@ func (s *Server) readPump(p *peer) {
 			s.mu.RUnlock()
 			env.SkipDirect, env.P2P = nil, nil
 			for _, c := range list {
-				s.send(c, env)
+				if !s.send(c, env) && env.StreamID != "" {
+					s.send(c, protocol.Envelope{Type: protocol.TypeError, StreamID: env.StreamID, Error: "relay response is too large"})
+				}
 			}
 		}
 	}
 }
+func (s *Server) dispatchClientRPC(p *peer, env protocol.Envelope) {
+	p.dispatchMu.Lock()
+	defer p.dispatchMu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p.revoked || s.clients[p.clientID] != p {
+		return
+	}
+	select {
+	case <-p.closed:
+		return
+	default:
+	}
+	agent := s.agents[p.agentID]
+	if agent == nil {
+		s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "agent offline", StreamID: env.StreamID})
+		return
+	}
+	if !s.send(agent, env) {
+		s.send(p, protocol.Envelope{Type: protocol.TypeError, StreamID: env.StreamID, Error: "relay request is too large"})
+	}
+}
+
 func (s *Server) sendStatus(p *peer, kind string) {
 	a, err := s.store.GetAgent(p.agentID)
 	if err != nil {
@@ -692,13 +841,16 @@ func (s *Server) Close() {
 		if s.verifier != nil {
 			s.verifier.Close()
 		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, p := range s.agents {
+			p.close()
+		}
+		for _, p := range s.clients {
+			p.close()
+		}
+		if err := s.store.Close(); err != nil {
+			log.Printf("close relay state: %v", err)
+		}
 	})
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, p := range s.agents {
-		p.close()
-	}
-	for _, p := range s.clients {
-		p.close()
-	}
 }

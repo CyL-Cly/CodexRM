@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/codexrm/codexrm/internal/appserver"
@@ -19,25 +20,59 @@ func (a *Agent) threadSnapshot(ctx context.Context, app *appserver.Client, param
 	if id == "" {
 		return nil, &appserver.RPCError{Code: -32602, Message: "threadId is required"}
 	}
-	raw, err := app.Call(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": false})
-	if err != nil {
-		return nil, err
+	read := func() (map[string]any, error) {
+		raw, err := app.Call(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": false})
+		if err != nil {
+			return nil, err
+		}
+		var result struct {
+			Thread map[string]any `json:"thread"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		if result.Thread == nil {
+			return nil, errors.New("thread/read returned no thread")
+		}
+		return result.Thread, nil
 	}
-	var result struct {
-		Thread map[string]any `json:"thread"`
+	var thread map[string]any
+	var turns []json.RawMessage
+	var cursor json.RawMessage
+	for range 3 {
+		before, err := read()
+		if err != nil {
+			return nil, err
+		}
+		turns, cursor, err = initialThreadHistory(ctx, app, id, before["historyMode"] != "paginated")
+		if err != nil {
+			return nil, err
+		}
+		after, err := read()
+		if err != nil {
+			return nil, err
+		}
+		if reflect.DeepEqual(before["status"], after["status"]) &&
+			reflect.DeepEqual(before["updatedAt"], after["updatedAt"]) &&
+			reflect.DeepEqual(before["historyMode"], after["historyMode"]) {
+			thread = after
+			break
+		}
 	}
-	if err = json.Unmarshal(raw, &result); err != nil {
-		return nil, err
-	}
-	thread := result.Thread
 	if thread == nil {
-		return nil, errors.New("thread/read returned no thread")
-	}
-	turns, cursor, err := initialThreadHistory(ctx, app, id, thread["historyMode"] != "paginated")
-	if err != nil {
-		return nil, err
+		return nil, errors.New("thread changed while reading its history; retry the snapshot")
 	}
 	thread["turns"] = turns
+	route, err := a.providerRoute(id)
+	if err != nil {
+		return nil, err
+	}
+	if route.ProviderID != "" {
+		thread["codexrmProvider"] = route.ProviderID
+		if route.Model != "" {
+			thread["model"] = route.Model
+		}
+	}
 	// Paths from a remote app-server belong to that machine, never the agent.
 	if a.cfg.AppServerURL == "" {
 		path, _ := thread["path"].(string)

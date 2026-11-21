@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/codexrm/codexrm/internal/agent"
 	"github.com/codexrm/codexrm/internal/agenthost"
@@ -79,10 +80,23 @@ func main() {
 	setupAutostart := flag.Bool("setup-autostart", false, "internal: record the setup startup preference")
 	restart := flag.Bool("restart", false, "stop the existing agent and restart the service")
 	settings := flag.Bool("settings", false, "open the local settings page (Windows/macOS)")
+	loopbackSettings := flag.Bool("loopback-settings", false, "listen on loopback with a persistent settings password and port for SSH forwarding")
 	lanSettings := flag.Bool("lan-settings", false, "allow LAN access to the settings page (trusted networks only)")
 	uninstall := flag.Bool("uninstall", false, "uninstall this Windows installation")
 	uninstallDir := flag.String("uninstall-dir", "", "internal: uninstall using a temporary helper")
+	wxInstallHelper := flag.Bool("wx-install-helper", false, "install signed Docker Engine and Compose packages on Linux")
 	flag.Parse()
+	if *loopbackSettings && *lanSettings {
+		log.Fatal("--loopback-settings and --lan-settings are mutually exclusive")
+	}
+	if *wxInstallHelper {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		defer cancel()
+		if err := agenthost.InstallWXDocker(ctx); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if *version {
 		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"versionCode": release.VersionCode, "versionName": release.VersionName})
 		return
@@ -274,6 +288,7 @@ func main() {
 		}
 	}
 	host.LANSettings = *lanSettings
+	host.LoopbackSettings = *loopbackSettings
 	host.LinuxUpdateExecutable = updater.LinuxExecutable()
 	host.OpenOnStart = runtime.GOOS != "linux" && (*settings || !host.Configured())
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

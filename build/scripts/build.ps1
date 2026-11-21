@@ -1,7 +1,8 @@
 param(
     [switch]$Linux,
     [ValidateSet('Agent', 'Server', 'All')][string]$Target = 'All',
-    [switch]$Interactive
+    [switch]$Interactive,
+    [string]$WxBotImageLock
 )
 $ErrorActionPreference = 'Stop'
 $buildRoot = Split-Path -Parent $PSScriptRoot
@@ -35,6 +36,21 @@ if ($Interactive) {
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw 'Go was not found. Install Go 1.24+ and add it to PATH before building.'
 }
+if ($WxBotImageLock) {
+    if (-not $Linux -or $Target -eq 'Server') { throw 'The wxbot image lock requires a Linux Agent build.' }
+    $lockPath = [IO.Path]::GetFullPath($WxBotImageLock)
+    $lockBytes = [IO.File]::ReadAllBytes($lockPath)
+    if ($lockBytes.Length -gt 32768) { throw 'The wxbot image lock is too large.' }
+    $wxbotImages = Get-Content -LiteralPath $lockPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $imageKeys = @('redis', 'mysql', 'qdrant', 'wechat-auth', 'slider', 'uuid', 'word-cloud', 'jimeng', 'mcp', 'admin-web', 'admin-api', 'nginx', 'client', 'protocol', 'backup')
+    foreach ($key in $imageKeys) {
+        $image = $wxbotImages.$key
+        if ($image -isnot [string] -or $image -cnotmatch '^[a-z0-9][a-z0-9.-]+(?::[0-9]+)?/[a-z0-9][a-z0-9_./-]*@sha256:[a-f0-9]{64}$' -or $image.Contains('..')) {
+            throw "Invalid wxbot image reference for $key."
+        }
+    }
+    $wxbotLock64 = [Convert]::ToBase64String($lockBytes)
+}
 $previousOS = $env:GOOS
 $previousArch = $env:GOARCH
 $previousCGO = $env:CGO_ENABLED
@@ -53,6 +69,9 @@ try {
         Write-Host "Building $component for $env:GOOS/$env:GOARCH..."
         $componentLdflags = $ldflags
         if (-not $Linux -and $component -eq 'agent') { $componentLdflags += ' -H=windowsgui' }
+        if ($Linux -and $component -eq 'agent' -and $wxbotLock64) {
+            $componentLdflags += " -X github.com/codexrm/codexrm/internal/agenthost.wxReleaseImageLock=$wxbotLock64"
+        }
         go build -trimpath -ldflags $componentLdflags -o $outputPath "./cmd/codexrm-$component"
         if ($LASTEXITCODE) { throw "$component build failed for $env:GOOS/$env:GOARCH (exit code $LASTEXITCODE)." }
         Write-Host "Built: $outputPath"

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -63,6 +64,9 @@ type PairingRecord struct {
 type Store struct {
 	mu       sync.RWMutex
 	path     string
+	lock     *os.File
+	closed   bool
+	public   bool
 	agents   map[string]*AgentRecord
 	clients  map[string]*ClientRecord
 	pairings map[string]*PairingRecord
@@ -72,6 +76,51 @@ type persistShape struct {
 	Agents   map[string]*AgentRecord   `json:"agents"`
 	Clients  map[string]*ClientRecord  `json:"clients"`
 	Pairings map[string]*PairingRecord `json:"pairings"`
+}
+
+// OpenExclusive holds an operating system lock for the relay's lifetime.
+func OpenExclusive(path string) (*Store, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockState(lock); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("lock relay state directory: %w", err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	s.lock = lock
+	return s, nil
+}
+
+// LimitPublicEnrollment caps JSON rewrite costs on public relays. Expired,
+// unpaired installations can be reclaimed without affecting paired clients.
+func (s *Store) LimitPublicEnrollment() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.public = true
+}
+
+var ErrCapacity = errors.New("relay registration capacity reached")
+
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	if s.lock == nil {
+		return nil
+	}
+	return s.lock.Close()
 }
 
 func Open(path string) (*Store, error) {
@@ -85,10 +134,28 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	data, err := os.ReadFile(path)
-	if err == nil && len(data) > 0 {
+	if err == nil {
 		var shape persistShape
 		if err := json.Unmarshal(data, &shape); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read relay state: %w", err)
+		}
+		if shape.Agents == nil || shape.Clients == nil || shape.Pairings == nil {
+			return nil, errors.New("relay state is missing required collections")
+		}
+		for _, agent := range shape.Agents {
+			if agent == nil {
+				return nil, errors.New("relay state contains a null agent")
+			}
+		}
+		for _, client := range shape.Clients {
+			if client == nil {
+				return nil, errors.New("relay state contains a null client")
+			}
+		}
+		for _, pairing := range shape.Pairings {
+			if pairing == nil {
+				return nil, errors.New("relay state contains a null pairing")
+			}
 		}
 		if shape.Agents != nil {
 			s.agents = shape.Agents
@@ -127,27 +194,40 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) persistShapeLocked(shape persistShape) error {
+	if s.closed {
+		return os.ErrClosed
+	}
 	data, err := json.MarshalIndent(shape, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".state-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	defer os.Remove(tmp.Name())
+	if _, err = tmp.Write(data); err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return replaceState(tmp.Name(), s.path)
 }
 
 func randomToken() string {
 	b := make([]byte, 24)
-	_, _ = rand.Read(b)
+	rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
 func manualCode() string {
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	rand.Read(b)
 	chars := make([]byte, 8)
 	for i := 0; i < 8; i++ {
 		chars[i] = alphabet[int(b[i])%len(alphabet)]
@@ -209,8 +289,26 @@ func (s *Store) EnrollAgent(req protocol.EnrollRequest, previousToken ...string)
 	}
 	updated.Token = randomToken()
 	updated.ExpiresAt = now.Add(30 * 24 * time.Hour)
-	updated.Online = false
 	agents := maps.Clone(s.agents)
+	if s.public && existing == nil && len(agents) >= 2048 {
+		retained := make(map[string]bool)
+		for _, client := range s.clients {
+			retained[client.AgentID] = true
+		}
+		for _, pair := range s.pairings {
+			if now.Before(pair.ExpiresAt) {
+				retained[pair.AgentID] = true
+			}
+		}
+		for key, agent := range agents {
+			if !agent.Online && !retained[key] && now.After(agent.ExpiresAt.Add(enrollmentRecoveryWindow)) {
+				delete(agents, key)
+			}
+		}
+		if len(agents) >= 2048 {
+			return nil, ErrCapacity
+		}
+	}
 	agents[updated.AgentID] = updated
 	if err := s.persistShapeLocked(persistShape{Agents: agents, Clients: s.clients, Pairings: s.pairings}); err != nil {
 		return nil, err
@@ -319,16 +417,28 @@ func (s *Store) StartPairing(agentID string, manual bool) (*PairingRecord, error
 		ExpiresAt:     now.Add(10 * time.Minute),
 		CreatedAt:     now,
 	}
-	if manual {
-		rec.ManualPairingCode = manualCode()
-	}
 	pairings := maps.Clone(s.pairings)
-	pairings[rec.PairingCode] = rec
 	for code, old := range pairings {
 		if now.After(old.ExpiresAt) {
 			delete(pairings, code)
 		}
 	}
+	if s.public && len(pairings) >= 4096 {
+		return nil, ErrCapacity
+	}
+	if manual {
+		for range 16 {
+			candidate := manualCode()
+			if _, used := s.findPairingLocked(candidate); !used {
+				rec.ManualPairingCode = candidate
+				break
+			}
+		}
+		if rec.ManualPairingCode == "" {
+			return nil, errors.New("cannot allocate unique manual pairing code")
+		}
+	}
+	pairings[rec.PairingCode] = rec
 	if err := s.persistShapeLocked(persistShape{Agents: s.agents, Clients: s.clients, Pairings: pairings}); err != nil {
 		return nil, err
 	}
@@ -354,6 +464,9 @@ func (s *Store) ClaimPairing(code, clientName, deviceType string, ip ...string) 
 	a, ok := s.agents[rec.AgentID]
 	if !ok {
 		return nil, nil, ErrNotFound
+	}
+	if s.public && len(s.clients) >= 8192 {
+		return nil, nil, ErrCapacity
 	}
 	claimed := *rec
 	claimed.Claimed = true
@@ -431,11 +544,11 @@ func (s *Store) UpdateClientProfile(token, name, deviceType string) error {
 	return ErrUnauthorized
 }
 
-func (s *Store) PairingStatus(code string) (bool, error) {
+func (s *Store) PairingStatus(agentID, code string) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rec, ok := s.findPairingLocked(code)
-	if !ok {
+	if !ok || rec.AgentID != agentID || time.Now().After(rec.ExpiresAt) {
 		return false, ErrNotFound
 	}
 	return rec.Claimed, nil

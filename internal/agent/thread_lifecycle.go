@@ -35,7 +35,7 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 		q.RPCMu.Lock()
 		defer q.RPCMu.Unlock()
 	}
-	if id != "" && (method == "thread/resume" || method == "turn/start") {
+	if id != "" && (method == "thread/resume" || method == "turn/start" || method == switchProviderMethod) {
 		defer func() {
 			a.textMu.Lock()
 			textApp := a.textApp
@@ -51,10 +51,22 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 			}
 		}()
 	}
+	if method == switchProviderMethod {
+		return a.switchThreadProvider(ctx, app, id, q, params)
+	}
 	// Keep caller-supplied runtime settings, before provider preparation adds
 	// credentials. Every automatic resume reloads current provider credentials.
 	settings := resumeSettings(params)
+	var route threadProviderRoute
 	if method == "turn/start" && q != nil {
+		var err error
+		route, err = a.providerRoute(id)
+		if err != nil {
+			return nil, err
+		}
+		if route.Model != "" && params["model"] == nil {
+			params["model"] = route.Model
+		}
 		if err := a.resumeDetachedThread(ctx, app, id, q); err != nil {
 			return nil, err
 		}
@@ -83,7 +95,18 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 		}
 	}
 	if err == nil {
+		switch method {
+		case "thread/fork", "thread/archive", "thread/unarchive", "turn/start":
+			threadID, _ := params["threadId"].(string)
+			a.emptyForks(method, threadID, raw)
+		}
 		a.recordStartedTurn(method, params, raw)
+		if model, _ := params["model"].(string); route.ProviderID != "" && model != "" && model != route.Model {
+			route.Model = model
+			if err := a.saveProviderRoute(id, route); err != nil {
+				log.Printf("save model for thread %s: %v", id, err)
+			}
+		}
 		if method == "thread/start" || method == "thread/resume" || method == "thread/fork" {
 			var out struct {
 				Thread struct {
@@ -131,6 +154,9 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 	}
 	if historyErr != nil {
 		return nil, historyErr
+	}
+	if err == nil && method == "thread/resume" {
+		return a.withProviderRoute(id, raw)
 	}
 	return raw, err
 }
@@ -218,14 +244,27 @@ func (a *Agent) releaseIdleThread(ctx context.Context, app *appserver.Client, id
 	if json.Unmarshal(raw, &snapshot) != nil || snapshot.Thread.Status.Type != "idle" {
 		return
 	}
+	if err := a.unloadThread(callCtx, app, id, q); err != nil {
+		log.Printf("release idle thread %s: %v", id, err)
+	}
+}
+
+// The caller holds q.RPCMu and has verified the thread is idle.
+func (a *Agent) unloadThread(ctx context.Context, app *appserver.Client, id string, q *messageQueue) error {
 	a.queueMu.Lock()
 	unloaded := make(chan struct{})
 	q.Unloaded = unloaded
 	a.queueMu.Unlock()
-	raw, err = app.Call(callCtx, "thread/unsubscribe", map[string]any{"threadId": id})
+	defer func() {
+		a.queueMu.Lock()
+		if q.Unloaded == unloaded {
+			q.Unloaded = nil
+		}
+		a.queueMu.Unlock()
+	}()
+	raw, err := app.Call(ctx, "thread/unsubscribe", map[string]any{"threadId": id})
 	if err != nil {
-		log.Printf("release idle thread %s: %v", id, err)
-		return
+		return err
 	}
 	var result struct{ Status string }
 	_ = json.Unmarshal(raw, &result)
@@ -234,8 +273,8 @@ func (a *Agent) releaseIdleThread(ctx context.Context, app *appserver.Client, id
 		// until thread/closed so an immediate next message can safely resume.
 		select {
 		case <-unloaded:
-		case <-callCtx.Done():
-			log.Printf("wait for idle thread %s to unload: %v", id, callCtx.Err())
+		case <-ctx.Done():
+			err = ctx.Err()
 		}
 	}
 	a.queueMu.Lock()
@@ -245,4 +284,5 @@ func (a *Agent) releaseIdleThread(ctx context.Context, app *appserver.Client, id
 	delete(a.owners, id)
 	a.mu.Unlock()
 	a.publishThreadState("detached", id)
+	return err
 }

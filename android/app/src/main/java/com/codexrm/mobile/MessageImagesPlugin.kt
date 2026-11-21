@@ -20,11 +20,12 @@ import io.noties.markwon.image.AsyncDrawableScheduler
 import io.noties.markwon.image.AsyncDrawableSpan
 import io.noties.markwon.image.ImageProps
 import org.commonmark.node.Image
+import java.util.Collections
 import java.util.WeakHashMap
 
 internal class MessageImagesPlugin(private val context: Context, private val images: MessageImageLoader) : AbstractMarkwonPlugin() {
     var messageId = ""
-    private val sources = WeakHashMap<AsyncDrawable, MessageImage>()
+    private val sources = Collections.synchronizedMap(WeakHashMap<AsyncDrawable, MessageImage>())
     private val requests = WeakHashMap<AsyncDrawable, Any>()
     private val loader = object : AsyncDrawableLoader() {
         override fun load(drawable: AsyncDrawable) {
@@ -83,6 +84,7 @@ internal class MessageImagesPlugin(private val context: Context, private val ima
         }
         override fun setAlpha(alpha: Int) { paint.alpha = alpha }
         override fun setColorFilter(colorFilter: ColorFilter?) { paint.colorFilter = colorFilter }
+        @Deprecated("Deprecated in Java")
         override fun getOpacity(): Int = PixelFormat.OPAQUE
     }
 }

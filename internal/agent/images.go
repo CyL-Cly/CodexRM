@@ -65,7 +65,7 @@ func (a *Agent) readImage(params map[string]any) (any, error) {
 	if expected, _ := params["version"].(string); expected != "" && expected != version {
 		return nil, fmt.Errorf("图片已变化，请重试")
 	}
-	offset, err := attachmentNumber(params, "offset")
+	offset, err := attachmentNumber(params, "offset", attachmentMaxSize)
 	if err != nil || offset > stat.Size() {
 		return nil, fmt.Errorf("invalid image offset")
 	}

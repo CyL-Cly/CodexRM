@@ -19,7 +19,7 @@ internal class SidebarSwipeLayout(
     private val moveSidebar: (Float) -> Unit,
     private val finishSidebarDrag: (Boolean) -> Unit,
 ) : FrameLayout(context) {
-    private enum class Swipe { IDLE, TRACKING, DRAGGING, CONSUMING }
+    private enum class Swipe { IDLE, TRACKING, DRAGGING, PANNING, CONSUMING }
 
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val openDistance = max(Ui.dp(context, 64), touchSlop * 4)
@@ -27,6 +27,9 @@ internal class SidebarSwipeLayout(
     private var startY = 0f
     private var startTranslationX = 0f
     private var swipe = Swipe.IDLE
+    private var overflowView: MathTextView? = null
+    private var overflow: HorizontalOverflow? = null
+    private var lastX = 0f
 
     fun stopSidebarSwipe() {
         when (swipe) {
@@ -42,25 +45,42 @@ internal class SidebarSwipeLayout(
             if (swipe == Swipe.DRAGGING) finishSidebarDrag(false)
             startX = event.x
             startY = event.y
-            swipe = if (canOpenSidebar() && !blocksSwipe(this, startX, startY)) Swipe.TRACKING else Swipe.IDLE
+            lastX = startX
+            val blocker = swipeBlocker(this, startX, startY)
+            overflow = blocker?.span
+            overflowView = if (overflow != null) blocker?.view as? MathTextView else null
+            swipe = if (canOpenSidebar() && blocker == null) Swipe.TRACKING else Swipe.IDLE
         }
 
         val dx = event.x - startX
+        val dy = abs(event.y - startY)
+        val target = overflow
+        if (target != null && swipe != Swipe.PANNING) {
+            when (action) {
+                MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> clearOverflow()
+                MotionEvent.ACTION_MOVE -> {
+                    if (event.eventTime - event.downTime >= ViewConfiguration.getLongPressTimeout() ||
+                        (dy > touchSlop && dy >= abs(dx)) || overflowView?.containsOverflow(target) != true) {
+                        clearOverflow()
+                    } else if (abs(dx) > touchSlop && abs(dx) > dy) {
+                        // ListView can consume DOWN during a fling and never dispatch it to the TextView.
+                        cancelChildTouch(event)
+                        swipe = Swipe.PANNING
+                    }
+                }
+            }
+        }
         if (swipe == Swipe.TRACKING) {
             when (action) {
                 MotionEvent.ACTION_POINTER_DOWN -> swipe = Swipe.IDLE
                 MotionEvent.ACTION_MOVE -> {
-                    val dy = abs(event.y - startY)
                     if (event.pointerCount != 1 || !canOpenSidebar() ||
                         event.eventTime - event.downTime >= ViewConfiguration.getLongPressTimeout() ||
                         dx < -touchSlop || (dy > touchSlop && dy >= abs(dx))) {
                         swipe = Swipe.IDLE
                     } else if (dx > touchSlop && dx >= dy * 1.5f) {
                         // Cancel the original target so the drag cannot also click a link or button.
-                        val cancel = MotionEvent.obtain(event)
-                        cancel.action = MotionEvent.ACTION_CANCEL
-                        super.dispatchTouchEvent(cancel)
-                        cancel.recycle()
+                        cancelChildTouch(event)
                         startTranslationX = startSidebarDrag()
                         swipe = Swipe.DRAGGING
                     }
@@ -69,6 +89,24 @@ internal class SidebarSwipeLayout(
         }
 
         when (swipe) {
+            Swipe.PANNING -> {
+                when (action) {
+                    MotionEvent.ACTION_MOVE, MotionEvent.ACTION_UP -> {
+                        val view = overflowView
+                        if (view != null && target != null && view.containsOverflow(target)) {
+                            view.panOverflow(target, lastX - event.x)
+                            lastX = event.x
+                        }
+                    }
+                }
+                when (action) {
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                        clearOverflow()
+                        swipe = if (action == MotionEvent.ACTION_POINTER_DOWN) Swipe.CONSUMING else Swipe.IDLE
+                    }
+                }
+                return true
+            }
             Swipe.DRAGGING -> {
                 when (action) {
                     MotionEvent.ACTION_MOVE -> moveSidebar(startTranslationX + dx - touchSlop)
@@ -92,14 +130,27 @@ internal class SidebarSwipeLayout(
                 val handled = super.dispatchTouchEvent(event)
                 val wasTracking = swipe == Swipe.TRACKING
                 if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) swipe = Swipe.IDLE
-                return handled || wasTracking
+                return handled || wasTracking || overflow != null
             }
         }
     }
 
-    private fun blocksSwipe(view: View, x: Float, y: Float): Boolean {
-        if (view is MathTextView && view.scrollableFormulaAt(x, y) != null) return true
-        if (view is EditText || view is HorizontalScrollView || (view is TextView && view.hasSelection())) return true
+    private fun cancelChildTouch(event: MotionEvent) {
+        val cancel = MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL }
+        super.dispatchTouchEvent(cancel)
+        cancel.recycle()
+    }
+
+    private fun clearOverflow() {
+        overflow = null
+        overflowView = null
+    }
+
+    private data class SwipeBlocker(val view: View, val span: HorizontalOverflow? = null)
+
+    private fun swipeBlocker(view: View, x: Float, y: Float): SwipeBlocker? {
+        if (view is EditText || view is HorizontalScrollView || (view is TextView && view.hasSelection())) return SwipeBlocker(view)
+        if (view is MathTextView) view.horizontalOverflowAt(x, y)?.let { return SwipeBlocker(view, it) }
         if (view is ViewGroup) {
             for (index in view.childCount - 1 downTo 0) {
                 val child = view.getChildAt(index)
@@ -107,10 +158,10 @@ internal class SidebarSwipeLayout(
                 val childX = x + view.scrollX - child.x
                 val childY = y + view.scrollY - child.y
                 if (childX >= 0 && childX < child.width && childY >= 0 && childY < child.height) {
-                    return blocksSwipe(child, childX, childY)
+                    return swipeBlocker(child, childX, childY)
                 }
             }
         }
-        return false
+        return null
     }
 }

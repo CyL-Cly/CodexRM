@@ -23,6 +23,7 @@ import (
 type Host struct {
 	OpenOnStart            bool
 	LANSettings            bool
+	LoopbackSettings       bool
 	LinuxUpdateExecutable  string // Set by the standalone agent before Run.
 	mu                     sync.Mutex
 	opMu                   sync.Mutex
@@ -33,6 +34,12 @@ type Host struct {
 	active                 *agent.Agent
 	activeCtx              context.Context
 	wxLocalServer          string
+	wxLocalEnrollment      string
+	wxRelayMu              sync.Mutex
+	wxTaskWG               sync.WaitGroup
+	wxInstanceMu           sync.Mutex
+	wxScanMu               sync.Mutex
+	wxScans                map[int64]wxLoginScan
 	wxActive               *agent.Agent
 	wxActiveCtx            context.Context
 	wxActiveVersion        uint64
@@ -59,6 +66,12 @@ func New(path, installDir string, config clientconfig.Connection, base agent.Con
 	if err := config.Normalize(); err != nil {
 		return nil, err
 	}
+	if base.ProviderDir == "" {
+		base.ProviderDir = filepath.Dir(path)
+	}
+	if runtime.GOOS == "linux" {
+		base.OneBotSettingsPath = filepath.Join(filepath.Dir(path), "onebot.json")
+	}
 	return &Host{path: path, installDir: installDir, config: config, base: base, version: 1, changed: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), openBrowser: desktop.OpenBrowser, newUpdater: updater.New, startUpdate: func(plan *updater.Plan) error { return plan.StartHelper() }}, nil
 }
 
@@ -72,7 +85,7 @@ func (h *Host) OpenSettings() {
 	}
 	if err != nil {
 		// Headless Linux has no browser; the URL is still needed for an SSH tunnel.
-		log.Printf("无法自动打开设置页面，请在浏览器访问 %s（原因：%v）", url, err)
+		log.Print("无法自动打开设置页面，请从 CodexRM 设置入口重试")
 	}
 }
 
@@ -81,6 +94,22 @@ func (h *Host) Run(ctx context.Context) error {
 	h.ctx, h.cancel = context.WithCancel(ctx)
 	runCtx := h.ctx
 	h.mu.Unlock()
+	defer func() {
+		h.cancel()
+		wxRuntime.mu.Lock()
+		wxRuntime.mu.Unlock() // Prevent Add racing with Wait on shutdown.
+		h.wxTaskWG.Wait()
+	}()
+	if wxSupported {
+		go h.resumeWXTask()
+		if instance := h.loadWXInstance(); instance != nil && (instance.Mode == "installed" || instance.Mode == "taken-over") {
+			probeCtx, stop := context.WithTimeout(runCtx, 5*time.Second)
+			if err := h.ensureWXRelay(probeCtx); err != nil {
+				log.Printf("WeChat relay: %v", err)
+			}
+			stop()
+		}
+	}
 	defer h.cancel()
 	defer h.closePage()
 	if h.LANSettings {
@@ -90,13 +119,13 @@ func (h *Host) Run(ctx context.Context) error {
 		}
 		local, _ := url.Parse(address)
 		log.Printf("Agent 设置页面监听端口 %s，密码保存在 %s；风险提示：仅可在可信网络启用 LAN 设置", local.Port(), h.settingsAccessPath())
-	} else if runtime.GOOS == "linux" {
+	} else if h.LoopbackSettings || runtime.GOOS == "linux" {
 		address, err := h.SettingsURL()
 		if err != nil {
 			return fmt.Errorf("启动本机设置页面: %w", err)
 		}
 		local, _ := url.Parse(address)
-		log.Printf("设置服务仅监听本机。headless 环境请使用 SSH 端口转发：ssh -L <本地端口>:%s <主机>", local.Host)
+		log.Printf("设置服务仅监听 %s，密码保存在 %s。远程访问可使用 ssh -L %s:%s <主机>", local.Host, h.settingsAccessPath(), local.Port(), local.Host)
 	} else if h.OpenOnStart {
 		h.OpenSettings()
 	}
@@ -123,14 +152,15 @@ func (h *Host) Run(ctx context.Context) error {
 	for runCtx.Err() == nil {
 		h.mu.Lock()
 		cfg, version := h.config, h.version
+		wxRelay, wxKey := h.wxLocalServer, h.wxLocalEnrollment
 		h.mu.Unlock()
 		generationCtx, cancel := context.WithCancel(runCtx)
 		finished := make(chan struct{})
 		go func() {
 			defer close(finished)
-			if h.wxLocalServer != "" && h.wxLocalServer != cfg.Server {
+			if wxRelay != "" && wxRelay != cfg.Server {
 				wxDone := make(chan struct{})
-				go func() { defer close(wxDone); h.runWXConnection(generationCtx, version) }()
+				go func() { defer close(wxDone); h.runWXConnection(generationCtx, version, wxRelay, wxKey) }()
 				defer func() { <-wxDone }()
 			}
 			h.runConnection(generationCtx, cfg, version)
@@ -242,6 +272,11 @@ func (h *Host) queueUpdate(plan *updater.Plan) {
 var errUpdateBusy = errors.New("secondary agent is busy")
 
 func (h *Host) applyPendingUpdate() error {
+	wxRuntime.mu.Lock()
+	defer wxRuntime.mu.Unlock()
+	if wxRuntime.running[h.StateDir()] {
+		return nil
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.pendingUpdate == nil || h.ctx.Err() != nil || time.Now().Before(h.updateRetryAt) {
@@ -354,17 +389,7 @@ func (h *Host) runConnection(ctx context.Context, cfg clientconfig.Connection, v
 		base.CheckForUpdate = h.checkRemoteUpdate
 	}
 	base.NoAutoPair = true
-	if cfg.Workspace != "" {
-		base.Cwd = cfg.Workspace
-	}
-	if cfg.CodexPath != "" {
-		base.CodexPath = cfg.CodexPath
-		if filepath.IsAbs(base.CodexPath) {
-			if _, err := os.Stat(base.CodexPath); errors.Is(err, os.ErrNotExist) {
-				base.CodexPath = ""
-			}
-		}
-	}
+	base = withLocalSettings(base, cfg)
 	a, err := agent.NewForServer(base)
 	if err != nil {
 		h.setError(version, err)
@@ -419,4 +444,19 @@ func (h *Host) current(ctx context.Context) (*agent.Agent, context.Context, func
 	requestCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	stop := context.AfterFunc(h.activeCtx, cancel)
 	return h.active, requestCtx, func() { stop(); cancel() }, nil
+}
+
+func withLocalSettings(base agent.Config, cfg clientconfig.Connection) agent.Config {
+	if cfg.Workspace != "" {
+		base.Cwd = cfg.Workspace
+	}
+	if cfg.CodexPath != "" {
+		base.CodexPath = cfg.CodexPath
+		if filepath.IsAbs(base.CodexPath) {
+			if _, err := os.Stat(base.CodexPath); errors.Is(err, os.ErrNotExist) {
+				base.CodexPath = ""
+			}
+		}
+	}
+	return base
 }

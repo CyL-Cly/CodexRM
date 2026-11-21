@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,8 +55,13 @@ func (h *Host) SettingsURL() (string, error) {
 	var listener net.Listener
 	var token string
 	var err error
-	if h.LANSettings {
-		listener, token, err = listenLANSettings(h.settingsAccessPath())
+	passwordSettings := h.LANSettings || h.LoopbackSettings || runtime.GOOS == "linux"
+	if passwordSettings {
+		bindHost := "127.0.0.1"
+		if h.LANSettings {
+			bindHost = ""
+		}
+		listener, token, err = listenPasswordSettings(h.settingsAccessPath(), bindHost)
 	} else {
 		listener, err = net.Listen("tcp4", "127.0.0.1:0")
 		token = settingsSecret()
@@ -66,7 +72,7 @@ func (h *Host) SettingsURL() (string, error) {
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
 	localHost := net.JoinHostPort("127.0.0.1", port)
 	h.page.url = "http://" + localHost + "/"
-	if !h.LANSettings {
+	if !passwordSettings {
 		h.page.url += "#" + token
 	}
 	mux := http.NewServeMux()
@@ -75,13 +81,40 @@ func (h *Host) SettingsURL() (string, error) {
 	mux.HandleFunc("/api/pair", h.pair)
 	mux.HandleFunc("/api/devices", h.devices)
 	mux.HandleFunc("/api/devices/", h.devices)
+	mux.HandleFunc("POST /api/providers/{action}", h.providerSettings)
+	if oneBotSupported {
+		mux.HandleFunc("/api/onebot", h.oneBotSettings)
+		mux.HandleFunc("POST /api/onebot/test", h.oneBotTest)
+	}
 	if wxSupported {
 		mux.HandleFunc("/api/wx/accounts", h.wxList)
+		mux.HandleFunc("GET /api/wx/workspaces", h.wxWorkspaces)
+		mux.HandleFunc("/api/wx/cache", h.wxRecordCache)
+		mux.HandleFunc("/api/wx/maintenance", h.wxMaintenance)
+		mux.HandleFunc("/api/wx/robot/{operation}", h.wxRobotManagement)
+		mux.HandleFunc("GET /wx-slider/{challenge}", h.wxSliderFrame)
+		mux.HandleFunc("GET /wx-slider/{challenge}/submit", h.wxSliderSubmit)
+		mux.HandleFunc("/api/wx/manage/{operation}", h.wxOperation)
+		mux.HandleFunc("/api/wx/probe", h.wxProbe)
+		mux.HandleFunc("/api/wx/task", h.wxTask)
+		mux.HandleFunc("POST /api/wx/install", h.wxStartInstall)
+		mux.HandleFunc("POST /api/wx/takeover", h.wxStartTakeover)
+		mux.HandleFunc("/api/wx/contacts", h.wxContacts)
+		mux.HandleFunc("/api/wx/group-members", h.wxGroupMembers)
+		mux.HandleFunc("/api/wx/group-notices", h.wxGroupNotices)
+		mux.HandleFunc("/api/wx/contacts/sync", h.wxSyncContacts)
 		mux.HandleFunc("/api/wx/{action}", h.wxSettings)
 	}
+	settingsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/wx/") {
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(3 * time.Minute))
+		}
+		mux.ServeHTTP(w, r)
+	})
 	root, _ := fs.Sub(assets, "web")
 	mux.Handle("/", http.FileServer(http.FS(root)))
-	h.page.server = &http.Server{Handler: guardSettings(mux, localHost, token, h.LANSettings), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	sessionLogin := passwordSettings && runtime.GOOS == "linux"
+	h.page.server = &http.Server{Handler: guardSettings(settingsHandler, localHost, token, passwordSettings, sessionLogin), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	go h.page.server.Serve(listener)
 	return h.page.url, nil
 }
@@ -116,29 +149,37 @@ func matchesSettingsInterface(r *http.Request) bool {
 	return err == nil && ip.WithZone("").Unmap() == local.AddrPort().Addr().WithZone("").Unmap()
 }
 
-func guardSettings(next http.Handler, localHost, secret string, lan bool) http.Handler {
+func guardSettings(next http.Handler, localHost, secret string, passwordSettings, sessionLogin bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		validHost := r.Host == localHost
-		if lan {
+		if passwordSettings {
 			validHost = matchesSettingsInterface(r)
 		}
 		origin := r.Header.Get("Origin")
-		if !validHost || (origin != "" && origin != "http://"+r.Host) || r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		sliderCallback := wxSupported && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/wx-slider/") && strings.HasSuffix(r.URL.Path, "/submit") && origin == "null"
+		if !validHost || (!sliderCallback && ((origin != "" && origin != "http://"+r.Host) || r.Header.Get("Sec-Fetch-Site") == "cross-site")) {
 			http.Error(w, "请直接通过 Agent 的 IP 地址打开设置页面", http.StatusForbidden)
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if !ok || subtle.ConstantTimeCompare([]byte(token), []byte(secret)) != 1 {
-				if lan {
-					respond(w, http.StatusUnauthorized, map[string]any{"error": "请输入正确的设置密码", "passwordRequired": true})
+			token, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			passwordOK := bearer && subtle.ConstantTimeCompare([]byte(token), []byte(secret)) == 1
+			login := sessionLogin && r.Method == http.MethodPost && r.URL.Path == "/api/settings/login"
+			if !passwordOK && (!bearer || !sessionLogin || login || !validSettingsSession(secret, token, time.Now())) {
+				if passwordSettings {
+					respond(w, http.StatusUnauthorized, map[string]any{"error": "请输入正确的设置密码", "passwordRequired": true, "sessionLogin": sessionLogin})
 				} else {
 					http.Error(w, "请从托盘重新打开设置页面", http.StatusUnauthorized)
 				}
+				return
+			}
+			if login {
+				expiresAt := time.Now().Add(settingsSessionLifetime)
+				respond(w, http.StatusOK, map[string]string{"sessionToken": signSettingsSession(secret, expiresAt.Unix())})
 				return
 			}
 		}
@@ -229,7 +270,7 @@ func (h *Host) snapshot() map[string]any {
 			}
 		}
 	}
-	return map[string]any{"server": server, "enrollmentKeySet": keySet, "updatePending": pending, "updateStatus": updateStatus, "updateMode": h.updateMode(), "status": status, "state": connection.State, "error": connection.Error, "lastConnectedAt": connection.LastConnectedAt, "nextRetryAt": connection.NextRetryAt, "version": release.VersionName, "packaged": installation.IsPackaged(), "wxSupported": wxSupported}
+	return map[string]any{"server": server, "enrollmentKeySet": keySet, "updatePending": pending, "updateStatus": updateStatus, "updateMode": h.updateMode(), "status": status, "state": connection.State, "error": connection.Error, "lastConnectedAt": connection.LastConnectedAt, "nextRetryAt": connection.NextRetryAt, "version": release.VersionName, "packaged": installation.IsPackaged(), "wxSupported": wxSupported, "oneBotSupported": oneBotSupported}
 }
 
 func (h *Host) settings(w http.ResponseWriter, r *http.Request) {

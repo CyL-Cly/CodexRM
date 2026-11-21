@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -16,8 +17,9 @@ import (
 // Queues live beside Codex, so closing a browser or losing the relay does not
 // prevent the next message from starting. They end with this app-server session.
 type queuedMessage struct {
-	ID, Owner string
-	Params    map[string]any
+	ID, Owner      string
+	Params         map[string]any
+	outcomeUnknown bool
 }
 
 type messageQueue struct {
@@ -34,6 +36,7 @@ type messageQueue struct {
 	ActiveTurn    string
 	LastCompleted string
 	Starting      bool
+	ObservedStart string
 	Paused        bool
 	Error         string
 	Version       uint64
@@ -131,6 +134,12 @@ func (a *Agent) queueRPC(ctx context.Context, app *appserver.Client, owner, meth
 	if method != "codexrm/queue/list" && method != "codexrm/queue/add" && method != "codexrm/queue/remove" && method != "codexrm/queue/resume" {
 		return nil, fmt.Errorf("unknown queue method: %s", method)
 	}
+	if method == "codexrm/queue/add" {
+		// Do not enqueue a message while its thread is switching providers.
+		q := a.threadQueue(threadID)
+		q.RPCMu.Lock()
+		defer q.RPCMu.Unlock()
+	}
 	if method == "codexrm/queue/add" || method == "codexrm/queue/resume" {
 		if err := a.ensureQueue(ctx, app, threadID); err != nil {
 			return nil, err
@@ -173,6 +182,10 @@ func (a *Agent) queueRPC(ctx context.Context, app *appserver.Client, owner, meth
 		}
 		q.Entries = append(q.Entries[:index], q.Entries[index+1:]...)
 	case "codexrm/queue/resume":
+		if len(q.Entries) > 0 && q.Entries[0].outcomeUnknown {
+			a.queueMu.Unlock()
+			return nil, fmt.Errorf("上一条消息是否已执行无法确认。请检查会话历史，移除该条消息后再继续排队")
+		}
 		q.Paused = false
 		q.Error = ""
 	}
@@ -221,6 +234,9 @@ func (a *Agent) queueNotification(ctx context.Context, app *appserver.Client, ra
 	case "turn/started":
 		q.Known = true
 		q.ActiveTurn = event.Params.Turn.ID
+		if q.Starting {
+			q.ObservedStart = event.Params.Turn.ID
+		}
 	case "turn/completed":
 		q.Known = true
 		q.LastCompleted = event.Params.Turn.ID
@@ -323,6 +339,7 @@ func (a *Agent) drainQueue(ctx context.Context, app *appserver.Client, threadID 
 	}
 	entry := q.Entries[0]
 	q.Starting = true
+	q.ObservedStart = ""
 	q.Version++
 	view := a.queueViewLocked(threadID)
 	a.queueMu.Unlock()
@@ -346,9 +363,20 @@ func (a *Agent) drainQueue(ctx context.Context, app *appserver.Client, threadID 
 		return
 	}
 	q.Starting = false
+	observed := q.ObservedStart
+	q.ObservedStart = ""
+	var rejected *appserver.RPCError
+	if err != nil && !errors.As(err, &rejected) && observed != "" {
+		result.Turn.ID = observed
+		err = nil
+	}
 	if err != nil {
 		q.Paused = true
+		entry.outcomeUnknown = !errors.As(err, &rejected)
 		q.Error = err.Error()
+		if entry.outcomeUnknown {
+			q.Error = "发送结果未知。请检查会话历史，移除该条消息后再继续排队"
+		}
 	} else {
 		q.Entries = q.Entries[1:]
 		if q.LastCompleted != result.Turn.ID {

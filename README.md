@@ -83,13 +83,19 @@ Windows Agent 直接在系统托盘运行，不依赖 PowerShell。全新安装�
 
 ## Linux 无桌面设置
 
-启动 `codexrm-agent` 后，设置页默认只监听 `127.0.0.1`，不会暴露到局域网；这适合通过 SSH 端口转发或本机浏览器访问。首次由系统分配一个空闲端口，生成随机访问凭证，URL 中的 `#...` 片段仅保存在本机，随启动日志输出。重启会复用同一端口和凭证。用 SSH 隧道时可执行 `ssh -L 8080:127.0.0.1:<port> user@host`，再在本机浏览器打开 `http://127.0.0.1:8080/`。
+以 `--loopback-settings` 启动 `codexrm-agent` 后，设置页只监听 `127.0.0.1`，端口和登录密码保存在连接配置相邻的 `settings-access.json`，重启时复用。用 `ssh -N -L 127.0.0.1:<port>:127.0.0.1:<port> user@host` 转发设置页，再在浏览器打开 `http://127.0.0.1:<port>/` 并输入密码。未指定设置模式时，Agent 每次启动使用临时回环端口和随机会话凭据。
 
 确需从可信局域网直接访问时，显式传入 `--lan-settings`。此模式会把端口和随机密码保存到 `connection.json` 同目录的 `settings-access.json`（权限 `0600`），默认位置是 `~/.config/CodexRM/.state/settings-access.json`，如从安装目录的 `bin/` 启动则使用安装目录中的 `.state/`，也可通过 `--config` 指定连接配置路径。启动日志会显示端口和配置文件路径，在浏览器中用 `http://<Agent 的局域网 IP>:<port>/` 打开并输入文件中的 `password`。重启继续使用同一端口和密码，端口被占用时启动会报错。
 
 设置页使用 HTTP；LAN 模式请通过防火墙把端口限制在可信局域网内，并优先使用 SSH 隧道，避免在不可信网络中传输密码、连接密钥和配对码。可用 `--restart` 通知同配置目录的旧实例退出，或 `--settings` 打开已有实例的设置页。
 
 Linux amd64 的独立 Agent 包支持自动更新，也可以在设置页点击“检查更新”。运行账号需要拥有 Agent 二进制并能写入其所在目录。详见 [Linux Agent 自更新](docs/updates.md#linux-agent-自更新)。
+
+### Linux OneBot 11 机器人
+
+Linux Agent 设置页的「QQ 机器人 → OneBot 11」可直接连接 NapCat、LLOneBot、Lagrange.OneBot 等协议端，支持反向/正向 WebSocket、HTTP API + POST 事件、私聊与群聊、CQ/数组消息、图片、回复上下文和持久 Codex 会话。私聊按 QQ 授权，群聊支持仅 @ 或全部消息、全群共享或成员独立会话及管理员控制。OneBot 事件在本机 Agent 内处理，不经过 CodexRM 中继。
+
+连接、权限、图片安全、聊天命令和联机验收见 [Linux Agent · OneBot 11](docs/linux-onebot.md)。当前适配目标是 OneBot 11，不是 OneBot 12。
 
 ## 其他 Windows 电脑安装
 
@@ -133,13 +139,13 @@ CodexRM 创建或恢复会话时会启用 Codex CLI 普通模式的提问功能�
 
 ## 供应商与模型
 
-Agent 默认只读本机 `~/.cc-switch/cc-switch.db` 中的 Codex 供应商，在输入框下方按供应商分组显示模型。每组分别请求自己的 `/models` 接口，并合并 CCSwitch 保存的模型与思考强度；在线查询失败时继续显示已保存的模型。官方组使用 CCSwitch 的 `codex-official-models.json` 缓存，实际对话仍需本机可用的官方登录。
+在 Windows 或 Linux 的 Agent 设置中打开「模型供应商 → 管理供应商」，即可配置支持 OpenAI Responses API 的第三方接入地址、API Key 和默认模型。配置保存在本机 Agent，Android 和网页连接这台电脑后可选择这些供应商与模型。使用 Codex 官方账号时，在电脑端 Codex 登录。
 
-点击模型旁的刷新按钮重新读取供应商和模型。不同工作区会分别记住模型及思考强度，选择保存在此浏览器中，并按设备、目录区分。同一供应商可以在已有会话中换模型；切换供应商会回到新会话，原会话保留在历史列表中。
+Agent 从供应商的 `/models` 接口获取模型。可以手动添加模型，也可以移除或恢复模型。移除项以删除线显示在管理列表底部，并从对话的模型菜单中隐藏。返回时一次性保存模型改动，后续刷新仍会更新上游列表并应用黑名单。
 
-每个会话向 Codex app-server 注入独立的供应商标识和连接设置，恢复历史时根据会话保存的标识读取原供应商。Agent 数据目录的 `thread-models.json` 仅保存会话的供应商标识、模型与思考强度；旧会话会从本地历史恢复最后使用的模型。密钥仅在本机 Agent 与 app-server 之间传递，网页只接收供应商和模型元数据，不修改 CCSwitch 当前选择、数据库或全局 Codex 配置。CCSwitch 中移除供应商后，对应会话会明确提示配置缺失。
+已有 CC Switch 配置可通过「从 CC Switch 导入」复制第三方供应商，并保留会话和模型黑名单的关联。重复导入只补充尚未导入的供应商。官方账号仍由本机 Codex 管理。
 
-如数据库不在默认位置，可设置 `CODEXRM_CCSWITCH_DB`，或传入 `--ccswitch-db <绝对路径>`。未安装 CCSwitch、模拟模式及连接外部 app-server 时，仍可使用当前 Codex 配置的模型。
+网页和 Android 可以在原会话更换模型。第三方供应商的会话空闲时，也可以切换到另一第三方接入点，沿用已有历史。Agent 恢复会话时从本机读取对应连接配置，客户端的供应商详情不会返回已保存的 API Key。
 
 ## 构建与测试
 

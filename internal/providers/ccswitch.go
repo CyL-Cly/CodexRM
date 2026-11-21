@@ -58,10 +58,16 @@ func (p Provider) RuntimeID() string {
 
 // Overrides are sent over local app-server stdin, never written into global config.
 func (p Provider) Overrides() map[string]any {
+	return p.OverridesFor(p.RuntimeID())
+}
+
+// OverridesFor allows an existing thread to keep its persisted provider ID
+// while using another CCSwitch endpoint's connection settings.
+func (p Provider) OverridesFor(runtimeID string) map[string]any {
 	if p.builtin != "" {
 		return nil
 	}
-	return map[string]any{"model_providers." + p.ID: p.config}
+	return map[string]any{"model_providers." + runtimeID: p.config}
 }
 
 func (p Provider) Official() bool { return p.builtin == "openai" }
@@ -69,6 +75,19 @@ func (p Provider) Official() bool { return p.builtin == "openai" }
 func DefaultPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".cc-switch", "cc-switch.db")
+}
+
+func openCCSwitch(path, mode string) (*sql.DB, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	uriPath := filepath.ToSlash(abs)
+	if !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	u := url.URL{Scheme: "file", Path: uriPath, RawQuery: "mode=" + mode + "&_pragma=busy_timeout(3000)"}
+	return sql.Open("sqlite", u.String())
 }
 
 func Load(ctx context.Context, path string) ([]Provider, error) {
@@ -80,16 +99,7 @@ func Load(ctx context.Context, path string) ([]Provider, error) {
 	} else if err != nil {
 		return nil, fmt.Errorf("无法读取 CCSwitch 数据库")
 	}
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return nil, err
-	}
-	uriPath := filepath.ToSlash(abs)
-	if !strings.HasPrefix(uriPath, "/") {
-		uriPath = "/" + uriPath
-	}
-	u := url.URL{Scheme: "file", Path: uriPath, RawQuery: "mode=ro&_pragma=busy_timeout(3000)"}
-	db, err := sql.Open("sqlite", u.String())
+	db, err := openCCSwitch(path, "ro")
 	if err != nil {
 		return nil, fmt.Errorf("无法打开 CCSwitch 数据库")
 	}
@@ -112,7 +122,7 @@ func Load(ctx context.Context, path string) ([]Provider, error) {
 		}
 		p.Notes = strings.TrimSpace(notes)
 		if p.Official() {
-			cached := officialModels(filepath.Join(filepath.Dir(abs), "codex-official-models.json"))
+			cached := officialModels(filepath.Join(filepath.Dir(path), "codex-official-models.json"))
 			if len(cached) > 0 {
 				indices := map[string]int{}
 				for i, model := range p.Models {
@@ -156,24 +166,31 @@ type codexConfig struct {
 // CurrentProviderID identifies a saved provider whose connection settings match
 // the local Codex configuration. Model names alone do not identify a provider.
 func CurrentProviderID(items []Provider, dbPath string) string {
+	id, _ := CurrentProvider(items, dbPath)
+	return id
+}
+
+// CurrentProvider returns the matching CCSwitch ID and the active custom
+// provider ID in Codex's own configuration. Built-in providers have no custom ID.
+func CurrentProvider(items []Provider, dbPath string) (id, customRuntimeID string) {
 	if len(items) == 0 {
-		return ""
+		return "", ""
 	}
 	home := os.Getenv("CODEX_HOME")
 	if home == "" {
 		userHome, err := os.UserHomeDir()
 		if err != nil {
-			return ""
+			return "", ""
 		}
 		home = filepath.Join(userHome, ".codex")
 	}
 	data, err := os.ReadFile(filepath.Join(home, "config.toml"))
 	if err != nil && !os.IsNotExist(err) {
-		return ""
+		return "", ""
 	}
 	var cfg codexConfig
 	if toml.Unmarshal(data, &cfg) != nil {
-		return ""
+		return "", ""
 	}
 	live := cfg.Providers[cfg.Provider]
 	if len(live) > 0 && live["experimental_bearer_token"] == nil && live["requires_openai_auth"] == true && live["env_key"] == nil {
@@ -206,16 +223,24 @@ func CurrentProviderID(items []Provider, dbPath string) string {
 		}
 		if same {
 			if p.ID == preferred {
-				return p.ID
+				return p.ID, customProviderRuntime(cfg)
 			}
 			matched = p.ID
 			matches++
 		}
 	}
 	if matches == 1 {
-		return matched
+		return matched, customProviderRuntime(cfg)
 	}
-	return ""
+	return "", ""
+}
+
+func customProviderRuntime(cfg codexConfig) string {
+	switch cfg.Provider {
+	case "", "openai", "ollama", "lmstudio":
+		return ""
+	}
+	return cfg.Provider
 }
 
 func providerID(id string) string {

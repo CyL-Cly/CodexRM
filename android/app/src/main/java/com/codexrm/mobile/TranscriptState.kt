@@ -14,8 +14,14 @@ internal object TurnRenderer {
     fun messages(turn: JSONObject, readOnly: Boolean): List<ChatMessage> {
         val result = ArrayList<ChatMessage>()
         val items = turn.arrayAt("items")
+        val turnId = turn.string("id")
         for (index in 0 until items.length()) {
-            items.optJSONObject(index)?.let { result += ProtocolFormatter.fromItem(it) }
+            val item = items.optJSONObject(index) ?: continue
+            // Overlapping pages must recognize the same id-less item even when the
+            // server resends it in a freshly parsed JSONObject.
+            val stableId = "$turnId:item:$index"
+            if (item.string("id").isEmpty()) item.put("id", stableId)
+            result += ProtocolFormatter.fromItem(item, stableId)
         }
         result += terminalMessages(turn, readOnly)
         return result

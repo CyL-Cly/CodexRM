@@ -39,6 +39,8 @@ class ComposerStateTest {
         assertEquals("original", ComposerText.afterFailedSend("", "original"))
         assertEquals("original\n\nnew input", ComposerText.afterFailedSend("new input", "original"))
         assertEquals("new input", ComposerText.afterFailedSend("new input", ""))
+        // An edit inserted before the submitted text already contains that text.
+        assertEquals("new\noriginal", ComposerText.afterFailedSend("new\noriginal", "original"))
     }
 
     @Test fun queuedDraftPreservesExistingTextAndUploadedAttachments() {

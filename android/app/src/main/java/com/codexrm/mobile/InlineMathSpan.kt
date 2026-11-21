@@ -2,6 +2,7 @@ package com.codexrm.mobile
 
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.RectF
 import io.noties.markwon.core.MarkwonTheme
 import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableSpan
@@ -13,7 +14,12 @@ import kotlin.math.min
 
 /** Keep a formula's TeX baseline aligned with surrounding text, including extra line spacing. */
 internal class InlineMathSpan(theme: MarkwonTheme, drawable: AsyncDrawable) :
-    AsyncDrawableSpan(theme, drawable, ALIGN_BASELINE, false) {
+    AsyncDrawableSpan(theme, drawable, ALIGN_BASELINE, false), HorizontalOverflow {
+    override val viewport = RectF()
+    private var offset = 0f
+    override val scrollRange: Float get() = (drawable.bounds.width() - viewport.width()).coerceAtLeast(0f)
+
+    override fun panBy(distance: Float) { offset = (offset + distance).coerceIn(0f, scrollRange) }
 
     override fun getSize(paint: Paint, text: CharSequence, start: Int, end: Int, fm: Paint.FontMetricsInt?): Int {
         if (!drawable.hasResult()) return super.getSize(paint, text, start, end, fm)
@@ -26,7 +32,8 @@ internal class InlineMathSpan(theme: MarkwonTheme, drawable: AsyncDrawable) :
             fm.top = min(metrics.top, fm.ascent)
             fm.bottom = max(metrics.bottom, fm.descent)
         }
-        return drawable.bounds.width()
+        val width = drawable.bounds.width()
+        return min(width, contentWidth(text).takeIf { it > 0 } ?: width)
     }
 
     override fun draw(canvas: Canvas, text: CharSequence, start: Int, end: Int, x: Float, top: Int, y: Int, bottom: Int, paint: Paint) {
@@ -35,9 +42,16 @@ internal class InlineMathSpan(theme: MarkwonTheme, drawable: AsyncDrawable) :
             super.draw(canvas, text, start, end, x, top, y, bottom, paint)
             return
         }
+        val bounds = drawable.bounds
+        val hostWidth = contentWidth(text)
+        val width = if (hostWidth > 0) min(bounds.width().toFloat(), (hostWidth - x).coerceAtLeast(1f)) else bounds.width().toFloat()
+        val formulaTop = y - baseline(bounds.height())
+        viewport.set(x, formulaTop, x + width, formulaTop + bounds.height())
+        panBy(0f)
         val saved = canvas.save()
         try {
-            canvas.translate(x, y - baseline(drawable.bounds.height()))
+            canvas.clipRect(viewport)
+            canvas.translate(x - offset, formulaTop)
             drawable.draw(canvas)
         } finally {
             canvas.restoreToCount(saved)
