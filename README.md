@@ -53,11 +53,12 @@
 | 用途 | 附件后缀 | 如何使用 |
 | --- | --- | --- |
 | Windows x64 被控电脑 | `windows-amd64-Setup.exe` | 双击安装 Agent，启动后在系统托盘打开设置 |
-| Linux x86-64 | `linux-amd64.tar.gz` | 内含 Server、`web/` 和 Linux Agent，可按需使用 |
-| Linux ARM64 | `linux-arm64.tar.gz` | 内含 Server 和 `web/`，用于 ARM64 中继主机 |
-| Android 手机 | `android-arm64-debug.apk` | 安装测试版客户端，扫描配对二维码 |
+| Linux x86-64 被控电脑 | `linux-amd64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
+| Linux ARM64 被控电脑 | `linux-arm64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
+| Linux x86-64 中继主机 | `linux-amd64-server.tar.gz` | 内含 Server 和 `web/`，见[自行部署](#自行部署) |
+| Android ARM64 手机 | `android-arm64-v8a-release-unsigned.apk` | 签名后安装，再扫描配对二维码 |
 
-Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 使用调试签名，覆盖安装需与已安装版本的签名一致。卸载旧版会清除应用内的配对信息。也可以直接使用手机浏览器。
+Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 提供未签名的 Release APK，可在发布环境用 Android SDK 的 `apksigner` 签名后安装。覆盖安装需要沿用原版本的签名证书。手机也可以直接用浏览器访问。
 
 ### 首次配对和发起任务
 
@@ -94,7 +95,7 @@ Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm6
 
 设置页使用 HTTP；LAN 模式请通过防火墙把端口限制在可信局域网内，并优先使用 SSH 隧道，避免在不可信网络中传输密码、连接密钥和配对码。可用 `--restart` 通知同配置目录的旧实例退出，或 `--settings` 打开已有实例的设置页。
 
-从 Linux amd64 包解压后，以运行 Codex 的普通用户执行 `./codexrm-agent --loopback-settings`，再按上文访问设置页并配对。Linux amd64 Agent 支持在设置页点击“检查更新”。运行账号需要拥有 Agent 二进制并能写入其所在目录。
+从对应架构的 Linux Agent 包解压后，以运行 Codex 的普通用户执行 `./codexrm-agent --loopback-settings`，再按上文访问设置页并配对。Linux amd64 Agent 支持在设置页点击“检查更新”。运行账号需要拥有 Agent 二进制并能写入其所在目录。
 
 ### Linux OneBot 11 机器人
 
@@ -207,13 +208,13 @@ codex app-server --listen ws://127.0.0.1:4500
 
 ## 自行部署
 
-以下示例适用于有 systemd 的 Linux 主机。准备与主机架构匹配的 Server 包，以及已指向主机的域名和 TLS 证书。部署脚本、systemd 单元和 Nginx 示例位于源码仓库。
+以下示例适用于有 systemd 的 Linux 主机。准备 Linux x86-64 Server 包，以及已指向主机的域名和 TLS 证书。部署脚本、systemd 单元和 Nginx 示例位于源码仓库。
 
 ```bash
 git clone https://github.com/CyL-Cly/CodexRM.git
 cd CodexRM
-# 将路径替换为下载的 Linux amd64 或 arm64 包
-archive=/path/to/CodexRM-nightly-…-linux-amd64.tar.gz
+# 将路径替换为下载的 Linux Server 包
+archive=/path/to/CodexRM-nightly-…-linux-amd64-server.tar.gz
 mkdir -p server-package
 tar -xzf "$archive" -C server-package
 sudo bash build/scripts/install-server.sh ./server-package/codexrm-server ./deploy/codexrm.service ./server-package/web

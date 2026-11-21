@@ -117,7 +117,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Package Linux Server for amd64 and arm64
+      - name: Package Linux Agents for amd64 and arm64
         env:
           CGO_ENABLED: 0
           GOOS: linux
@@ -125,18 +125,26 @@ jobs:
           out="$PWD/nightly-dist"
           mkdir -p "$out"
           for arch in amd64 arm64; do
-            linux="$RUNNER_TEMP/codexrm-linux-$arch"
-            mkdir -p "$linux"
-            GOARCH="$arch" go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-server" ./cmd/codexrm-server
-            # Keep the Linux Agent in the existing amd64 bundle.
-            if [[ "$arch" == amd64 ]]; then
-              GOARCH="$arch" go build -trimpath -ldflags "-s -w" -o "$linux/codexrm-agent" ./cmd/codexrm-agent
-            fi
-            git archive HEAD web | tar -x -C "$linux"
-            rm -f "$linux/web/app.test.mjs" "$linux/web/sw.test.mjs"
-            cp LICENSE "$linux/"
-            tar -czf "$out/CodexRM-$TAG-linux-$arch.tar.gz" -C "$linux" .
+            agent="$RUNNER_TEMP/codexrm-linux-$arch-agent"
+            mkdir -p "$agent"
+            GOARCH="$arch" go build -trimpath -ldflags "-s -w" -o "$agent/codexrm-agent" ./cmd/codexrm-agent
+            cp LICENSE "$agent/"
+            tar -czf "$out/CodexRM-$TAG-linux-$arch-agent.tar.gz" -C "$agent" .
           done
+
+      - name: Package Linux amd64 Server
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          server="$RUNNER_TEMP/codexrm-linux-amd64-server"
+          mkdir -p "$server"
+          go build -trimpath -ldflags "-s -w" -o "$server/codexrm-server" ./cmd/codexrm-server
+          git archive HEAD web | tar -x -C "$server"
+          rm -f "$server/web/app.test.mjs" "$server/web/sw.test.mjs"
+          cp LICENSE "$server/"
+          tar -czf "nightly-dist/CodexRM-$TAG-linux-amd64-server.tar.gz" -C "$server" .
 
       - uses: actions/setup-java@v6.3.0
         with:
@@ -146,14 +154,14 @@ jobs:
 
       - uses: android-actions/setup-android@v4.0.4
 
-      - name: Package Android arm64
+      - name: Package Android arm64-v8a Release
         run: |
           # Read SDK pins from the selected source commit.
           sdk=$(awk '$1 == "compileSdk" && $2 == "=" {print $3}' android/app/build.gradle.kts)
           ndk=$(awk -F '"' '/^[[:space:]]*ndkVersion[[:space:]]*=/ {print $2}' android/app/build.gradle.kts)
           sdkmanager --install "platforms;android-$sdk" "ndk;$ndk"
-          (cd android && bash gradlew --no-daemon :app:assembleDebug)
-          cp android/app/build/outputs/apk/debug/app-debug.apk "nightly-dist/CodexRM-$TAG-android-arm64-debug.apk"
+          (cd android && bash gradlew --no-daemon :app:assembleRelease)
+          cp android/app/build/outputs/apk/release/app-release-unsigned.apk "nightly-dist/CodexRM-$TAG-android-arm64-v8a-release-unsigned.apk"
 
       - uses: actions/upload-artifact@v7.0.2
         with:
@@ -185,9 +193,10 @@ jobs:
         run: |
           assets=(
             "CodexRM-$TAG-windows-amd64-Setup.exe"
-            "CodexRM-$TAG-linux-amd64.tar.gz"
-            "CodexRM-$TAG-linux-arm64.tar.gz"
-            "CodexRM-$TAG-android-arm64-debug.apk"
+            "CodexRM-$TAG-linux-amd64-agent.tar.gz"
+            "CodexRM-$TAG-linux-arm64-agent.tar.gz"
+            "CodexRM-$TAG-linux-amd64-server.tar.gz"
+            "CodexRM-$TAG-android-arm64-v8a-release-unsigned.apk"
           )
           sha256sum "${assets[@]}" > SHA256SUMS.txt
           assets+=(SHA256SUMS.txt)
@@ -202,5 +211,5 @@ jobs:
             gh release edit "$TAG" --draft=false --prerelease --latest=false
           else
             gh release create "$TAG" "${assets[@]}" --target "$SOURCE_SHA" --title "$TAG" \
-              --prerelease --latest=false --notes "Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation. The Android APK is debug-signed by the runner."
+              --prerelease --latest=false --notes "Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation. The Android arm64-v8a Release APK requires signing before installation."
           fi
