@@ -35,3 +35,7 @@ docs/provider-models-*.md
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Keep only the top-level README under version control
+*.[mM][dD]
+!/README.md

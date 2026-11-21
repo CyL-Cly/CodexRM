@@ -29,9 +29,17 @@ foreach ($relativePath in $files) {
         [IO.File]::WriteAllText($destination, $scriptText, (New-Object Text.UTF8Encoding $true))
     }
 }
-$installGuide = Join-Path (Split-Path -Parent $root) 'docs\windows-install.md'
-if (-not (Test-Path -LiteralPath $installGuide -PathType Leaf)) { $installGuide = Join-Path $root 'docs\windows-install.md' }
-Copy-Item -LiteralPath $installGuide -Destination (Join-Path $stage 'README.md')
+$installGuide = @'
+# CodexRM Agent for Windows
+
+1. Install and sign in to Codex on this PC.
+2. Run CodexRM-Setup.exe and open Settings from the CodexRM tray icon.
+3. Connect to your relay and generate a pairing code.
+4. Open the same relay in a browser and enter the code, or scan the QR code with the Android app.
+
+Full setup guide: https://github.com/CyL-Cly/CodexRM#readme
+'@
+[IO.File]::WriteAllText((Join-Path $stage 'README.md'), $installGuide, [Text.UTF8Encoding]::new($false))
 # Old automatic updaters require these ZIP entries. Native installers/updaters
 # only extract the exe; a fresh installation never installs these placeholders.
 $compatScripts = Join-Path $stage 'scripts'

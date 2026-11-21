@@ -45,13 +45,12 @@ try {
     $env:CODEXRM_ENROLL_KEY = $null
     $env:CODEXRM_INSTALL_TEST_ROOT = $testRoot
     $packageRoot = Join-Path $testRoot 'package'
-    foreach ($directory in @('bin', 'scripts', 'docs')) {
+    foreach ($directory in @('bin', 'scripts')) {
         [void][IO.Directory]::CreateDirectory((Join-Path $packageRoot $directory))
     }
     foreach ($file in @('install.cmd', 'scripts\install-client.ps1', 'scripts\client-install.ps1',
-            'scripts\connect.ps1', 'scripts\package-client.ps1', 'docs\windows-install.md')) {
+            'scripts\connect.ps1', 'scripts\package-client.ps1')) {
         $sourceFile = Join-Path $repoRoot $file
-        if ($file -eq 'docs\windows-install.md') { $sourceFile = Join-Path (Split-Path -Parent $repoRoot) $file }
         Copy-Item -LiteralPath $sourceFile -Destination (Join-Path $packageRoot $file)
     }
     $fixtureBinary = Join-Path $packageRoot 'bin\codexrm-agent.exe'

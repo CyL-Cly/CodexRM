@@ -44,33 +44,38 @@
 
 ## 快速开始
 
-需要 Go 1.24+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建；运行前端测试需要 Node.js 22+。
+先在要被远程控制的电脑上安装并登录 Codex 桌面版，或在同一用户账号下配置 Codex CLI。远程操作的一侧只需要浏览器或 Android 客户端。Agent 需要保持运行，电脑休眠或退出 Agent 后，远程端将显示离线。
 
-```powershell
-git clone https://github.com/codexrm/codexrm.git
-cd codexrm
-.\build.bat
-```
+### 选择下载包
 
-Windows 上可双击根目录的 `build.bat`，依次选择 Windows / Linux 和 Agent / Server，也可选择同时构建两者。程序输出到 `build/bin`：Windows 文件为 `codexrm-server.exe`、`codexrm-agent.exe`，Linux amd64 文件带 `-linux-amd64` 后缀。
+从 [GitHub Releases](https://github.com/CyL-Cly/CodexRM/releases) 中打开同一次 Nightly 预发布，按用途选择附件。
 
-也可直接运行 `.\build\scripts\build.ps1`，默认构建 Windows Agent 和 Server；加 `-Linux` 构建 Linux 版本，加 `-Target Agent` 或 `-Target Server` 单独构建。Server 从磁盘 `web/` 目录提供页面，部署时需同时部署二进制与该目录；页面不内嵌至服务端二进制。
+| 用途 | 附件后缀 | 如何使用 |
+| --- | --- | --- |
+| Windows x64 被控电脑 | `windows-amd64-Setup.exe` | 双击安装 Agent，启动后在系统托盘打开设置 |
+| Linux x86-64 | `linux-amd64.tar.gz` | 内含 Server、`web/` 和 Linux Agent，可按需使用 |
+| Linux ARM64 | `linux-arm64.tar.gz` | 内含 Server 和 `web/`，用于 ARM64 中继主机 |
+| Android 手机 | `android-arm64-debug.apk` | 安装测试版客户端，扫描配对二维码 |
 
-启动本地连接器：
+Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 使用调试签名，覆盖安装需与已安装版本的签名一致。卸载旧版会清除应用内的配对信息。也可以直接使用手机浏览器。
 
-```powershell
-.\build\bin\codexrm-agent.exe
-```
+### 首次配对和发起任务
 
-Windows Agent 直接在系统托盘运行，不依赖 PowerShell。全新安装默认连接公共中继 `https://codexrm.ooth.tech`，无需连接授权密钥。右键托盘图标选择 **设置** 可更换服务器和填写该服务器所需的密钥，保存后 Agent 自动重连。设置页可生成配对码、显示二维码、查看和移除已配对设备；更新服务器固定为 `https://codexrm.dagongren.tech/`，不在设置中显示。
+1. 启动 Windows Agent，在系统托盘右键点击 **设置**。默认使用公共中继 `https://codexrm.ooth.tech`。使用自托管中继时，将服务器改成自己的 HTTPS 地址，填入该中继的注册密钥，保存后等待重连。
+2. 等设置页显示服务器已连接，点击 **生成配对码**。配对码有效期 10 分钟，只可使用一次。每台浏览器或手机分别生成一个码。
+3. 在浏览器打开同一个中继地址，输入配对码，也可扫描二维码打开配对链接。在 Android 客户端中可直接扫码，手动输入短码时同时填写中继地址。
+4. 连接设备后，在侧栏 **工作区** 旁点击 **+**，浏览或输入被控电脑上的项目路径，选择 **添加此文件夹**，再为该目录新建会话。
+5. 发送“请说明当前项目结构”。收到流式回复即完成验证。运行中遇到审批或用户输入请求时，先查看会话中的请求内容再决定如何处理。
 
-首次使用按以下五步完成验证：
+### 连接问题
 
-1. 安装并登录 Codex 桌面版，或配置好 Codex CLI，然后启动 Agent。
-2. 在托盘设置页确认服务器状态为“已连接”，点击 **生成配对码**。
-3. 打开中继网页（公共中继为 `https://codexrm.ooth.tech`），扫描二维码或输入一次性配对码。配对失效时直接点击 **重新配对**，本地草稿会保留。
-4. 在侧栏“工作区”旁点击 **+**，选择电脑上的项目目录。
-5. 发送“请说明当前项目结构”。能收到流式回复即完成连接验证；失败时按页面中的连接状态、错误原因和重试按钮处理，不要重复提交未确认的任务。
+| 现象 | 检查方法 |
+| --- | --- |
+| Agent 无法连接或注册 | 检查 HTTPS 地址、证书及注册密钥，确认反向代理支持 WebSocket |
+| 配对码无效 | 确认两端使用同一中继，并在 Agent 设置中生成新的码 |
+| 已配对但设备离线 | 确认被控电脑未休眠、Agent 仍在运行，并检查设置页的连接状态 |
+| 在线但无法开始会话 | 在运行 Agent 的账号下确认 Codex 已登录、项目目录有访问权限，并查看 Agent 日志 |
+| 页面提示发送状态未确认 | 等待重连后同步会话，确认消息是否已经送达，再决定是否重发 |
 
 ```powershell
 .\build\bin\codexrm-agent.exe --settings
@@ -89,17 +94,17 @@ Windows Agent 直接在系统托盘运行，不依赖 PowerShell。全新安装�
 
 设置页使用 HTTP；LAN 模式请通过防火墙把端口限制在可信局域网内，并优先使用 SSH 隧道，避免在不可信网络中传输密码、连接密钥和配对码。可用 `--restart` 通知同配置目录的旧实例退出，或 `--settings` 打开已有实例的设置页。
 
-Linux amd64 的独立 Agent 包支持自动更新，也可以在设置页点击“检查更新”。运行账号需要拥有 Agent 二进制并能写入其所在目录。详见 [Linux Agent 自更新](docs/updates.md#linux-agent-自更新)。
+从 Linux amd64 包解压后，以运行 Codex 的普通用户执行 `./codexrm-agent --loopback-settings`，再按上文访问设置页并配对。Linux amd64 Agent 支持在设置页点击“检查更新”。运行账号需要拥有 Agent 二进制并能写入其所在目录。
 
 ### Linux OneBot 11 机器人
 
 Linux Agent 设置页的「QQ 机器人 → OneBot 11」可直接连接 NapCat、LLOneBot、Lagrange.OneBot 等协议端，支持反向/正向 WebSocket、HTTP API + POST 事件、私聊与群聊、CQ/数组消息、图片、回复上下文和持久 Codex 会话。私聊按 QQ 授权，群聊支持仅 @ 或全部消息、全群共享或成员独立会话及管理员控制。OneBot 事件在本机 Agent 内处理，不经过 CodexRM 中继。
 
-连接、权限、图片安全、聊天命令和联机验收见 [Linux Agent · OneBot 11](docs/linux-onebot.md)。当前适配目标是 OneBot 11，不是 OneBot 12。
+在设置页选择与协议端一致的连接方式，填写地址和协议端配置的访问令牌，保存后先用已授权账号发一条私聊验证。群聊可单独配置授权与触发条件。适配版本为 OneBot 11。
 
 ## 其他 Windows 电脑安装
 
-需要在 Windows“已安装的应用”中使用 **移动** 更换安装磁盘时，使用原生 **MSIX 版 CodexRM Agent**，参见 [MSIX 安装与跨盘移动](docs/windows-msix.md)。可运行 `.\build\scripts\package-msix.ps1` 构建；MSIX 由 Windows 管理安装、移动、更新和卸载。
+需要在 Windows“已安装的应用”中使用 **移动** 更换安装磁盘时，使用原生 **MSIX 版 CodexRM Agent**。安装受本机信任的签名包后，在 **设置 → 应用 → 已安装的应用 → CodexRM Agent → 移动** 中选择磁盘。可运行 `.\build\scripts\package-msix.ps1` 构建；MSIX 由 Windows 管理安装、移动、更新和卸载。
 
 双击 `CodexRM-Setup.exe` 即可打开安装向导。安装器内置 Agent，支持自定义目录和离线安装。首次启动后，可从本机设置页生成配对码或改用自托管服务器。
 
@@ -112,9 +117,9 @@ Linux Agent 设置页的「QQ 机器人 → OneBot 11」可直接连接 NapCat�
 .\build\scripts\package-setup.ps1
 ```
 
-安装器输出到 `build/dist`。详见 [Windows 安装说明](docs/windows-install.md)。
+安装器输出到 `build/dist`。
 
-已安装的 Windows EXE 客户端每次启动立即检查更新，之后每 20 小时检查固定更新服务器的 `update.json`，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。详见 [自动更新与发布](docs/updates.md)。
+已安装的 Windows EXE 客户端每次启动立即检查更新，之后每 20 小时检查固定更新服务器的 `update.json`，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。
 
 ## 多工作区
 
@@ -202,22 +207,26 @@ codex app-server --listen ws://127.0.0.1:4500
 
 ## 自行部署
 
+以下示例适用于有 systemd 的 Linux 主机。准备与主机架构匹配的 Server 包，以及已指向主机的域名和 TLS 证书。部署脚本、systemd 单元和 Nginx 示例位于源码仓库。
+
 ```bash
-# 在 Linux 上构建，或上传 Windows 交叉编译的 Linux 二进制
-go build -trimpath -ldflags '-s -w' -o codexrm-server ./cmd/codexrm-server
-sudo bash build/scripts/install-server.sh ./codexrm-server ./deploy/codexrm.service ./web
-sudo systemctl status codexrm
-sudo journalctl -u codexrm -n 50 --no-pager
+git clone https://github.com/CyL-Cly/CodexRM.git
+cd CodexRM
+# 将路径替换为下载的 Linux amd64 或 arm64 包
+archive=/path/to/CodexRM-nightly-…-linux-amd64.tar.gz
+mkdir -p server-package
+tar -xzf "$archive" -C server-package
+sudo bash build/scripts/install-server.sh ./server-package/codexrm-server ./deploy/codexrm.service ./server-package/web
+curl -fsS http://127.0.0.1:18080/api/v1/health
 ```
 
-安装脚本生成 `/opt/codexrm/server.env`，权限为 `0600`，里面的 `CODEXRM_ENROLL_KEY` 用于注册设备。将相同值设置到本地 Agent 的环境变量：
+从源码部署时，可用 `CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o codexrm-server ./cmd/codexrm-server` 构建当前 Linux 架构，再将二进制和仓库的 `web/` 分别传给同一个安装脚本。源码构建需要 Go 1.24 或更高版本。
 
-```powershell
-$env:CODEXRM_ENROLL_KEY = '<服务器注册密钥>'
-.\build\bin\codexrm-agent.exe --server https://your-server.example --cwd D:\projects\my-project
-```
+1. 将 `deploy/nginx-location.conf` 中的代理配置合入中继域名的 TLS `server` 块，保留 WebSocket 升级请求头。运行 `sudo nginx -t`，通过后执行 `sudo systemctl reload nginx`。
+2. 从客户端网络访问 `https://你的中继域名/api/v1/health`，确认返回 `ok: true`。若本机健康检查失败，用 `sudo systemctl status codexrm` 和 `sudo journalctl -u codexrm -n 50 --no-pager` 排查服务。
+3. 从服务器上的 `/opt/codexrm/server.env` 私下读取 `CODEXRM_ENROLL_KEY`，在 Agent 设置中填入中继的 HTTPS 地址和该密钥。服务器地址和注册密钥保存后，按上面的流程生成浏览器或 Android 配对码。
 
-将 `deploy/nginx-location.conf` 中的代理规则合入已有 TLS 站点。服务进程使用专用 `codexrm` 用户，状态目录为 `/opt/codexrm/data`，页面目录为 `/opt/codexrm/web`。后续更新页面只需将本地 `web/` 同步到该目录并刷新浏览器，不需要重新上传二进制或重启服务。前端引用统一携带 `?v=YYYYMMDD` 日期版本，发布页面时应同步更新 `index.html`、`manifest.webmanifest`、`sw.js` 中的版本号。如需直接监听公网端口，自行设置 `--addr :18080`；已部署实例通过 HTTPS 域名访问。
+服务监听 `127.0.0.1:18080`，程序位于 `/opt/codexrm/bin`，页面位于 `/opt/codexrm/web`，持久化状态位于 `/opt/codexrm/data`。升级前备份状态目录和权限为 `0600` 的 `server.env`。解压新版本后再次运行安装脚本即可更新二进制和页面并重启服务，脚本沿用已有注册密钥。注册密钥、设备 token 和配对码均应按凭证保管。
 
 注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取专属 token。服务器记录配对设备的最近连接时间及 IP，Agent 设置页可查看；在线心跳持续更新时间。服务器启动时及每分钟清理超过 7 天未连接的设备授权，持续在线的设备保留；升级前缺少连接记录的设备给予一次性的 7 天宽限，重启不会延长。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查和设备间路由隔离。可在 Agent 设置的“已配对设备管理”中删除授权，删除后立即失效并需要重新配对。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
 
@@ -254,7 +263,7 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | `GET /api/v1/client/ws` | 浏览器 WebSocket |
 | `GET /api/v1/agents` | 返回浏览器已授权的设备 |
 
-更新服务器只发布更新清单。客户端按清单中的 `downloadUrl` 从外部存储下载对应平台的 ZIP 或 APK。项目的发布脚本使用 Cloudreve，自托管时也可使用 OSS、EOS 等对象存储。详见 [客户端更新与发布](docs/updates.md)。
+更新服务器只发布更新清单。客户端按清单中的 `downloadUrl` 从外部存储下载对应平台的 ZIP 或 APK。项目的发布脚本使用 Cloudreve，自托管时也可使用 OSS、EOS 等对象存储。自托管时将清单放在 Server 数据目录的 `updates/` 下，并填写与发布文件对应的版本、下载地址、文件大小和 SHA-256。
 
 普通请求通过 `Authorization: Bearer <token>` 认证。浏览器 WebSocket 使用 `codexrm` 和 `codexrm.token.<token>` 子协议传递凭据，避免 token 出现在 URL 及普通访问日志中。中继的 `message` 包含 Codex JSON-RPC；`codexrm/info` 是 Agent 提供的运行状态接口。请求 ID 在 Agent 内映射，支持多个浏览器各自从相同 ID 开始发送请求。
 
@@ -262,7 +271,7 @@ Agent 还提供 `codexrm/workspace/list`、`codexrm/workspace/add`、`codexrm/wo
 
 ## 贡献与安全
 
-欢迎通过 Issue 和 Pull Request 参与，请先阅读[贡献指南](CONTRIBUTING.md)和[行为准则](CODE_OF_CONDUCT.md)。安全漏洞请按照[安全政策](SECURITY.md)私密报告，不要公开披露凭据或未修复的漏洞细节。
+欢迎通过 Issue 和 Pull Request 参与。安全漏洞请使用 GitHub 仓库的私密漏洞报告渠道，避免公开凭据或未修复的漏洞细节。仓库只跟踪根目录的 `README.md`，其余 Markdown 文档保存在本地。
 
 ## 许可证
 
