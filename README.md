@@ -253,6 +253,31 @@ sudo bash build/scripts/install-server.sh /path/to/server-package/codexrm-server
 
 注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取专属 token。服务器记录配对设备的最近连接时间及 IP，Agent 设置页可查看；在线心跳持续更新时间。服务器启动时及每分钟清理超过 7 天未连接的设备授权，持续在线的设备保留；升级前缺少连接记录的设备给予一次性的 7 天宽限，重启不会延长。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查和设备间路由隔离。可在 Agent 设置的“已配对设备管理”中删除授权，删除后立即失效并需要重新配对。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
 
+### Server 版本和自动更新
+
+Server 独立于 Windows、Android 和 Linux Agent 维护版本。运行 `/opt/codexrm/bin/codexrm-server --version`，或查看 `/api/v1/health` 的 `serverVersionName`、`serverVersionCode`。原有 `version` 字段仍是协议版本。`/server-update.json` 是**可用更新**的清单，不一定等于正在运行的版本；没有发布时返回 404。
+
+带 `codexrm-server-updater` 的 Server 安装包首次安装时会启用 systemd 定时器。此前已安装的主机需要手动用新安装包执行一次 `sudo bash install-server.sh`，才能启用自动更新；已有更新设置不会被覆盖。支持本节的 Linux x86-64 `codexrm.service` 安装方式，其他部署方式继续手动更新。
+
+默认每天 **03:00（`Asia/Singapore`，UTC+8）**检查并安装更高版本。编辑 `/etc/codexrm/server-update.env` 即可修改，下次定时检查时生效，不需要重启中继：
+
+```ini
+CODEXRM_SERVER_AUTO_UPDATE=true
+CODEXRM_SERVER_UPDATE_CRON="0 3 * * *"
+CODEXRM_SERVER_UPDATE_TZ=Asia/Singapore
+# 可选：换成自己信任并控制的 HTTPS Server 更新源
+# CODEXRM_SERVER_UPDATE_URL=https://releases.example.com/server-update.json
+```
+
+- 关闭自动更新：设置 `CODEXRM_SERVER_AUTO_UPDATE=false`。也可运行 `sudo systemctl disable --now codexrm-server-update.timer` 停止定时器；要恢复，设置为 `true`，再运行 `sudo systemctl enable --now codexrm-server-update.timer`。
+- Cron 使用五字段：分、时、日、月、星期。例：`"30 4 * * MON-FRI"` 表示工作日 04:30；`"0 3 * * SUN"` 表示每周日 03:00。`CODEXRM_SERVER_UPDATE_TZ` 支持 IANA 时区名。机器关机或定时器关闭时错过的检查不补跑。
+- 默认清单源为 `https://codexrm.dagongren.tech/server-update.json`。清单和下载都要求 HTTPS，安装前核对大小与 SHA-256。只信任管理员控制的更新源；不要把 Server 清单交给中继账户或其他非发布人员写入。
+- 更新会一起替换 Server 程序和 Web 前端并重启中继，现有 WebSocket 会短暂断开。新版本启动失败或健康接口版本不匹配时，会尝试恢复旧程序和页面。更新器不替换 `server.env`、`data/` 或 systemd 中继配置；升级前仍建议备份。查看更新日志：`sudo journalctl -u codexrm-server-update.service -n 50 --no-pager`。
+
+**发布 Server 更新（Windows 构建机）**：首次用 `build\release-server.cmd nopause` 构建。后续发布前分别修改 `internal/release/server.go` 的 `ServerVersionName` 并递增 `ServerVersionCode`，不要重复使用已发布的版本号。输出在 `build/dist/`，其中 `.tar.gz` 是手动安装包，`.zip` 是自动更新包，`server-update.json` 是清单。使用 `build\release-server.cmd nopause -Publish` 构建并通过现有的 Cloudreve/RM 配置发布，失败可用 `-PublishOnly` 重试原包。首发前须先手动安装支持该接口的 Server。发布更新清单不会立即重启中继。
+
+若自行托管清单，把 ZIP 上传到 HTTPS 存储，填写清单的 `downloadUrl`，再由管理员原子替换 `/opt/codexrm/server-updates/server-update.json`（目录 `root:root`、权限 `0755`，清单 `root:root`、权限 `0644`）。这是和 Agent 清单分开的目录；不要放入 `data/updates/`。
+
 ### Android NAT 诊断
 
 在 Android 顶栏点击连接图标 →「诊断」，可同时测手机和已配对 Agent 的 IPv4 UDP 路径，即使业务走 RM 中继也能测。RFC 3489 显示传统类型，RFC 5780 分开显示映射和过滤行为。多个配置端点以独立 UDP socket 测试，先获得完整分类的可用端点胜出；不会把不同端点的映射与过滤拼成一份结果。「不支持」和「未响应」不是 NAT 类型，也不能证明无法直连。
@@ -290,6 +315,7 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | `GET /update.json` | Windows 客户端自动更新清单 |
 | `GET /android-update.json` | Android 客户端手动更新清单 |
 | `GET /linux-update.json` | Linux amd64 Agent 更新清单 |
+| `GET /server-update.json` | Linux x86-64 Server 自动更新清单 |
 | `POST /api/v1/agent/enroll` | 注册/续期，远程注册需 `X-Enrollment-Key` |
 | `POST /api/v1/agent/pair` | Agent 生成配对码 |
 | `GET /api/v1/agent/pair/status` | 查询配对状态，需 Agent token |

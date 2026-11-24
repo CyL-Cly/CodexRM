@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/codexrm/codexrm/internal/p2p"
+	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/server"
 )
 
@@ -23,6 +24,8 @@ func main() {
 	dataDir := flag.String("data", defaultDataDir(), "data directory")
 	webDir := flag.String("web", "web", "static UI directory served from disk")
 	updateDir := flag.String("updates", "", "client release directory (default: <data>/updates)")
+	serverUpdateDir := flag.String("server-updates", "server-updates", "directory for the Server release manifest (keep publisher-owned and separate from client updates)")
+	version := flag.Bool("version", false, "print the Server release version and exit")
 	enrollKey := flag.String("enroll-key", os.Getenv("CODEXRM_ENROLL_KEY"), "key required to register remote agents")
 	publicEnrollment := flag.Bool("public-enrollment", false, "allow agent registration without a shared key")
 	stun := flag.String("p2p-stun", os.Getenv("CODEXRM_P2P_STUN"), "comma-separated IPv4:port or [IPv6]:port STUN endpoints; empty disables public P2P")
@@ -36,6 +39,10 @@ func main() {
 	verifyOnly := flag.Bool("p2p-verify-only", false, "serve only the UDP verifier using the shared key file")
 	trustProxy := flag.Bool("p2p-trust-loopback-proxy", false, "trust X-Real-IP and X-Forwarded-Proto from a local TLS reverse proxy")
 	flag.Parse()
+	if *version {
+		fmt.Printf("CodexRM Server %s (code %d)\n", release.ServerVersionName, release.ServerVersionCode)
+		return
+	}
 	if *natCheck {
 		if *verifyOnly {
 			log.Fatal("--check-nat-stun and --p2p-verify-only are mutually exclusive")
@@ -76,6 +83,7 @@ func main() {
 		AdminToken:       *enrollKey,
 		PublicEnrollment: *publicEnrollment,
 		UpdateDir:        *updateDir,
+		ServerUpdateDir:  *serverUpdateDir,
 		P2PSTUN:          *stun,
 		P2PNATSTUN:       *natSTUN,
 		P2PLAN:           *lan,
@@ -88,7 +96,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("CodexRM server listening on %s", *addr)
+	log.Printf("CodexRM Server %s (code %d) listening on %s", release.ServerVersionName, release.ServerVersionCode, *addr)
 	log.Printf("web UI: %s", absWeb)
 	httpServer := newHTTPServer(*addr, srv.Handler())
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

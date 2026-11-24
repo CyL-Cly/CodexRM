@@ -12,7 +12,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "build/publish.config.json", "private Cloudreve configuration")
-	archive := flag.String("package", "", "Windows ZIP or Android APK package")
+	archive := flag.String("package", "", "release ZIP or APK package")
 	manifest := flag.String("manifest", "build/dist/update.json", "package update manifest")
 	flag.Parse()
 	data, err := os.ReadFile(*configPath)

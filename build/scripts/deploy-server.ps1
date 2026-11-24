@@ -26,7 +26,7 @@ $sshOptions = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10')
 if ($LASTEXITCODE) { throw 'Could not prepare the RM Server binary directory.' }
 & scp @sshOptions -q $Binary "${sshTarget}:$remoteStage"
 if ($LASTEXITCODE) { throw 'Could not upload the RM Server binary. The running Server was not changed.' }
-$activate = "chmod 0755 '$remoteStage' && " +
+$activate = "exec 9>'$installDir/.install.lock'; flock -x -w 20 9 && chmod 0755 '$remoteStage' && " +
     "{ test ! -f '$target' || cp -p '$target' '$previous'; } && " +
     "mv -f '$remoteStage' '$target' && systemctl restart '$service' && systemctl is-active --quiet '$service'"
 & ssh @sshOptions $sshTarget $activate
