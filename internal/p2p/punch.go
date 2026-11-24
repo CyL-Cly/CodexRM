@@ -168,18 +168,14 @@ func (s *Session) plans(order []int, targets []netip.AddrPort, hints map[netip.A
 		}
 		for _, g := range groups {
 			addrs := grouped[g]
+			st := punchStrategyFor(s.localHint(socket), g.hint.Mapping, !s.disableFullPunch, s.agent || s.dualNATPunch)
 			var expanded []netip.AddrPort
-			switch g.hint.Mapping {
-			case protocol.P2PMappingStable:
-				continue
-			case protocol.P2PMappingLinear:
+			if st.Predict {
 				expanded = predictedTargets(addrs, g.hint.Step)
-			default:
+			}
+			if st.Spray {
 				// Share the probing budget across source sockets and remote paths.
-				// New peers can guess when either side advertises an unstable map.
-				if s.agent || (s.dualNATPunch && g.hint.Mapping == protocol.P2PMappingVaries) {
-					expanded = expandedTargets(addrs, 0, len(addrs)+max(1, budget/(len(groups)*len(order))))
-				}
+				expanded = append(expanded, expandedTargets(addrs, 0, len(addrs)+max(1, budget/(len(groups)*len(order))))...)
 			}
 			if len(expanded) == 0 {
 				continue
@@ -257,6 +253,9 @@ func (s *Session) punchPaths(ctx context.Context, targets, local []netip.AddrPor
 			}
 		}()
 	}
+	if s.preflight && outboundBlocked(ctx) {
+		s.disableFullPunch = true
+	}
 	order := s.rankedPaths()
 	pathSockets := len(order)
 	for _, i := range order {
@@ -300,10 +299,12 @@ func (s *Session) punchPaths(ctx context.Context, targets, local []netip.AddrPor
 		}
 	}
 	for _, i := range order {
-		if !supportsFamily(s.sockets[i], false) {
+		if !supportsFamily(s.sockets[i], false) || s.disableFullPunch {
 			continue
 		}
 		mapping := s.localHint(i)
+		// Grow extra local ports when this egress is (or may be) randomly
+		// symmetric. Linear and cone mappings stay on the sockets already bound.
 		if mapping == protocol.P2PMappingVaries || (!s.agent && mapping == "" && !allLinear) {
 			growPaths = append(growPaths, i)
 		}
@@ -315,6 +316,9 @@ func (s *Session) punchPaths(ctx context.Context, targets, local []netip.AddrPor
 			growPaths = nil
 		}
 		socketLimit = min(socketLimit, dualNATPunchSockets)
+	}
+	if s.disableFullPunch {
+		growPaths = nil
 	}
 	growAfter := publicAfter.Add(exactWindow(s.mapping, ""))
 	if exactFor > 0 {

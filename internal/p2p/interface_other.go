@@ -10,3 +10,7 @@ import (
 func bindInterface(uintptr, net.Interface, bool) error {
 	return errors.New("interface binding unavailable")
 }
+
+func adapterType(iface net.Interface) AdapterType {
+	return classifyAdapterName(iface.Name)
+}

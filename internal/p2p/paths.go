@@ -8,7 +8,11 @@ import (
 	"syscall"
 )
 
-const maxDirectPaths = 8 // Includes the system default route.
+const (
+	maxDirectPaths      = 8 // Includes the system default route.
+	maxIPv4PerInterface = 2
+	maxIPv6PerInterface = 2
+)
 
 // Source identifies a local address on a specific network. Bind, when supplied,
 // pins an unconnected socket to that network before its local address is bound.
@@ -16,6 +20,7 @@ const maxDirectPaths = 8 // Includes the system default route.
 type Source struct {
 	Prefix  netip.Prefix
 	Network string
+	Adapter AdapterType
 	LAN     bool
 	Bind    func(uintptr) error
 }
@@ -33,7 +38,7 @@ func sourceInterfaces() []Source {
 			if err != nil || !usableSource(p.Addr()) {
 				continue
 			}
-			out = append(out, Source{Prefix: p, Network: iface.Name, LAN: true, Bind: func(fd uintptr) error {
+			out = append(out, Source{Prefix: p, Network: iface.Name, Adapter: adapterType(iface), LAN: true, Bind: func(fd uintptr) error {
 				return bindInterface(fd, iface, p.Addr().Is6())
 			}})
 		}
@@ -67,10 +72,16 @@ func orderSources(sources []Source, ipv6 bool) []Source {
 		}
 		seen[key] = true
 		g := group{src.Network, ip.Is6()}
-		switch counts[g] {
-		case 0:
+		limit := maxIPv4PerInterface
+		if ip.Is6() {
+			limit = maxIPv6PerInterface
+		}
+		switch {
+		case counts[g] >= limit:
+			continue
+		case counts[g] == 0:
 			first = append(first, src)
-		case 1:
+		default:
 			second = append(second, src)
 		}
 		counts[g]++

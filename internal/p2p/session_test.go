@@ -125,3 +125,30 @@ func TestDirectRacesCandidatesAndUsesAlternateSocketForQUIC(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPrepareForceRelay(t *testing.T) {
+	start := protocol.P2P("start", "test-session-without-peer-candidates")
+	start.Secret = strings.Repeat("ab", 32)
+	start.ForceRelay = true
+	if _, _, err := PrepareWithSources(t.Context(), true, *start, nil); !errors.Is(err, ErrForceRelay) {
+		t.Fatalf("got %v, want ErrForceRelay", err)
+	}
+}
+
+func TestSwitchEgressRequiresLiveConnection(t *testing.T) {
+	l := &Link{}
+	if err := l.SwitchEgress("eth0"); !errors.Is(err, ErrSwitchUnavailable) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestDisableFullPunchOmitsPredictedTargets(t *testing.T) {
+	a, _ := loopbackUDP(t)
+	s := &Session{agent: true, sockets: []*net.UDPConn{a}, pathSockets: 1, disableFullPunch: true}
+	linear := netip.MustParseAddrPort("192.0.2.2:40500")
+	hints := map[netip.AddrPort]protocol.P2PMappingHint{linear: {Mapping: protocol.P2PMappingLinear, Step: 7}}
+	plans := s.plans(s.rankedPaths(), []netip.AddrPort{linear}, hints, time.Now(), 0, dualNATProbeTargets)
+	if len(plans) != 0 {
+		t.Fatalf("expected no expansion plans, got %+v", plans)
+	}
+}

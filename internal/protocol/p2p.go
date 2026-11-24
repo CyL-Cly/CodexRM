@@ -70,6 +70,9 @@ type P2PSignal struct {
 	NATUsesP2PSTUN  bool       `json:"natUsesP2PStun,omitempty"`  // No separate diagnostic endpoints configured.
 
 	ClientInitiated bool `json:"clientInitiated,omitempty"` // Negotiated permission for an addressless client offer.
+
+	ForceRelay       bool `json:"forceRelay,omitempty"`       // Skip punching and stay on the RM relay.
+	DisableFullPunch bool `json:"disableFullPunch,omitempty"` // Exact published ports only; no prediction, spray, or extra sockets.
 }
 
 type P2PMappingHint struct {
