@@ -27,20 +27,24 @@ var (
 	ErrNoPeerCandidate      = errors.New("no verified peer candidate")
 	ErrUDPPunch             = errors.New("UDP punch")
 	ErrDualUnpredictableNAT = errors.New("both peers have unpredictable UDP mappings and no working direct path")
+	ErrForceRelay           = errors.New("direct path skipped by force relay")
+	ErrSwitchUnavailable    = errors.New("direct connection does not allow a network switch now")
 )
 
 type Session struct {
-	agent        bool
-	id           string
-	key          []byte
-	cert         tls.Certificate
-	sockets      []*net.UDPConn
-	pathSockets  int // wildcard socket plus routable, locally bound alternatives
-	lan          []netip.Prefix
-	paths        []directPath
-	mapping      string
-	dualNATPunch bool
-	ipv6         bool
+	agent            bool
+	id               string
+	key              []byte
+	cert             tls.Certificate
+	sockets          []*net.UDPConn
+	pathSockets      int // wildcard socket plus routable, locally bound alternatives
+	lan              []netip.Prefix
+	paths            []directPath
+	mapping          string
+	dualNATPunch     bool
+	ipv6             bool
+	disableFullPunch bool
+	preflight        bool
 
 	clientInitiated bool
 }
@@ -61,10 +65,14 @@ func PrepareWithLocalPrefixes(ctx context.Context, agent bool, start protocol.P2
 }
 
 func PrepareWithSources(ctx context.Context, agent bool, start protocol.P2PSignal, sources []Source) (*Session, *protocol.P2PSignal, error) {
+	if start.ForceRelay {
+		return nil, nil, ErrForceRelay
+	}
 	key, err := hex.DecodeString(start.Secret)
 	if err != nil || len(key) != 32 || len(start.ID) != 36 || len(start.STUN) > 4 {
 		return nil, nil, errors.New("invalid direct session")
 	}
+	sources = prepareSources(sources)
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, err
@@ -76,6 +84,8 @@ func PrepareWithSources(ctx context.Context, agent bool, start protocol.P2PSigna
 	}
 	s := &Session{agent: agent, id: start.ID, key: key, cert: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}}
 	s.dualNATPunch, s.ipv6 = start.DualNATPunch, start.IPv6
+	s.disableFullPunch = start.DisableFullPunch
+	s.preflight = !start.DisableFullPunch
 	s.clientInitiated = start.ClientInitiated
 	if start.LAN {
 		for _, src := range sources {
@@ -227,6 +237,7 @@ type directPath struct {
 	source Source
 	hint   protocol.P2PMappingHint
 	rtt    time.Duration
+	exitIP netip.Addr
 }
 
 func (s *Session) rankedPaths() []int {
@@ -235,7 +246,20 @@ func (s *Session) rankedPaths() []int {
 		order[i] = i
 	}
 	if len(s.paths) == len(order) {
+		preferred := preferredEgress()
 		slices.SortStableFunc(order, func(i, j int) int {
+			if preferred != "" {
+				ai, aj := s.paths[i].source.Network == preferred, s.paths[j].source.Network == preferred
+				if ai != aj {
+					if ai {
+						return -1
+					}
+					return 1
+				}
+			}
+			if c := s.pathRank(i) - s.pathRank(j); c != 0 {
+				return -c
+			}
 			a, b := s.paths[i].rtt, s.paths[j].rtt
 			switch {
 			case a == b:
@@ -248,6 +272,17 @@ func (s *Session) rankedPaths() []int {
 		})
 	}
 	return order
+}
+
+func (s *Session) pathRank(i int) int {
+	if i >= len(s.paths) {
+		return 0
+	}
+	score := s.paths[i].source.Adapter.rank() * 100
+	if s.paths[i].source.Network != "" {
+		score += 10
+	}
+	return score
 }
 
 // Keep each socket from discovery through punching and QUIC. A failed STUN
@@ -290,6 +325,12 @@ func (s *Session) discoverPaths(ctx context.Context, start protocol.P2PSignal, s
 		if len(rtts) > 0 {
 			slices.Sort(rtts)
 			path.rtt = rtts[len(rtts)/2]
+		}
+		for _, q := range queries {
+			if q.mapped.IsValid() {
+				path.exitIP = q.mapped.Addr()
+				break
+			}
 		}
 		path.hint.Mapping, path.hint.Step = classifyMapping(queries)
 		paths[keep], s.sockets[keep], s.paths[keep] = queries, s.sockets[i], path
@@ -416,6 +457,10 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 		qc.MaxIncomingStreams = 2
 	}
 	link := &Link{trans: tr, udp: c, ipv6: addr.Addr().Is6()}
+	if i < len(s.paths) {
+		link.path = pathInfo(s.paths[i])
+		RememberEgress(s.paths[i].source.Network)
+	}
 	for _, a := range local {
 		if a.Addr() == addr.Addr() {
 			link.lan = true

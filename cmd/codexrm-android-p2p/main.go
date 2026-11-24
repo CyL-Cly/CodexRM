@@ -81,7 +81,11 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 	defer cancel()
 	prepared, offer, err := p2p.PrepareWithSources(attempt, false, start, local)
 	if err != nil {
-		failure = "prepare"
+		if errors.Is(err, p2p.ErrForceRelay) {
+			failure = "force_relay"
+		} else {
+			failure = "prepare"
+		}
 		log.Printf("CodexRM P2P prepare: %v", err)
 		return
 	}
@@ -117,7 +121,8 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 		return
 	}
 	defer link.Close()
-	log.Printf("CodexRM P2P: QUIC established (lan=%t ipv6=%t bound=%t)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource())
+	path := link.Path()
+	log.Printf("CodexRM P2P: QUIC established (lan=%t ipv6=%t bound=%t channel=%s network=%s adapter=%s)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource(), path.Channel, path.Network, path.Adapter)
 	if link.IsLAN() && !s.emitBytes(attempt, []byte(`{"type":"native_direct_lan"}`)) {
 		return
 	}

@@ -251,6 +251,8 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 		pair.clientInitiated = agent.clientInitiatedCapable && sig.ClientInitiated
 		start.ClientInitiated = pair.clientInitiated
 		start.DualNATPunch = len(stun) > 0 && agent.dualNATPunchCapable && sig.DualNATPunch
+		start.ForceRelay = sig.ForceRelay
+		start.DisableFullPunch = sig.DisableFullPunch
 		if s.verifier != nil {
 			var err error
 			if pair.agentTicket, err = s.verifier.Ticket(now); err != nil {

@@ -44,3 +44,47 @@ func ipv6InterfaceIndex(index int) (int, error) {
 	}
 	return 0, errors.New("IPv6 interface index unavailable")
 }
+
+const (
+	ifTypeEthernetCSMACD = 6
+	ifTypeIEEE80211      = 71
+	ifTypePPP            = 23
+	ifTypeWWANPP         = 243
+	ifTypeWWANPP2        = 244
+)
+
+func adapterType(iface net.Interface) AdapterType {
+	if t, err := windowsIfType(iface.Index); err == nil {
+		switch t {
+		case ifTypeEthernetCSMACD:
+			return AdapterEthernet
+		case ifTypeIEEE80211:
+			return AdapterWiFi
+		case ifTypePPP, ifTypeWWANPP, ifTypeWWANPP2:
+			return AdapterCellular
+		}
+	}
+	return classifyAdapterName(iface.Name)
+}
+
+func windowsIfType(index int) (uint32, error) {
+	size := uint32(15 * 1024)
+	for range 3 {
+		buf := make([]byte, size)
+		first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0]))
+		err := windows.GetAdaptersAddresses(windows.AF_UNSPEC, windows.GAA_FLAG_SKIP_UNICAST|windows.GAA_FLAG_SKIP_ANYCAST|windows.GAA_FLAG_SKIP_MULTICAST|windows.GAA_FLAG_SKIP_DNS_SERVER, 0, first, &size)
+		if err == windows.ERROR_BUFFER_OVERFLOW {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		for a := first; a != nil; a = a.Next {
+			if int(a.IfIndex) == index || int(a.Ipv6IfIndex) == index {
+				return a.IfType, nil
+			}
+		}
+		break
+	}
+	return 0, errors.New("adapter type unavailable")
+}

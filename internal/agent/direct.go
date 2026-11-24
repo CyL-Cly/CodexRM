@@ -249,6 +249,10 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	defer cancel()
 	prepared, offer, err := p2p.Prepare(attempt, true, start)
 	if err != nil {
+		if errors.Is(err, p2p.ErrForceRelay) {
+			log.Printf("p2p negotiate: staying on RM relay (forceRelay)")
+			return
+		}
 		log.Printf("p2p negotiate: %v", err)
 		return
 	}
@@ -284,7 +288,8 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	d.active, d.lease = true, time.Now().Add(protocol.P2PLease)
 	a.eventMu.Unlock()
 	cancel()
-	log.Printf("p2p direct active (lan=%t ipv6=%t bound=%t)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource())
+	path := link.Path()
+	log.Printf("p2p direct active (lan=%t ipv6=%t bound=%t channel=%s network=%s adapter=%s)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource(), path.Channel, path.Network, path.Adapter)
 	go link.WatchQuality(d.ctx)
 	go a.serveDirectShares(d, link)
 	go func() {

@@ -18,15 +18,50 @@ import (
 type Link struct {
 	lan    bool
 	ipv6   bool
+	path   PathInfo
 	stream *quic.Stream
 	conn   *quic.Conn
 	udp    *net.UDPConn
 	trans  *quic.Transport
 	once   sync.Once
+
+	statsMu sync.Mutex
+	stats   FallbackStats
 }
 
-func (l *Link) IsLAN() bool  { return l.lan }
-func (l *Link) IsIPv6() bool { return l.ipv6 }
+// FallbackStats records why a direct path was abandoned for the RM relay.
+type FallbackStats struct {
+	AutoRelaySwitches   int
+	ManualRelaySwitches int
+	LastReason          string
+}
+
+func (l *Link) IsLAN() bool    { return l.lan }
+func (l *Link) IsIPv6() bool   { return l.ipv6 }
+func (l *Link) Path() PathInfo { return l.path }
+
+func (l *Link) Fallback() FallbackStats {
+	l.statsMu.Lock()
+	defer l.statsMu.Unlock()
+	return l.stats
+}
+
+// SwitchEgress records a preferred network for the next direct attempt and
+// closes this link so the owner can fall back to the RM relay and renegotiate.
+func (l *Link) SwitchEgress(network string) error {
+	if l.conn == nil {
+		return ErrSwitchUnavailable
+	}
+	select {
+	case <-l.conn.Context().Done():
+		return ErrSwitchUnavailable
+	default:
+	}
+	RememberEgress(network)
+	l.noteFallback(false, "manual_switch")
+	l.Close()
+	return nil
+}
 func (l *Link) UsesBoundSource() bool {
 	return !l.udp.LocalAddr().(*net.UDPAddr).AddrPort().Addr().IsUnspecified()
 }
@@ -87,7 +122,8 @@ func (l *Link) WatchQuality(ctx context.Context) {
 			}
 			previous = current
 			if badWindows == 3 {
-				log.Print("p2p direct: sustained packet loss, returning to RM relay")
+				log.Printf("p2p direct: sustained packet loss (sent=%d lost=%d), try to switch to relay", current.PacketsSent, current.PacketsLost)
+				l.noteFallback(true, "auto_loss")
 				l.Close()
 				return
 			}
@@ -103,6 +139,17 @@ func badLossWindow(previous, current quic.ConnectionStats) bool {
 	sent := current.PacketsSent - previous.PacketsSent
 	lost := current.PacketsLost - previous.PacketsLost
 	return sent >= 100 && lost >= (sent+1)/2
+}
+
+func (l *Link) noteFallback(auto bool, reason string) {
+	l.statsMu.Lock()
+	defer l.statsMu.Unlock()
+	if auto {
+		l.stats.AutoRelaySwitches++
+	} else {
+		l.stats.ManualRelaySwitches++
+	}
+	l.stats.LastReason = reason
 }
 
 func (l *Link) Close() {
