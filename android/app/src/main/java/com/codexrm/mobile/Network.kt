@@ -43,6 +43,7 @@ internal object Network {
         path: String,
         token: String = "",
         body: JSONObject? = null,
+        httpClient: OkHttpClient = client,
         callback: HttpCallback,
     ): Call {
         val builder = Request.Builder()
@@ -50,7 +51,7 @@ internal object Network {
             .header("Accept", "application/json")
         if (token.isNotEmpty()) builder.header("Authorization", "Bearer $token")
         if (body == null) builder.get() else builder.post(body.toString().toRequestBody(jsonType))
-        val call = client.newCall(builder.build())
+        val call = httpClient.newCall(builder.build())
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 main.post { callback.onComplete(null, ApiException(e.message ?: "网络连接失败")) }

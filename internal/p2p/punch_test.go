@@ -13,39 +13,28 @@ import (
 	"github.com/codexrm/codexrm/internal/protocol"
 )
 
-func TestAgentProbesStartExactThenExpandAndRetry(t *testing.T) {
+func TestExpandedTargetsKeepsMultiplePublicIPs(t *testing.T) {
 	a := netip.MustParseAddrPort("203.0.113.1:40000")
 	b := netip.MustParseAddrPort("203.0.113.2:65535")
 	private := netip.MustParseAddrPort("192.168.2.10:40000")
-	p := agentProbes{exact: []netip.AddrPort{a, b, private}, budget: maxProbeTargets}
-	now := time.Now()
-	expandAt := now.Add(exactWindow(protocol.P2PMappingStable, protocol.P2PMappingStable))
-	for i, want := range p.exact {
-		if got := p.next(now.Add(time.Duration(i)*punchTick), expandAt); got != want {
-			t.Fatalf("exact candidate %d: got %v want %v", i, got, want)
-		}
-	}
-	if p.next(now.Add(3*punchTick), expandAt).IsValid() || p.expanded {
-		t.Fatal("expanded ahead of the exact window")
-	}
-	if got := p.next(expandAt, expandAt); !slices.Contains(p.exact, got) {
-		t.Fatalf("lost the exact retry: %v", got)
-	}
-	if got := p.next(expandAt.Add(punchTick), expandAt); got != netip.MustParseAddrPort("203.0.113.1:40001") {
+	exact := []netip.AddrPort{a, b, private}
+	extra := expandedTargets(exact, 0, maxProbeTargets)
+	if got := extra[0]; got != netip.MustParseAddrPort("203.0.113.1:40001") {
 		t.Fatalf("did not begin with the closest neighbor: %v", got)
 	}
-	if len(p.extra)+len(p.exact) != maxProbeTargets {
-		t.Fatalf("unexpected probe budget: %d", len(p.extra))
+	if len(extra)+len(exact) != maxProbeTargets {
+		t.Fatalf("unexpected probe count: %d", len(extra))
 	}
 	seen := make(map[netip.AddrPort]bool)
-	for _, addr := range p.extra {
-		if seen[addr] || slices.Contains(p.exact, addr) || addr.Port() < 1024 || (addr.Addr() != a.Addr() && addr.Addr() != b.Addr()) {
+	seenIP := make(map[netip.Addr]bool)
+	for _, addr := range extra {
+		if seen[addr] || slices.Contains(exact, addr) || addr.Port() < 1024 || (addr.Addr() != a.Addr() && addr.Addr() != b.Addr()) {
 			t.Fatalf("unexpected expanded target %v", addr)
 		}
-		seen[addr] = true
+		seen[addr], seenIP[addr.Addr()] = true, true
 	}
-	if got := p.next(expandAt.Add(candidateRetry), expandAt); !slices.Contains(p.exact, got) {
-		t.Fatalf("did not retry exact targets during expansion: %v", got)
+	if !seenIP[a.Addr()] || !seenIP[b.Addr()] {
+		t.Fatalf("missing egress: %v", seenIP)
 	}
 	if got := expandedTargets([]netip.AddrPort{private, netip.MustParseAddrPort("100.64.1.1:40000")}, 0, maxProbeTargets); len(got) != 0 {
 		t.Fatal("expanded non-public addresses")
@@ -72,21 +61,9 @@ func TestDualNATProbeBudget(t *testing.T) {
 
 func TestLinearStepPrecedesNeighborhood(t *testing.T) {
 	exact := netip.MustParseAddrPort("203.0.113.8:20000")
-	p := agentProbes{exact: []netip.AddrPort{exact}, step: 4, budget: maxProbeTargets}
-	expandAt := time.Now()
-	if got := p.next(expandAt, expandAt); got != exact {
-		t.Fatalf("exact retry = %v", got)
-	}
-	if got := p.next(expandAt, expandAt); got != netip.MustParseAddrPort("203.0.113.8:20004") {
-		t.Fatalf("forward step = %v", got)
-	}
-	if got := p.next(expandAt, expandAt); got != netip.MustParseAddrPort("203.0.113.8:19996") {
-		t.Fatalf("backward step = %v", got)
-	}
-	if exactWindow(protocol.P2PMappingVaries, protocol.P2PMappingLinear) != 120*time.Millisecond ||
-		exactWindow(protocol.P2PMappingStable, protocol.P2PMappingLinear) != 200*time.Millisecond ||
-		exactWindow(protocol.P2PMappingStable, protocol.P2PMappingStable) != 800*time.Millisecond {
-		t.Fatal("unexpected exact windows")
+	extra := expandedTargets([]netip.AddrPort{exact}, 4, maxProbeTargets)
+	if got := extra[0]; got != netip.MustParseAddrPort("203.0.113.8:20004") {
+		t.Fatalf("did not prioritize predicted port: %v", got)
 	}
 }
 
@@ -103,7 +80,7 @@ func TestPunchContinuesPastAnUnconfirmedPair(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		_, addr, err := s.punch(ctx, []netip.AddrPort{a, b}, nil, exactWindow("", ""), 0, false)
+		_, addr, err := s.punchPaths(ctx, []netip.AddrPort{a, b}, nil, nil, exactWindow("", ""), false)
 		done <- result{addr, err}
 	}()
 	waitSelected := func(c *net.UDPConn) {
@@ -156,7 +133,7 @@ func TestMobileUsesOneSocketForFastPath(t *testing.T) {
 	defer cancel()
 	// The alternate target makes expansion eligible, but we should not reach it.
 	targets := []netip.AddrPort{src, netip.MustParseAddrPort("192.0.2.8:40000")}
-	i, addr, err := s.punch(ctx, targets, nil, exactWindow(protocol.P2PMappingStable, protocol.P2PMappingStable), 0, false)
+	i, addr, err := s.punchPaths(ctx, targets, nil, nil, exactWindow(protocol.P2PMappingStable, protocol.P2PMappingStable), false)
 	if err != nil || i != 0 || addr != src || len(s.sockets) != 1 {
 		t.Fatalf("fast path socket=%d addr=%v err=%v sockets=%d", i, addr, err, len(s.sockets))
 	}
@@ -170,7 +147,7 @@ func TestPunchRejectsUnauthenticatedUnknownSource(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := agent.punch(ctx, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.2:9")}, nil, time.Hour, 0, false)
+		_, _, err := agent.punchPaths(ctx, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.2:9")}, nil, nil, time.Hour, false)
 		done <- err
 	}()
 	bad := agent.packet(1, punchPing)
@@ -209,11 +186,11 @@ func TestPunchLearnsAuthenticatedUnknownSource(t *testing.T) {
 	}
 	results := make(chan result, 2)
 	go func() {
-		i, addr, err := agent.punch(ctx, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.2:9")}, nil, time.Hour, 0, false)
+		i, addr, err := agent.punchPaths(ctx, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.2:9")}, nil, nil, time.Hour, false)
 		results <- result{true, i, addr, err}
 	}()
 	go func() {
-		i, addr, err := mobile.punch(ctx, []netip.AddrPort{agentAddr}, nil, time.Hour, 0, false)
+		i, addr, err := mobile.punchPaths(ctx, []netip.AddrPort{agentAddr}, nil, nil, time.Hour, false)
 		results <- result{false, i, addr, err}
 	}()
 	for range 2 {

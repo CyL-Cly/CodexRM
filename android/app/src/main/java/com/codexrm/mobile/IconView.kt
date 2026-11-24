@@ -42,12 +42,19 @@ internal class IconView(context: Context, private var icon: String, color: Int =
             }
             "search" -> { circle(11,11,7); move(16,16); line(21,21) }
             "plus" -> { move(12,5); line(12,19); move(5,12); line(19,12) }
+            "minus" -> { move(5,12); line(19,12) }
             "refresh" -> { move(20,7); line(20,12); line(15,12); move(4,17); line(4,12); line(9,12); move(6,6); cubic(9,2,16,3,19,8); move(18,18); cubic(15,22,8,21,5,16) }
             "update" -> { move(12,3); line(12,15); move(7,10); line(12,15); line(17,10); move(4,20); line(20,20) }
             "monitor" -> { rect(3,4,18,13,1); move(8,21); line(16,21); move(12,17); line(12,21) }
             "zap" -> { move(13,2); line(3,14); line(11,14); line(10,22); line(21,10); line(13,10); close() }
             "relay" -> { rect(9,3,6,6,1); rect(3,15,6,6,1); rect(15,15,6,6,1); move(12,9); line(12,12); move(6,15); line(6,12); line(18,12); line(18,15) }
             "sliders" -> { move(4,6); line(8,6); move(12,6); line(20,6); circle(10,6,2); move(4,12); line(14,12); move(18,12); line(20,12); circle(16,12,2); move(4,18); line(7,18); move(11,18); line(20,18); circle(9,18,2) }
+            "wrench" -> {
+                move(21,5); line(17,9); line(15,7); line(19,3)
+                cubic(15,2,11,5,11,9); cubic(11,10,11,11,11.5f,12)
+                line(3.5f,19); cubic(2,20.5f,3.5f,22,5,21.5f); line(13.5f,14)
+                cubic(14.5f,14.5f,15,14.5f,16,14.5f); cubic(20,14.5f,22.5f,9,21,5); close()
+            }
             "settings" -> { circle(12,12,3); move(9,3); line(15,3); line(16,6); line(19,7); line(21,12); line(19,17); line(16,18); line(15,21); line(9,21); line(8,18); line(5,17); line(3,12); line(5,7); line(8,6); close() }
             "close" -> { move(6,6); line(18,18); move(6,18); line(18,6) }
             "panel" -> { rect(3,4,18,16,2); move(9,4); line(9,20); move(6,8); line(7,9); move(6,12); line(7,13) }
@@ -77,10 +84,25 @@ internal class IconView(context: Context, private var icon: String, color: Int =
             "scissors" -> { circle(6,6,3); circle(6,18,3); move(8,8); line(20,20); move(8,16); line(20,4) }
             "trash" -> { move(4,6); line(20,6); move(9,6); line(9,3); line(15,3); line(15,6); move(6,6); line(7,21); line(17,21); line(18,6); move(10,10); line(10,17); move(14,10); line(14,17) }
             "edit" -> { move(4,15); line(15,4); line(20,9); line(9,20); line(4,20); close(); move(13,6); line(18,11) }
+            "help" -> {
+                circle(12,12,9)
+                move(9,9); cubic(9,5.5f,15,5.5f,15,9)
+                cubic(15,11,12,11,12,13)
+                circle(12,16.5f,.55f)
+            }
             "info" -> { circle(12,12,9); circle(12,8,.5f); move(12,11); line(12,17) }
             "share" -> { circle(6,12,3); circle(18,5,3); circle(18,19,3); move(9,11); line(15,6); move(9,13); line(15,18) }
             "open" -> { move(12,5); line(4,5); line(4,20); line(19,20); line(19,12); move(14,4); line(20,4); line(20,10); move(11,13); line(20,4) }
             "attach" -> { move(8,13); line(15,6); cubic(19,2,23,7,19,11); line(10,20); cubic(4,25,-1,17,4,12); line(13,3) }
+            "speaker" -> { move(4,10); line(4,14); line(8,14); line(13,18); line(13,6); line(8,10); close(); move(16,9); cubic(18,10,18,14,16,15); move(18,7); cubic(21,9,21,15,18,17) }
+            "eye" -> { move(2,12); cubic(6,7,18,7,22,12); cubic(18,17,6,17,2,12); circle(12,12,2.2f) }
+            "window" -> { rect(4,5,16,14,2); move(4,9); line(20,9) }
+            "fullscreen" -> { move(4,9); line(4,4); line(9,4); move(15,4); line(20,4); line(20,9); move(20,15); line(20,20); line(15,20); move(9,20); line(4,20); line(4,15) }
+            "logout" -> { move(10,12); line(20,12); move(16,8); line(20,12); line(16,16); rect(4,4,8,16,1) }
+            "rotate" -> { move(20,8); line(20,4); line(16,4); move(4,16); cubic(4,20,8,20,12,18); move(4,16); line(4,20); line(8,20) }
+            "keyboard" -> { rect(2,6,20,12,2); move(6,10); line(6,11); move(10,10); line(10,11); move(14,10); line(14,11); move(18,10); line(18,11); move(7,14); line(17,14) }
+            "layout" -> { rect(3,3,8,8,1); rect(13,3,8,8,1); rect(3,13,8,8,1); rect(13,13,8,8,1) }
+            "shield" -> { move(12,3); line(19,6); line(19,12); cubic(19,17,15,20,12,21); cubic(9,20,5,17,5,12); line(5,6); close() }
             else -> { move(8,6); line(2,12); line(8,18); move(16,6); line(22,12); line(16,18); move(14,3); line(10,21) }
         }
         canvas.drawPath(path, paint)

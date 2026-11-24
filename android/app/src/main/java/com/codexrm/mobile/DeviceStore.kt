@@ -5,11 +5,24 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import org.json.JSONArray
+import org.json.JSONObject
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+
+internal data class PendingDeviceRevocation(val serverUrl: String, val token: String) {
+    fun toJson(): JSONObject = JSONObject().put("serverUrl", serverUrl).put("token", token)
+
+    companion object {
+        fun fromJson(value: JSONObject): PendingDeviceRevocation? {
+            val serverUrl = value.string("serverUrl")
+            val token = value.string("token")
+            return if (serverUrl.isBlank() || token.isBlank()) null else PendingDeviceRevocation(serverUrl, token)
+        }
+    }
+}
 
 internal class DeviceStore(context: Context) {
     private val appContext = context.applicationContext
@@ -25,12 +38,16 @@ internal class DeviceStore(context: Context) {
         set(value) = uiPrefs.edit().putString("last_server", value).apply()
 
     var sandbox: String
-        get() = uiPrefs.getString("sandbox", "workspace-write") ?: "workspace-write"
+        get() = uiPrefs.getString("sandbox", null) ?: "danger-full-access"
         set(value) = uiPrefs.edit().putString("sandbox", value).apply()
 
     var approvalPolicy: String
-        get() = uiPrefs.getString("approval_policy", "on-request") ?: "on-request"
+        get() = uiPrefs.getString("approval_policy", null) ?: "never"
         set(value) = uiPrefs.edit().putString("approval_policy", value).apply()
+
+    var shareToNewDraft: Boolean
+        get() = uiPrefs.getBoolean("share_to_new_draft", false)
+        set(value) = uiPrefs.edit().putBoolean("share_to_new_draft", value).apply()
 
     var darkTheme: Boolean
         get() = uiPrefs.getBoolean("dark_theme", true)
@@ -80,10 +97,49 @@ internal class DeviceStore(context: Context) {
     }
 
     fun save(devices: List<Device>) {
-        val array = JSONArray()
-        devices.forEach { array.put(it.toJson()) }
-        securePrefs.edit().putString("devices", Crypto.encrypt(array.toString())).apply()
+        securePrefs.edit().putString("devices", encodeDevices(devices)).apply()
     }
+
+    private fun encodeDevices(devices: List<Device>): String =
+        Crypto.encrypt(JSONArray(devices.map(Device::toJson)).toString())
+
+    // Like the device list, the revocation queue is accessed only on the main thread.
+    fun saveRemoval(devices: List<Device>, removed: Device) {
+        val pending = PendingDeviceRevocation(removed.serverUrl, removed.token)
+        // Remove the pairing and retain only its relay URL and old token in the same transaction.
+        securePrefs.edit().putString("devices", encodeDevices(devices))
+            .putString("pending_revocations", encodeRevocations((pendingRevocations() + pending).distinct()))
+            .apply()
+    }
+
+    fun pendingRevocations(): List<PendingDeviceRevocation> {
+        val encrypted = securePrefs.getString("pending_revocations", null) ?: return emptyList()
+        return try {
+            val array = JSONArray(Crypto.decrypt(encrypted))
+            (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let(PendingDeviceRevocation::fromJson) }
+        } catch (_: Exception) {
+            securePrefs.edit().remove("pending_revocations").apply()
+            emptyList()
+        }
+    }
+
+    fun finishRevocation(pending: PendingDeviceRevocation, failed: Boolean) {
+        val remaining = pendingRevocations() - pending
+        val edit = securePrefs.edit()
+        if (remaining.isEmpty()) edit.remove("pending_revocations")
+        else edit.putString("pending_revocations", encodeRevocations(remaining))
+        if (failed) edit.putBoolean("revocation_failed", true)
+        edit.apply()
+    }
+
+    fun consumeRevocationFailure(): Boolean {
+        if (!securePrefs.getBoolean("revocation_failed", false)) return false
+        securePrefs.edit().remove("revocation_failed").apply()
+        return true
+    }
+
+    private fun encodeRevocations(items: List<PendingDeviceRevocation>): String =
+        Crypto.encrypt(JSONArray(items.map(PendingDeviceRevocation::toJson)).toString())
 
     fun draft(agentId: String, threadId: String, workspaceKey: String? = null): String {
         val legacyKey = "draft.$agentId.$threadId"

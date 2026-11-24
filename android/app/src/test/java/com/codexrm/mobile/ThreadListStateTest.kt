@@ -57,6 +57,18 @@ class ThreadListStateTest {
         assertEquals(emptyList<ThreadSummary>(), state.entries)
     }
 
+    @Test fun `background monitoring includes active conversations outside the current list`() {
+        val state = ThreadListState()
+        state.commit(listOf(old.copy(active = true), created))
+        state.updateActivity("unlisted", active = true, updatedAt = 20)
+        assertEquals(setOf(old.id, "unlisted"), state.activeIds)
+
+        state.updateActivity(old.id, active = false, updatedAt = 21)
+        assertEquals(setOf("unlisted"), state.activeIds)
+        state.updateActivity("unlisted", active = false, updatedAt = 22)
+        assertEquals(emptySet<String>(), state.activeIds)
+    }
+
     @Test fun `incomplete paging never replaces the committed list`() {
         val state = ThreadListState()
         state.commit(state.mergePage(emptyList(), listOf(old)))

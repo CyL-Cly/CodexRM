@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/codexrm/codexrm/internal/desktop"
+	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/google/uuid"
 )
 
@@ -37,6 +38,10 @@ type attachmentUpload struct {
 	Updated   time.Time
 	Downloads string
 	Sender    string
+	DirectID  string
+	Streamed  bool
+	Receiving bool
+	ChatImage bool
 }
 
 func attachmentName(name string) string {
@@ -101,7 +106,29 @@ func removeAbandonedParts(root string, cutoff time.Time) {
 	}
 }
 
-func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any, error) {
+func chatImageMIME(mime string) bool {
+	switch mime {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *Agent) attachmentRPC(owner, method string, params map[string]any, direct *directSession) (any, error) {
+	chatImage := strings.HasPrefix(method, protocol.ChatImagePrefix)
+	if chatImage {
+		operation := strings.TrimPrefix(method, protocol.ChatImagePrefix)
+		switch operation {
+		case "begin", "chunk", "finish", "abort", "read":
+			method = "codexrm/attachment/" + operation
+		default:
+			return nil, errors.New("unknown chat image operation")
+		}
+		if params["destination"] != nil || params["uploadStream"] != nil {
+			return nil, errors.New("chat image transfer cannot target desktop downloads or use a direct stream")
+		}
+	}
 	a.attachmentMu.Lock()
 	defer a.attachmentMu.Unlock()
 	root, err := filepath.Abs(filepath.Join(a.cfg.DataDir, "attachments"))
@@ -117,7 +144,7 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		}
 	}
 	for id, upload := range a.uploads {
-		if time.Since(upload.Updated) > 30*time.Minute {
+		if !upload.Receiving && time.Since(upload.Updated) > 30*time.Minute {
 			_ = os.Remove(upload.File.Path + ".part")
 			_ = os.Remove(filepath.Dir(upload.File.Path))
 			delete(a.uploads, id)
@@ -127,7 +154,10 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		name, _ := params["name"].(string)
 		downloads, sender := "", ""
 		limit := int64(attachmentMaxSize)
-		if params["destination"] == "downloads" {
+		if params["destination"] == protocol.DesktopShareDestination {
+			if direct == nil || direct.ctx.Err() != nil {
+				return nil, errors.New(protocol.DesktopShareDirectRequired)
+			}
 			downloads, err = desktop.Downloads()
 			if err != nil {
 				return nil, err
@@ -152,6 +182,9 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		if err != nil {
 			return nil, fmt.Errorf("单个文件最大 %d MB", limit>>20)
 		}
+		if chatImage && size == 0 {
+			return nil, errors.New("图片内容为空")
+		}
 		if len(a.uploads) >= 30 {
 			return nil, fmt.Errorf("同时上传的附件过多，请稍后重试")
 		}
@@ -167,8 +200,16 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		if err := f.Close(); err != nil {
 			return nil, err
 		}
-		a.uploads[file.ID] = &attachmentUpload{File: file, Owner: owner, Updated: time.Now(), Downloads: downloads, Sender: sender}
-		return map[string]any{"id": file.ID, "chunkSize": attachmentChunkSize}, nil
+		upload := &attachmentUpload{File: file, Owner: owner, Updated: time.Now(), Downloads: downloads, Sender: sender, ChatImage: chatImage}
+		if downloads != "" {
+			upload.DirectID = direct.id
+			upload.Streamed, _ = params["uploadStream"].(bool)
+			if upload.Streamed {
+				upload.Offset = -1 // Even an empty file must complete the stream.
+			}
+		}
+		a.uploads[file.ID] = upload
+		return map[string]any{"id": file.ID, "chunkSize": attachmentChunkSize, "uploadStream": upload.Streamed}, nil
 	}
 	id, _ := params["id"].(string)
 	parsed, err := uuid.Parse(id)
@@ -188,6 +229,9 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		path := filepath.Join(root, id, "file-"+attachmentName(file.Name))
 		if file.ID != id || file.Path != path {
 			return nil, fmt.Errorf("invalid attachment metadata")
+		}
+		if chatImage && (!chatImageMIME(file.MimeType) || file.Size <= 0 || file.Size > attachmentMaxSize) {
+			return nil, errors.New("中继仅读取已上传的聊天图片")
 		}
 		offset, err := attachmentNumber(params, "offset", file.Size)
 		if err != nil || offset > file.Size {
@@ -211,8 +255,14 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		return map[string]any{"file": file, "data": base64.StdEncoding.EncodeToString(data), "offset": offset + int64(len(data))}, nil
 	}
 	upload := a.uploads[id]
-	if upload == nil || upload.Owner != owner {
+	if upload == nil || upload.Owner != owner || upload.ChatImage != chatImage {
 		return nil, fmt.Errorf("上传已失效，请重新选择附件")
+	}
+	if upload.DirectID != "" && (direct == nil || direct.id != upload.DirectID || direct.ctx.Err() != nil) {
+		return nil, errors.New(protocol.DesktopShareDirectRequired)
+	}
+	if upload.Receiving {
+		return nil, errors.New("desktop file is still transferring")
 	}
 	upload.Updated = time.Now()
 	switch method {
@@ -224,6 +274,9 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 		delete(a.uploads, id)
 		return map[string]any{}, nil
 	case "codexrm/attachment/chunk":
+		if upload.Streamed {
+			return nil, errors.New("desktop file requires a direct stream")
+		}
 		offset, err := attachmentNumber(params, "offset", upload.File.Size)
 		if err != nil || offset != upload.Offset {
 			return nil, fmt.Errorf("附件上传位置不匹配，请重试")
@@ -233,7 +286,7 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 			return nil, fmt.Errorf("attachment chunk is too large")
 		}
 		data, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil || len(data) == 0 || upload.Offset+int64(len(data)) > upload.File.Size {
+		if err != nil || len(data) == 0 || len(data) > attachmentChunkSize || upload.Offset+int64(len(data)) > upload.File.Size {
 			return nil, fmt.Errorf("invalid attachment chunk")
 		}
 		f, err := os.OpenFile(upload.File.Path+".part", os.O_WRONLY, 0600)
@@ -275,6 +328,12 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any) (any,
 			return nil, readErr
 		}
 		upload.File.MimeType = strings.Split(http.DetectContentType(header[:n]), ";")[0]
+		if chatImage && !chatImageMIME(upload.File.MimeType) {
+			_ = os.Remove(upload.File.Path + ".part")
+			_ = os.Remove(filepath.Dir(upload.File.Path))
+			delete(a.uploads, id)
+			return nil, errors.New("中继仅支持 PNG、JPEG、GIF 或 WebP 聊天图片")
+		}
 		if err := os.Rename(upload.File.Path+".part", upload.File.Path); err != nil {
 			return nil, err
 		}

@@ -68,6 +68,11 @@ func newRelayEventQueue(conn *websocket.Conn) *relayEventQueue {
 }
 
 func (q *relayEventQueue) enqueue(env protocol.Envelope) {
+	if len(env.Message) > protocol.MaxEnvelopeSize {
+		log.Print("discarded relay event exceeding the wire limit")
+		return
+	}
+	env.Message, _ = protocol.WithoutInlineFiles(env.Message)
 	frame, err := json.Marshal(env)
 	if err != nil || len(frame) > protocol.MaxEnvelopeSize {
 		log.Print("discarded relay event exceeding the wire limit")
@@ -131,6 +136,28 @@ func (a *Agent) publishEvent(env protocol.Envelope) {
 func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *websocket.Conn, slots chan struct{}, env protocol.Envelope) {
 	sig := env.P2P
 	if sig == nil || sig.Version != protocol.P2PVersion {
+		return
+	}
+	if sig.Kind == "diagnose_start" {
+		if env.ClientID == "" || len(sig.ID) != 36 || len(sig.STUN) == 0 || len(sig.STUN) > 4 {
+			return
+		}
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				report := p2p.DiagnoseNAT(ctx, sig.STUN)
+				if ctx.Err() != nil {
+					return
+				}
+				result := protocol.P2P("diagnose_result", sig.ID)
+				result.NATResult = &report
+				_ = a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, ClientID: env.ClientID, P2P: result})
+			}()
+		default:
+			// Do not block the WebSocket reader when the Agent is busy.
+			return
+		}
 		return
 	}
 	a.eventMu.Lock()
@@ -210,6 +237,7 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	defer func() {
 		d.cancel()
 		d.files.close()
+		a.clearDirectShares(d)
 		a.eventMu.Lock()
 		defer a.eventMu.Unlock()
 		if a.direct[d.client] == d {
@@ -256,7 +284,9 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	d.active, d.lease = true, time.Now().Add(protocol.P2PLease)
 	a.eventMu.Unlock()
 	cancel()
-	log.Printf("p2p direct active (lan=%t ipv6=%t)", link.IsLAN(), link.IsIPv6())
+	log.Printf("p2p direct active (lan=%t ipv6=%t bound=%t)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource())
+	go link.WatchQuality(d.ctx)
+	go a.serveDirectShares(d, link)
 	go func() {
 		<-d.ctx.Done()
 		link.Close()

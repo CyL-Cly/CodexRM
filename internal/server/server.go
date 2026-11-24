@@ -24,11 +24,11 @@ import (
 )
 
 type Config struct {
-	Addr, DataDir, WebDir, AdminToken, UpdateDir string
-	PublicEnrollment                             bool
-	P2PSTUN, P2PVerifyListen, P2PVerifyPublic    string
-	P2PVerifyMore, P2PVerifyKeyFile              string
-	P2PTrustProxy, P2PLocalTest, P2PLAN          bool
+	Addr, DataDir, WebDir, AdminToken, UpdateDir          string
+	PublicEnrollment                                      bool
+	P2PSTUN, P2PNATSTUN, P2PVerifyListen, P2PVerifyPublic string
+	P2PVerifyMore, P2PVerifyKeyFile                       string
+	P2PTrustProxy, P2PLocalTest, P2PLAN                   bool
 }
 type peer struct {
 	id, agentID, clientID string
@@ -52,6 +52,11 @@ type peer struct {
 	lanCapable            bool
 	direct                *directPair
 	lastDirect            time.Time
+	lastNATDiagnostic     time.Time
+	natDiagnosticCapable  bool
+	natDiagnostic         *natDiagnostic
+
+	clientInitiatedCapable bool
 }
 
 const maxPeerQueueBytes = 2 * protocol.MaxEnvelopeSize
@@ -86,6 +91,7 @@ type Server struct {
 	maintenanceDone chan struct{}
 	closeOnce       sync.Once
 	stun            []string
+	natSTUN         []string
 	verifier        *p2p.UDPVerifier
 	verifyPublic    string
 	verifyMore      []string
@@ -101,6 +107,13 @@ func New(cfg Config) (*Server, error) {
 	stun, err := stunEndpoints(cfg.P2PSTUN)
 	if err != nil {
 		return nil, err
+	}
+	natSTUN := stunForPair(stun, false)
+	if cfg.P2PNATSTUN != "" {
+		natSTUN, err = stunEndpoints(cfg.P2PNATSTUN)
+		if err != nil || len(natSTUN) == 0 || len(natSTUN) != len(stunForPair(natSTUN, false)) {
+			return nil, errors.New("NAT diagnostic STUN requires up to four IPv4:port endpoints")
+		}
 	}
 	if cfg.WebDir == "" {
 		cfg.WebDir = "web"
@@ -119,7 +132,7 @@ func New(cfg Config) (*Server, error) {
 		_ = st.Close()
 		return nil, err
 	}
-	s := &Server{cfg: cfg, store: st, agents: map[string]*peer{}, clients: map[string]*peer{}, byAgent: map[string]map[string]*peer{}, maintenanceDone: make(chan struct{}), stun: stun}
+	s := &Server{cfg: cfg, store: st, agents: map[string]*peer{}, clients: map[string]*peer{}, byAgent: map[string]map[string]*peer{}, maintenanceDone: make(chan struct{}), stun: stun, natSTUN: natSTUN}
 	if err := s.startVerifier(); err != nil {
 		_ = st.Close()
 		return nil, err
@@ -732,8 +745,8 @@ func (s *Server) readPump(p *peer) {
 				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "method not allowed", StreamID: env.StreamID})
 				continue
 			}
-			if strings.HasPrefix(rpc.Method, protocol.DirectFilePrefix) {
-				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "文件管理仅支持 P2P 直连", StreamID: env.StreamID})
+			if protocol.RequiresDirectFileTransfer(rpc.Method, env.Message) {
+				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: protocol.FileTransferDirectRequired, StreamID: env.StreamID})
 				continue
 			}
 			env.ClientID = p.clientID
@@ -748,6 +761,7 @@ func (s *Server) readPump(p *peer) {
 			}
 			s.dispatchClientRPC(p, env)
 		} else if env.Type == protocol.TypeServerMessage {
+			env.Message, _ = protocol.WithoutInlineFiles(env.Message)
 			env.SeqID = s.seq.Add(1)
 			s.mu.RLock()
 			if s.agents[p.agentID] != p {
@@ -820,7 +834,7 @@ func (s *Server) sendStatus(p *peer, kind string) {
 	if a.Online {
 		status = "connected"
 	}
-	s.send(p, protocol.Envelope{Type: kind, Status: status, Agent: &a.AgentInfo})
+	s.send(p, protocol.Envelope{Type: kind, Status: status, Agent: &a.AgentInfo, FileTransferDirectOnly: true})
 }
 func (s *Server) broadcastStatus(agentID string) {
 	s.mu.RLock()

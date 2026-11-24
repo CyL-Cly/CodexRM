@@ -18,6 +18,13 @@ internal class DesktopShare(context: Context, private val client: CodexClient) {
     private val main = Handler(Looper.getMainLooper())
 
     fun send(content: SharedContent, progress: (String) -> Unit, complete: (Int, Exception?) -> Unit) {
+        client.withDesktopShareTransport { transport ->
+            if (transport == null) complete(0, IOException(DESKTOP_SHARE_DIRECT_REQUIRED))
+            else send(content, transport, progress, complete)
+        }
+    }
+
+    fun send(content: SharedContent, transport: DirectTransport, progress: (String) -> Unit, complete: (Int, Exception?) -> Unit) {
         val sendText = content.text.isNotBlank()
         val count = content.files.size + if (sendText) 1 else 0
         val sender = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
@@ -43,7 +50,7 @@ internal class DesktopShare(context: Context, private val client: CodexClient) {
                     prepared.fold({ (name, file) ->
                         val params = JSONObject().put("name", name).put("size", file.length())
                             .put("destination", "downloads").put("sender", sender)
-                        client.uploadAttachment(params, file::inputStream, { percent ->
+                        client.uploadDesktopFile(transport, params, file, { percent ->
                             progress("${index + 1}/$count · $name · $percent%")
                         }) { _, error ->
                             file.delete()

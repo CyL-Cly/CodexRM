@@ -142,7 +142,7 @@ func (p *localProvider) apply(patch ProviderPatch) error {
 	if patch.Notes != nil {
 		p.Notes = *patch.Notes
 	}
-	if patch.BaseURL != nil || patch.DefaultModel != nil || patch.APIKey != "" {
+	if patch.changesConfig() {
 		settings, err := patchProviderConfig(p.Settings, patch)
 		if err != nil {
 			return err

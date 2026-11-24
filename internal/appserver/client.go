@@ -52,6 +52,13 @@ type RPCError struct {
 }
 
 func (e *RPCError) Error() string { return e.Message }
+
+// OutcomeUnknown means the request may have reached Codex without a usable reply.
+type OutcomeUnknown struct{ Cause error }
+
+func (e *OutcomeUnknown) Error() string { return e.Cause.Error() }
+func (e *OutcomeUnknown) Unwrap() error { return e.Cause }
+
 func newClient() *Client {
 	return &Client{
 		pending: map[string]chan reply{}, closed: make(chan struct{}),
@@ -271,13 +278,16 @@ func (c *Client) writeRaw(ctx context.Context, raw json.RawMessage) error {
 	}()
 	select {
 	case err := <-done:
-		return err
+		if err != nil {
+			return &OutcomeUnknown{Cause: err}
+		}
+		return nil
 	case <-ctx.Done():
 		// A canceled write may have left a partial frame on the connection.
 		c.initiateClose()
-		return ctx.Err()
+		return &OutcomeUnknown{Cause: ctx.Err()}
 	case <-c.closed:
-		return errors.New("app-server connection closed")
+		return &OutcomeUnknown{Cause: errors.New("app-server connection closed")}
 	}
 }
 func (c *Client) Notify(method string, params any) error {
@@ -301,27 +311,38 @@ func (c *Client) Call(ctx context.Context, method string, params any) (json.RawM
 	if err = c.writeRaw(ctx, raw); err != nil {
 		return nil, err
 	}
+	var response reply
 	select {
+	case response = <-ch:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		response.err = ctx.Err()
 	case <-c.closed:
-		return nil, errors.New("app-server connection closed")
-	case response := <-ch:
-		if response.err != nil {
-			return nil, response.err
-		}
-		var msg struct {
-			Result json.RawMessage `json:"result"`
-			Error  *RPCError       `json:"error"`
-		}
-		if err := json.Unmarshal(response.message, &msg); err != nil {
-			return nil, err
-		}
-		if msg.Error != nil {
-			return nil, msg.Error
-		}
-		return msg.Result, nil
+		response.err = errors.New("app-server connection closed")
 	}
+	if response.err != nil {
+		// Prefer an already delivered reply if it raced with cancellation or close.
+		select {
+		case response = <-ch:
+		default:
+		}
+	}
+	if response.err != nil {
+		return nil, &OutcomeUnknown{Cause: response.err}
+	}
+	var msg struct {
+		Result json.RawMessage `json:"result"`
+		Error  *RPCError       `json:"error"`
+	}
+	if err := json.Unmarshal(response.message, &msg); err != nil {
+		return nil, &OutcomeUnknown{Cause: err}
+	}
+	if msg.Error != nil {
+		return nil, msg.Error
+	}
+	if len(msg.Result) == 0 {
+		return nil, &OutcomeUnknown{Cause: errors.New("app-server response has neither a result nor an error")}
+	}
+	return msg.Result, nil
 }
 func (c *Client) Initialize(ctx context.Context, name, version string) (json.RawMessage, error) {
 	result, err := c.Call(ctx, "initialize", map[string]any{"clientInfo": map[string]any{"name": name, "title": "CodexRM", "version": version}, "capabilities": map[string]any{"experimentalApi": true}})

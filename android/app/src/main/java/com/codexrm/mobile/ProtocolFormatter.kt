@@ -120,6 +120,13 @@ internal object ProtocolFormatter {
         return parts.joinToString("\n\n")
     }
 
+    fun permissionDecisions(message: JSONObject): List<String> {
+        val standard = listOf("accept", "acceptForSession", "decline")
+        val available = message.objectAt("params").optJSONArray("availableDecisions") ?: return standard
+        val supported = (0 until available.length()).mapNotNull { available.opt(it) as? String }.toSet()
+        return (standard + "cancel").filter { it in supported }
+    }
+
     fun permissionResult(message: JSONObject, decision: String): Any {
         if (message.string("method") == "item/permissions/requestApproval") {
             return JSONObject()

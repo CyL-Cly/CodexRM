@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "skills": {
+    "hiui-design": {
+      "source": "XiaoMi/hiui",
+      "ref": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "commit": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "sourceType": "github",
+      "skillPath": "skills/hiui-workflow/hiui-design/SKILL.md",
+      "computedHash": "5a3d93c2b31910be8ac0a95576ddfeff95c29a5c5cb008b9a3b3cc4a68124d77"
+    },
+    "hiui-page-workflow": {
+      "source": "XiaoMi/hiui",
+      "ref": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "commit": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "sourceType": "github",
+      "skillPath": "skills/hiui-workflow/hiui-page-workflow/SKILL.md",
+      "computedHash": "93c9676649157d539f9fee39cec6a87c4585bc157ec710f6dfbebed21460e702"
+    },
+    "hiui-refine": {
+      "source": "XiaoMi/hiui",
+      "ref": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "commit": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "sourceType": "github",
+      "skillPath": "skills/hiui-workflow/hiui-refine/SKILL.md",
+      "computedHash": "c1c9e3b548a1afc4b602ad0bb2d8d192e2c6e17b891d035795c2c9ac1ec06ae9"
+    },
+    "ux-walkthrough": {
+      "source": "XiaoMi/hiui",
+      "ref": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "commit": "57473f4ea93f6764cbad204439b3a2af6f7f10e1",
+      "sourceType": "github",
+      "skillPath": "skills/hiui-workflow/ux-walkthrough/SKILL.md",
+      "computedHash": "1b2612c98540c79f7d2f713fa9d0a3b0e0dd45999acd10e0a59ca7a4b14ca0d8"
+    }
+  }
+}

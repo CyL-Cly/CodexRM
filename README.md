@@ -16,9 +16,7 @@
 
 网页采用 DeepSeek Harness 的主题、侧栏、居中新对话页、圆角输入区、消息气泡和模型菜单布局，适配 CodexRM 的设备、工作区和 Codex 通信。模型菜单提供按供应商分组、搜索及思考强度选择。新对话沿用当前浏览器内这台设备最近选择或成功发送使用的供应商、模型和思考强度，跨工作区、刷新后保留；仅查看旧对话不会覆盖最近选择。无记录或模型已不可用时，选择可用的默认模型。复用主题和布局样式的 MIT 许可见 `web/dsh-LICENSE.txt`。
 
-输入框旁的附件按钮可以发送文件和图片，也可以在网页输入框或页面空白处粘贴图片、拖入文件；搜索、其他输入框和弹窗保留自己的粘贴行为。支持多选、上传进度、重试、移除、仅发送附件及运行中的排队/插队发送。每个文件最大 20 MB，每条消息最多 10 个附件、合计 50 MB。PNG、JPEG、GIF、WebP 作为图像输入交给 Codex；其他文件提供电脑中的实际路径供 Codex 读取。已上传的附件草稿按设备、工作区和会话保留，网页中的历史附件支持图片预览和原文件下载。
-
-附件分块经已配对的连接传到 Agent 数据目录的 `attachments/`，中继不保存文件；已发送的文件保留在电脑上供后续会话使用，手动移除后对应历史附件将无法下载。启用此功能需要同步更新网页、Agent 和 Server；旧 Agent 的附件入口会提示更新。
+Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、JPEG、GIF、WebP 图片，无需 P2P 直连。普通聊天附件、「发送到电脑」、工作区文件下载和读取远端工作区图片仍需要 Android P2P 直连。聊天附件每个最大 20 MB，每条消息最多 10 个附件、合计 50 MB；附件保存在 Agent 数据目录下，中继不保存图片文件。
 
 ## 界面预览
 
@@ -55,7 +53,7 @@
 | Windows x64 被控电脑 | `windows-amd64-Setup.exe` | 双击安装 Agent，启动后在系统托盘打开设置 |
 | Linux x86-64 被控电脑 | `linux-amd64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux ARM64 被控电脑 | `linux-arm64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
-| Linux x86-64 中继主机 | `linux-amd64-server.tar.gz` | 内含 Server 和 `web/`，见[自行部署](#自行部署) |
+| Linux x86-64 中继主机 | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
 | Android ARM64 手机 | `android-arm64-v8a-release-unsigned.apk` | 签名后安装，再扫描配对二维码 |
 
 Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 提供未签名的 Release APK，可在发布环境用 Android SDK 的 `apksigner` 签名后安装。覆盖安装需要沿用原版本的签名证书。手机也可以直接用浏览器访问。
@@ -147,6 +145,8 @@ CodexRM 创建或恢复会话时会启用 Codex CLI 普通模式的提问功能�
 
 在 Windows 或 Linux 的 Agent 设置中打开「模型供应商 → 管理供应商」，即可配置支持 OpenAI Responses API 的第三方接入地址、API Key 和默认模型。配置保存在本机 Agent，Android 和网页连接这台电脑后可选择这些供应商与模型。使用 Codex 官方账号时，在电脑端 Codex 登录。
 
+Android 的「设置 → 电脑 Agent 设置 → 模型供应商」可在编辑自定义供应商时开启「模型提供商是否为GPT官方」，启用 Responses WebSocket 和远程压缩（Compact）。如果使用电脑当前的自定义 Codex 供应商，请通过「当前 Codex 供应商设置」保存到电脑的 `config.toml`。该开关不切换供应商或登录方式，仅应在接入地址支持这两项能力时启用；远程压缩配置需要 Codex CLI 0.162.0 或更高版本。
+
 Agent 从供应商的 `/models` 接口获取模型。可以手动添加模型，也可以移除或恢复模型。移除项以删除线显示在管理列表底部，并从对话的模型菜单中隐藏。返回时一次性保存模型改动，后续刷新仍会更新上游列表并应用黑名单。
 
 已有 CC Switch 配置可通过「从 CC Switch 导入」复制第三方供应商，并保留会话和模型黑名单的关联。重复导入只补充尚未导入的供应商。官方账号仍由本机 Codex 管理。
@@ -155,7 +155,7 @@ Agent 从供应商的 `/models` 接口获取模型。可以手动添加模型，
 
 ## 构建与测试
 
-需要 Go 1.24+。页面使用原生 HTML / CSS / JavaScript，无需 npm 构建。Server 直接从磁盘 `web/` 目录提供页面，不使用 Go embed；更新页面只需替换该目录，无需重新编译或重启 Server。真实模式默认从 Codex 桌面版安装位置查找自带的 CLI，无需另外安装 CLI 或加入 PATH。Windows 上会检查正在运行的桌面版、Store 安装信息及各本地磁盘的常见安装目录，桌面版关闭时也可查找。直接运行 Agent 时，找不到桌面版 CLI 才使用 PATH；也支持用 `--codex` 指定 CLI 路径。
+需要 Go 1.24+。主工作区使用原生 HTML / CSS / JavaScript，无需 npm 构建。Server 直接从磁盘 `web/` 目录提供页面，不使用 Go embed；更新页面只需替换该目录，无需重新编译或重启 Server。真实模式默认从 Codex 桌面版安装位置查找自带的 CLI，无需另外安装 CLI 或加入 PATH。Windows 上会检查正在运行的桌面版、Store 安装信息及各本地磁盘的常见安装目录，桌面版关闭时也可查找。直接运行 Agent 时，找不到桌面版 CLI 才使用 PATH；也支持用 `--codex` 指定 CLI 路径。
 
 ```powershell
 .\build\scripts\build.ps1
@@ -171,6 +171,23 @@ node --check internal/agenthost/web/app.js
 ```
 
 构建产物输出到被 Git 忽略的 `build/bin/`。`codex/` 上游参考源码、`ChatGPT*` 设计参考和私人部署记录不参与构建，也不包含在公开仓库中。
+
+### HiUI 服务状态页
+
+`/hiui/` 使用独立的 React/Vite 入口和 HiUI 组件，读取 Server 的 `/api/v1/health`。构建产物写入 `web/hiui/`，运行 Go Server 后可直接访问。需要 Node.js 20.19+（20.x）或 22.12+。
+
+首次在新检出的仓库配置 HiUI 时，在根目录运行下面的命令。技能和生成的本地运行时由固定的上游提交恢复。
+
+```powershell
+npx --yes skills@1.9.0 add https://github.com/XiaoMi/hiui/tree/57473f4ea93f6764cbad204439b3a2af6f7f10e1/skills/hiui-workflow --skill '*' --agent codex --yes
+node .agents/skills/hiui-design/scripts/ensure-in-current-project.mjs --target . --mode host-integration --no-install
+npm ci
+npm run typical-page:preflight
+npm run build:hiui
+```
+
+按下方本地演示启动 Server 后访问 `http://127.0.0.1:8080/hiui/`。开发时可用 `npm run dev:hiui` 启动 Vite，健康检查请求会转发到本机的 8080 端口。自建部署可将 `web/hiui/` 随其他静态文件复制到服务器。
+
 
 ## 本地演示
 
@@ -208,17 +225,22 @@ codex app-server --listen ws://127.0.0.1:4500
 
 ## 自行部署
 
-以下示例适用于有 systemd 的 Linux 主机。准备 Linux x86-64 Server 包，以及已指向主机的域名和 TLS 证书。部署脚本、systemd 单元和 Nginx 示例位于源码仓库。
+在使用 systemd 的 Linux x86-64 中继主机上安装。先从 GitHub Releases 下载 `linux-amd64-server.tar.gz`，并按同一预发布的 `SHA256SUMS.txt` 核对文件。准备一个指向主机的域名和 TLS 证书，以便客户端通过 HTTPS 连接。
 
 ```bash
-git clone https://github.com/CyL-Cly/CodexRM.git
-cd CodexRM
-# 将路径替换为下载的 Linux Server 包
+# 将路径替换为已下载的 Server 包
 archive=/path/to/CodexRM-nightly-…-linux-amd64-server.tar.gz
 mkdir -p server-package
 tar -xzf "$archive" -C server-package
-sudo bash build/scripts/install-server.sh ./server-package/codexrm-server ./deploy/codexrm.service ./server-package/web
+cd server-package
+sudo bash install-server.sh
 curl -fsS http://127.0.0.1:18080/api/v1/health
+```
+
+若旧版压缩包没有 `install-server.sh`，克隆本仓库，在源码目录中以三个路径调用安装脚本。
+
+```bash
+sudo bash build/scripts/install-server.sh /path/to/server-package/codexrm-server ./deploy/codexrm.service /path/to/server-package/web
 ```
 
 从源码部署时，可用 `CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o codexrm-server ./cmd/codexrm-server` 构建当前 Linux 架构，再将二进制和仓库的 `web/` 分别传给同一个安装脚本。源码构建需要 Go 1.24 或更高版本。
@@ -230,6 +252,22 @@ curl -fsS http://127.0.0.1:18080/api/v1/health
 服务监听 `127.0.0.1:18080`，程序位于 `/opt/codexrm/bin`，页面位于 `/opt/codexrm/web`，持久化状态位于 `/opt/codexrm/data`。升级前备份状态目录和权限为 `0600` 的 `server.env`。解压新版本后再次运行安装脚本即可更新二进制和页面并重启服务，脚本沿用已有注册密钥。注册密钥、设备 token 和配对码均应按凭证保管。
 
 注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取专属 token。服务器记录配对设备的最近连接时间及 IP，Agent 设置页可查看；在线心跳持续更新时间。服务器启动时及每分钟清理超过 7 天未连接的设备授权，持续在线的设备保留；升级前缺少连接记录的设备给予一次性的 7 天宽限，重启不会延长。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查和设备间路由隔离。可在 Agent 设置的“已配对设备管理”中删除授权，删除后立即失效并需要重新配对。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
+
+### Android NAT 诊断
+
+在 Android 顶栏点击连接图标 →「诊断」，可同时测手机和已配对 Agent 的 IPv4 UDP 路径，即使业务走 RM 中继也能测。RFC 3489 显示传统类型，RFC 5780 分开显示映射和过滤行为。多个配置端点以独立 UDP socket 测试，先获得完整分类的可用端点胜出；不会把不同端点的映射与过滤拼成一份结果。「不支持」和「未响应」不是 NAT 类型，也不能证明无法直连。
+
+要部署完整诊断，准备支持两套协议的专用 STUN。一个端点须具有两个可达公网 IPv4 × 两个不同的 UDP 端口，并能从请求指定的备用来源回包。例如可在拥有两条可正确映射的公网 IPv4 的主机上运行 STUNTMAN 的 `full` 模式，为每个地址同时开放主、备用 UDP 端口；若主机绑定的是云内网地址，还需配置对应的公网 advertised 地址并确认 UDP 出站使用对应公网源地址。保留服务的防洪保护，不要把临时公共 STUN 当作唯一生产依赖。有条件时配置两套独立端点。
+
+仓库的 `deploy/codexrm-nat-stun.json.example` 和 `deploy/codexrm-nat-stun.service.example` 是 Linux 自建模板：准备 STUNTMAN 的 `stunserver` 可执行文件（或在 unit 中改为实际路径），替换示例 IP，将配置放到 `/etc/codexrm/nat-stun.json`，将 unit 放到 `/etc/systemd/system/codexrm-nat-stun.service`，再 `systemctl daemon-reload` 和 `systemctl enable --now codexrm-nat-stun.service`。不在主机上直接绑定公网 IP 时，两个 `*interface` 填本机绑定地址、两个 `*advertised` 分别填公网地址。
+
+先从可正常收发 IPv4 UDP 的主机检查（替换示例 IPv4）：
+
+```sh
+codexrm-server --check-nat-stun --p2p-nat-stun '203.0.113.10:3478,198.51.100.10:3478'
+```
+
+该命令不会启动 RM。它会检查两套协议的普通 Binding、备用地址与端口，以及实际回包来源；一项不通过就返回非零退出码。若探测主机自身 NAT/防火墙阻拦换源回复，请换有合适 UDP 路径的主机复核。命令通过只代表该检查主机的路径可用。先在隔离 RM 设置 `CODEXRM_P2P_NAT_STUN`（同一逗号分隔列表，最多四个 `IPv4:UDP端口`），用实际手机蜂窝网络和 Windows Agent 在诊断弹窗中多次复测；双端都能完成分类后，再将同一配置加入生产 RM 并重启。**不要换掉 `CODEXRM_P2P_STUN`**：它仍用于业务直连，不等同于诊断端点。未配专用端点时仍可做现有的基础探测，但普通 STUN 的 Binding 回包不足以拿到完整分类。
 
 ## 结构与接口
 

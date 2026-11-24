@@ -44,13 +44,32 @@ func signalUntil(t *testing.T, c *websocket.Conn, kind string) protocol.Envelope
 func TestDirectBusinessAndFallback(t *testing.T) {
 	t.Run("legacy", func(t *testing.T) {
 		_, h := directTestRM(t)
-		testDirectBusinessAndFallback(t, h, false, false, false)
+		testDirectBusinessAndFallback(t, h, false, false, false, false)
 	})
 	t.Run("both unpredictable with capability", func(t *testing.T) {
-		testDirectBusinessAndFallback(t, dualUnpredictableTestRM(t), true, false, false)
+		testDirectBusinessAndFallback(t, dualUnpredictableTestRM(t), true, false, false, false)
+	})
+	t.Run("client UDP egress differs from signaling", func(t *testing.T) {
+		s, err := server.New(server.Config{DataDir: t.TempDir(), AdminToken: "test-key", P2PSTUN: "127.0.0.1:9",
+			P2PTrustProxy: true, P2PLocalTest: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler := s.Handler()
+		h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip := "127.0.0.1"
+			if r.URL.Path == "/api/v1/client/ws" {
+				ip = "192.0.2.20" // No UDP candidate has this signaling IP or a verifier receipt.
+			}
+			r.Header.Set("X-Real-IP", ip)
+			r.Header.Set("X-Forwarded-Proto", "https")
+			handler.ServeHTTP(w, r)
+		}))
+		t.Cleanup(func() { s.Close(); h.Close() })
+		testDirectBusinessAndFallback(t, h, false, false, false, true)
 	})
 	t.Run("IPv6 UDP", func(t *testing.T) {
-		testDirectBusinessAndFallback(t, ipv6TestRM(t), false, true, true)
+		testDirectBusinessAndFallback(t, ipv6TestRM(t), false, true, true, false)
 	})
 	t.Run("IPv4 UDP verified independently of IPv6 WebSocket", func(t *testing.T) {
 		s, err := server.New(server.Config{DataDir: t.TempDir(), AdminToken: "test-key", P2PSTUN: "127.0.0.1:9",
@@ -70,7 +89,27 @@ func TestDirectBusinessAndFallback(t *testing.T) {
 			handler.ServeHTTP(w, r)
 		}))
 		t.Cleanup(func() { s.Close(); h.Close() })
-		testDirectBusinessAndFallback(t, h, false, true, false)
+		testDirectBusinessAndFallback(t, h, false, true, false, false)
+	})
+	t.Run("IPv6 UDP verified independently of IPv4 WebSocket", func(t *testing.T) {
+		probe, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+		if err != nil {
+			t.Skipf("no IPv6 UDP loopback: %v", err)
+		}
+		_ = probe.Close()
+		s, err := server.New(server.Config{DataDir: t.TempDir(), AdminToken: "test-key", P2PSTUN: "[::1]:9",
+			P2PTrustProxy: true, P2PLocalTest: true, P2PVerifyListen: "[::1]:0", P2PVerifyPublic: "[::1]:0"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler := s.Handler()
+		h := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Header.Set("X-Real-IP", "192.0.2.10")
+			r.Header.Set("X-Forwarded-Proto", "https")
+			handler.ServeHTTP(w, r)
+		}))
+		t.Cleanup(func() { s.Close(); h.Close() })
+		testDirectBusinessAndFallback(t, h, false, true, true, false)
 	})
 }
 
@@ -121,13 +160,21 @@ func ipv6TestRM(t *testing.T) *httptest.Server {
 	return h
 }
 
-func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server, dualNAT, ipv6, wantIPv6 bool) {
+func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server, dualNAT, ipv6, wantIPv6, clientInitiated bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	cwd := t.TempDir()
 	contents := bytes.Repeat([]byte("direct artifact"), 75_000)
 	if err := os.WriteFile(filepath.Join(cwd, "sample.apk"), contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	const png64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aA3sAAAAASUVORK5CYII="
+	png, err := base64.StdEncoding.DecodeString(png64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "sample.png"), png, 0600); err != nil {
 		t.Fatal(err)
 	}
 	a, err := agent.New(agent.Config{ServerURL: h.URL, DataDir: t.TempDir(), Cwd: cwd, Mock: true, EnrollmentKey: "test-key"})
@@ -154,10 +201,14 @@ func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server, dualNAT, ip
 	}
 	begin := protocol.P2P("begin", "")
 	begin.DualNATPunch, begin.IPv6 = dualNAT, ipv6
+	begin.ClientInitiated = clientInitiated
 	readSignal(begin)
 	start := signalUntil(t, c, "start").P2P
 	if start.DualNATPunch != dualNAT {
 		t.Fatalf("negotiated dual NAT punch = %t, want %t", start.DualNATPunch, dualNAT)
+	}
+	if start.ClientInitiated != clientInitiated {
+		t.Fatalf("negotiated client initiation = %t, want %t", start.ClientInitiated, clientInitiated)
 	}
 	if start.IPv6 != ipv6 {
 		t.Fatalf("negotiated IPv6 = %t, want %t", start.IPv6, ipv6)
@@ -235,6 +286,18 @@ func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server, dualNAT, ip
 		}
 	}
 	checkRelayDenied()
+	// The same paired client can transfer a chat attachment on the QUIC connection.
+	const contents64 = "AQIDBA=="
+	attachment := direct(5, "codexrm/attachment/begin", map[string]any{"name": "example.bin", "size": 4})
+	attachmentID := attachment["id"]
+	direct(6, "codexrm/attachment/chunk", map[string]any{"id": attachmentID, "offset": 0, "data": contents64})
+	direct(7, "codexrm/attachment/finish", map[string]any{"id": attachmentID})
+	if downloaded := direct(8, "codexrm/attachment/read", map[string]any{"id": attachmentID, "offset": 0}); downloaded["data"] != contents64 {
+		t.Fatalf("P2P attachment differs: %+v", downloaded)
+	}
+	if image := direct(9, "codexrm/image/read", map[string]any{"path": "sample.png", "cwd": cwd, "offset": 0}); image["data"] != png64 {
+		t.Fatalf("P2P image differs: %+v", image)
+	}
 	handle := direct(10, protocol.DirectFilePrefix+"open", fileParams)
 	var downloaded []byte
 	for id := 11; len(downloaded) < len(contents); id++ {
@@ -371,11 +434,14 @@ func TestDirectSignalingRejectsUnrelatedCandidatesAndRevokes(t *testing.T) {
 	write(t, ag, protocol.Envelope{Type: protocol.TypeP2P, P2P: protocol.P2P("hello", "")})
 	signalUntil(t, c, "available")
 	begin := protocol.P2P("begin", "")
-	begin.DualNATPunch = true
+	begin.DualNATPunch, begin.ClientInitiated = true, true
 	write(t, c, protocol.Envelope{Type: protocol.TypeP2P, P2P: begin, ClientID: "other"})
-	start := signalUntil(t, ag, "start")
-	if start.P2P.DualNATPunch || signalUntil(t, c, "start").P2P.DualNATPunch {
+	start, clientStart := signalUntil(t, ag, "start"), signalUntil(t, c, "start")
+	if start.P2P.DualNATPunch || clientStart.P2P.DualNATPunch {
 		t.Fatal("client capability alone must not enable dual NAT punching")
+	}
+	if start.P2P.ClientInitiated || clientStart.P2P.ClientInitiated {
+		t.Fatal("client capability alone must not permit an addressless offer")
 	}
 	if start.ClientID != client.ClientID {
 		t.Fatal("RM trusted a supplied client ID")
@@ -462,7 +528,7 @@ func TestLANOnlyOfferExchangesPeerPrivateAddress(t *testing.T) {
 }
 
 func TestDirectOfferUsesUDPSourceDifferentFromSignaling(t *testing.T) {
-	for _, scenario := range []string{"verified", "wrong port", "wrong peer", "no receipt", "multiple verifiers", "wrong extra port"} {
+	for _, scenario := range []string{"verified", "wrong port", "wrong peer", "no receipt", "one verifier multiple sockets", "multiple verifiers", "wrong extra port"} {
 		t.Run(scenario, func(t *testing.T) {
 			config := server.Config{DataDir: t.TempDir(), AdminToken: "test-key", P2PSTUN: "127.0.0.1:9",
 				P2PTrustProxy: true, P2PLocalTest: true, P2PVerifyListen: "127.0.0.1:0", P2PVerifyPublic: "127.0.0.1:0"}
@@ -525,13 +591,16 @@ func TestDirectOfferUsesUDPSourceDifferentFromSignaling(t *testing.T) {
 				t.Fatal("expected receipt for the real UDP socket")
 			}
 			verified := offer.Candidates[0]
-			if config.P2PVerifyMore != "" {
-				if len(start.VerifyMore) != 1 || start.VerifyMore[0] != config.P2PVerifyMore || offer.Proofs[verified] == "" {
+			if config.P2PVerifyMore != "" || scenario == "one verifier multiple sockets" {
+				if !start.MultiPath || offer.Proofs[verified] == "" || (config.P2PVerifyMore != "" && (len(start.VerifyMore) != 1 || start.VerifyMore[0] != config.P2PVerifyMore)) {
 					t.Fatal("expected additional verifier and deduplicated receipt from the punching socket")
 				}
 				// Use a second source socket to simulate an alternate mapping returned by the remote verifier.
 				alternate := *start
-				alternate.VerifyUDP, alternate.VerifyMore = start.VerifyMore[0], nil
+				if len(start.VerifyMore) > 0 {
+					alternate.VerifyUDP = start.VerifyMore[0]
+				}
+				alternate.VerifyMore = nil
 				otherSocket, otherOffer, err := p2p.Prepare(t.Context(), false, alternate)
 				if err != nil {
 					t.Fatal(err)
@@ -551,15 +620,27 @@ func TestDirectOfferUsesUDPSourceDifferentFromSignaling(t *testing.T) {
 				}
 				offer.Candidates = []string{verified, other}
 				offer.Proofs[other] = otherOffer.Proof
+				offer.PathMappings = map[string]protocol.P2PMappingHint{
+					verified: {Mapping: protocol.P2PMappingLinear, Step: 3},
+					other:    {Mapping: protocol.P2PMappingLinear, Step: 99},
+				}
+
 				write(t, c, protocol.Envelope{Type: protocol.TypeP2P, P2P: offer})
 				forwarded := signalUntil(t, ag, "offer").P2P
 				want := []string{verified}
-				if scenario == "multiple verifiers" {
+				if scenario == "multiple verifiers" || scenario == "one verifier multiple sockets" {
 					want = append(want, other)
 				}
 				if strings.Join(forwarded.Candidates, ",") != strings.Join(want, ",") || forwarded.Proof != "" || len(forwarded.Proofs) != 0 || forwarded.Ticket != "" {
 					t.Fatalf("wrong forwarded candidates or leaked receipts: %+v", forwarded)
 				}
+				if len(forwarded.PathMappings) != len(want) || forwarded.PathMappings[verified].Step != 3 {
+					t.Fatalf("unexpected verified mappings: %+v", forwarded.PathMappings)
+				}
+				if len(want) > 1 && forwarded.PathMappings[other].Mapping != protocol.P2PMappingVaries {
+					t.Fatalf("invalid port step was not normalized: %+v", forwarded.PathMappings)
+				}
+
 				return
 			}
 			addr, err := net.ResolveUDPAddr("udp4", verified)
@@ -573,7 +654,7 @@ func TestDirectOfferUsesUDPSourceDifferentFromSignaling(t *testing.T) {
 				offer.Candidates = []string{verified, addr.String(), "192.0.2.99:40000"}
 			}
 			if scenario == "no receipt" {
-				offer.Proof = ""
+				offer.Proof, offer.Proofs = "", nil
 			}
 			write(t, c, protocol.Envelope{Type: protocol.TypeP2P, P2P: offer})
 			if scenario == "verified" {

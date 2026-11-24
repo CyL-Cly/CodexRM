@@ -79,6 +79,18 @@ class DirectRetryTest {
     }
 
     @Test
+    fun networkChangeResumesNegotiationWithoutBypassingRelayCooldown() {
+        val retry = DirectRetry()
+        retry.requested(10_000)
+        retry.suspendForMapping()
+
+        retry.onNetworkChanged()
+
+        assertEquals(11_000L, retry.delay(20_000))
+        assertEquals(0L, retry.delay(31_000))
+    }
+
+    @Test
     fun replacementWebSocketCanNegotiateImmediately() {
         val retry = DirectRetry()
         retry.requested(10_000)

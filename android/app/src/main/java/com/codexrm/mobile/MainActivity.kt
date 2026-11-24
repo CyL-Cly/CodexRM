@@ -5,8 +5,6 @@ import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
-import android.app.Activity
-import android.app.AlertDialog
 import android.app.Dialog
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
@@ -18,8 +16,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.graphics.BitmapFactory
 import android.graphics.drawable.ColorDrawable
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -28,39 +26,43 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.provider.Settings
 import android.text.Editable
-import android.text.InputType
 import android.text.TextWatcher
 import android.text.method.ScrollingMovementMethod
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
+import android.view.KeyEvent
+import android.view.KeyboardShortcutGroup
+import android.view.KeyboardShortcutInfo
+import android.view.Menu
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
-import android.widget.BaseAdapter
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ListView
-import android.widget.PopupMenu
-import android.widget.PopupWindow
-import android.widget.ProgressBar
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.activity.ComponentActivity
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.core.view.WindowCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import okhttp3.Call
+import top.yukonga.miuix.kmp.basic.BasicComponent
+import top.yukonga.miuix.kmp.basic.SmallTitle
+import top.yukonga.miuix.kmp.basic.RadioButton
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -72,11 +74,12 @@ import kotlin.concurrent.thread
 import kotlin.math.min
 
 private const val PICK_COMPOSER_ATTACHMENT = 43
+private const val PICK_APPEARANCE_IMAGE = 48
 private const val CAPTURE_ATTACHMENT_PERMISSION = 46
 private const val ALBUM_WRITE_PERMISSION = 47
 private const val ATTACHMENT_CAMERA_URI_FLAGS = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
 
-internal class MainActivity : Activity() {
+internal class MainActivity : ComponentActivity() {
     private lateinit var store: DeviceStore
     private lateinit var attachmentStore: AttachmentStore
     private lateinit var imageLoader: MessageImageLoader
@@ -99,15 +102,16 @@ internal class MainActivity : Activity() {
     private var outboxOwnerAgentId = ""
     private data class DeferredOpen(val agentId: String, val threadId: String, val silent: Boolean, val archived: Boolean)
     private var pendingOpenThread: DeferredOpen? = null
+    private var desktopCloseDialog: MiuixDialog? = null
     private val processPendingOpen = Runnable { drainPendingOpen() }
     private val pendingShares = ArrayDeque<Intent>()
     private var bootstrapListVersion = 0
-    private val conversationResults = LinkedHashMap<Int, AlertDialog>()
+    private val conversationResults = LinkedHashMap<Int, MiuixDialog>()
     private var nextConversationPanelId = 0
     private var updateCall: Call? = null
-    private var updateDialog: AlertDialog? = null
+    private var updateDialog: MiuixDialog? = null
     private var updateFailureReceiver: BroadcastReceiver? = null
-    private var connectionDialog: AlertDialog? = null
+    private var connectionDialog: MiuixDialog? = null
     private var dialogShowsDirect = false
     private var updateOperation = 0
     private var pendingUpdate: UpdateChecker.VersionInfo? = null
@@ -146,7 +150,6 @@ internal class MainActivity : Activity() {
     private lateinit var demoBadge: TextView
     private lateinit var messageList: ChatListView
     private lateinit var latestButton: View
-    private lateinit var conversationMenu: View
     private lateinit var diffButton: TextView
     private val conversationCache by lazy { ConversationCache(this) }
     private val conversationPrefs by lazy { getSharedPreferences("conversation_ui", MODE_PRIVATE) }
@@ -158,8 +161,11 @@ internal class MainActivity : Activity() {
     private val attachmentProgress = mutableMapOf<String, TextView>()
     private var uploadingDraft = ""
     private var failedUploadDraft = ""
-    private var pendingShare: Intent? = null
-    private var sharedDraftPending = false
+    private var markupDialog: MiuixDialog? = null
+    private var openingMarkup = false
+    private val reviewPendingShare = Runnable { reviewSharedDraft() }
+    private var shareDialog: MiuixDialog? = null
+    private var cancelDesktopShareWait: (() -> Unit)? = null
     private var shareForThread: Pair<ComposerBinding, SharedContent>? = null
     private var desktopShareClient: CodexClient? = null
     private var pendingBranchDraft: BranchDraft? = null
@@ -170,8 +176,8 @@ internal class MainActivity : Activity() {
     private var pinRequestVersion = 0
     private lateinit var welcome: ScrollView
     private lateinit var welcomeDescription: TextView
-    private lateinit var welcomePrimary: TextView
-    private lateinit var welcomeSecondary: TextView
+    private lateinit var welcomePrimary: MiuixButtonView
+    private lateinit var welcomeSecondary: MiuixButtonView
     private lateinit var adapter: MessageAdapter
     private lateinit var composer: EditText
     private lateinit var attachButton: FrameLayout
@@ -184,8 +190,8 @@ internal class MainActivity : Activity() {
     private lateinit var sendHint: TextView
     private lateinit var stopButton: FrameLayout
     private lateinit var workspaceButton: LinearLayout
-    private lateinit var modelButton: TextView
-    private lateinit var effortSpinner: Spinner
+    private lateinit var modelButton: MiuixButtonView
+    private lateinit var effortButton: MiuixButtonView
     private lateinit var cwdLabel: TextView
     private lateinit var runningActions: LinearLayout
     private lateinit var bootstrapArea: LinearLayout
@@ -200,7 +206,7 @@ internal class MainActivity : Activity() {
     private var serverInput: EditText? = null
     private var codeInput: EditText? = null
     private var pairError: TextView? = null
-    private var pairSubmit: TextView? = null
+    private var pairSubmit: MiuixButtonView? = null
 
     private var online = false
     private var connectionState = ConnectionState.CONNECTING
@@ -214,6 +220,8 @@ internal class MainActivity : Activity() {
     private var outbox = OutboxState()
     private var running = false
     private var readOnly = false
+    private val providerUnavailable get() = currentThread?.optBoolean("codexrmProviderUnavailable") == true
+    private val providerSwitchHint = "请切换到可用的供应商后继续对话"
     private var activeTurnId = ""
     private var latestTurn: TurnProgress? = null
     private var startedAt = 0L
@@ -235,6 +243,9 @@ internal class MainActivity : Activity() {
     private var modelLoadSequence = 0
     private var modelCatalogLoaded = false
     private var settingsPage: SettingsPage? = null
+    private lateinit var appearance: ChatAppearance
+    private var pendingBackgroundPicker: AppearanceArea? = null
+    private var selectionDialog: Dialog? = null
     private val modelRefresh = object : Runnable {
         override fun run() {
             if (!resumed) return
@@ -244,7 +255,8 @@ internal class MainActivity : Activity() {
     }
     private var models = listOf<ModelOption>()
     private var selectedModelOption: ModelOption? = null
-    private var updatingSpinners = false
+    private var explicitModelChoice: ModelChoice? = null
+    private var effortSelection = ""
     private var generation = 0
     private var openGeneration = 0
     private var sidebarOpen = false
@@ -275,7 +287,7 @@ internal class MainActivity : Activity() {
     private lateinit var workspaceActions: LinearLayout
     private lateinit var sidebarScroll: ScrollView
     private var devicesExpanded = false
-    private var devicePopup: PopupWindow? = null
+    private var devicePopup: MiuixDialogHost? = null
     private val items = LinkedHashMap<String, JSONObject>()
     private val userMessages = UserMessageReconciler()
     private data class DeltaBuffer(val id: String, val type: String, val turnId: String, val text: StringBuilder)
@@ -309,13 +321,20 @@ internal class MainActivity : Activity() {
         override fun run() { refreshSnapshot() }
     }
 
+    private val replySpeech by lazy { ReplySpeech(this, ::toast) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = DeviceStore(this)
+        appearance = ChatAppearance(this, ::applyAppearance)
+        pendingBackgroundPicker = AppearanceArea.entries.firstOrNull { it.key == savedInstanceState?.getString("backgroundPicker") }
         attachmentStore = AttachmentStore(this)
         attachmentStore.cleanupStaleFiles()
         imageLoader = MessageImageLoader(this) {
-            ImageEnvironment("${device?.serverUrl.orEmpty().trimEnd('/')}\n${currentAgent()}", currentCwd, client, info.optBoolean("images"))
+            ImageEnvironment(
+                "${device?.serverUrl.orEmpty().trimEnd('/')}\n${currentAgent()}", currentCwd, client,
+                info.optBoolean("images"), info.optJSONObject("attachments")?.optBoolean("relayImages") == true,
+            )
         }
         workspaceFiles = WorkspaceFileUi(this, { client }, { device }, { info.optBoolean("directFiles") }) {
             if (::adapter.isInitialized) adapter.refreshFileCards()
@@ -328,11 +347,18 @@ internal class MainActivity : Activity() {
         device = devices.firstOrNull { it.agentId == store.selectedId } ?: devices.firstOrNull()
         outboxOwnerAgentId = currentAgent()
         if (device == null) showPair() else showMain(reset = true)
+        restoreModelChoice(savedInstanceState)
         if (savedInstanceState == null) acceptExternalIntent(intent)
+        else {
+            @Suppress("DEPRECATION")
+            val queued = savedInstanceState.getParcelableArrayList<Intent>("pendingShares")
+            if (queued != null) pendingShares.addAll(queued)
+        }
+        ChatEntryPoints.registerShortcuts(this)
         if (Build.VERSION.SDK_INT < 33 && !store.legacySystemWarningShown) {
             store.legacySystemWarningShown = true
             styledDialog(
-                AlertDialog.Builder(this)
+                MiuixDialog.Builder(this)
                     .setTitle("系统版本提示")
                     .setMessage("当前系统版本低于 Android 13，本应用可能无法完全兼容 Android 13 以下的系统，部分功能可能出现异常。建议将系统更新到 Android 13 或更高版本。")
                     .setPositiveButton("我知道了", null),
@@ -345,6 +371,7 @@ internal class MainActivity : Activity() {
         super.onStart()
         TaskMonitor.stop(this)
         started = true
+        appearance.start()
         if (mainVisible) connect()
     }
 
@@ -357,6 +384,9 @@ internal class MainActivity : Activity() {
         super.onResume()
         TaskMonitor.stop(this)
         resumed = true
+        DeviceRevokeJob.onFailure = ::showRevocationFailure
+        showRevocationFailure()
+        if (store.pendingRevocations().isNotEmpty()) DeviceRevokeJob.schedule(this)
         handler.postDelayed(modelRefresh, 180_000L)
         val pending = pendingUpdate
         if (pending != null) {
@@ -364,13 +394,21 @@ internal class MainActivity : Activity() {
             if (UpdateChecker.canInstall(this)) startUpdateDownload(pending) else showUpdateAvailable(pending)
         }
         showStartupUpdateIfReady()
+        reviewSharedDraft()
     }
     override fun onPause() {
         resumed = false
+        DeviceRevokeJob.onFailure = null
         handler.removeCallbacks(modelRefresh)
-        if (mainVisible && !isChangingConfigurations && TaskMonitor.enabled(this, currentAgent())) {
-            val monitor = Intent(this, TaskMonitor::class.java).putExtra(TaskMonitor.DEVICE, currentAgent())
-            runCatching { startForegroundService(monitor) }
+        if (mainVisible && online && !isChangingConfigurations && TaskMonitor.enabled(this, currentAgent())) {
+            val activeThreads = threadList.activeIds.toMutableSet()
+            if (running && currentThreadId.isNotEmpty()) activeThreads.add(currentThreadId)
+            if (activeThreads.isNotEmpty()) {
+                val monitor = Intent(this, TaskMonitor::class.java)
+                    .putExtra(TaskMonitor.DEVICE, currentAgent())
+                    .putExtra(TaskMonitor.ACTIVE_THREADS, activeThreads.toTypedArray())
+                runCatching { startForegroundService(monitor) }
+            }
         }
         super.onPause()
     }
@@ -380,7 +418,9 @@ internal class MainActivity : Activity() {
     }
     override fun onStop() {
         started = false
+        appearance.stop()
         finishBackGesture(commit = false)
+        replySpeech.stop()
         workspaceFiles.activityStopped()
         saveDraft()
         devicePopup?.dismiss()
@@ -389,14 +429,21 @@ internal class MainActivity : Activity() {
         super.onStop()
     }
     override fun onDestroy() {
+        appearance.close()
         pairOperation++
         pairCall?.cancel()
         pairCall = null
+        cancelDesktopShareWait?.invoke()
+        cancelDesktopShareWait = null
         desktopShareClient?.stop()
         desktopShareClient = null
+        shareDialog?.dismiss()
         settingsPage?.dismiss()
         settingsPage = null
+        selectionDialog?.dismiss()
+        selectionDialog = null
         attachmentSheet?.dismiss()
+        markupDialog?.dismiss()
         if (backCallbackRegistered) {
             SystemBackCompat.unregister(this, backCallback)
         }
@@ -404,15 +451,24 @@ internal class MainActivity : Activity() {
         pairCall?.cancel()
         pendingUpdate = null
         handler.removeCallbacksAndMessages(null)
+        replySpeech.close()
         imageLoader.close()
         workspaceFiles.close()
         super.onDestroy()
     }
     override fun onSaveInstanceState(outState: Bundle) {
+        pendingBackgroundPicker?.let { outState.putString("backgroundPicker", it.key) }
         saveDraft()
         outState.putString("threadId", currentThreadId)
+        explicitModelChoice?.let { choice ->
+            outState.putString("modelChoiceThread", choice.threadId)
+            outState.putString("modelChoiceProvider", choice.providerId)
+            outState.putString("modelChoiceModel", choice.model)
+            outState.putString("modelChoiceEffort", choice.effort)
+        }
         outState.putString("attachmentPickerKey", attachmentPickerKey)
         outState.putString("attachmentCameraFile", attachmentCameraFile)
+        outState.putParcelableArrayList("pendingShares", ArrayList(pendingShares))
         super.onSaveInstanceState(outState)
     }
 
@@ -436,6 +492,10 @@ internal class MainActivity : Activity() {
             drawSidebar(-sidebar.layoutParams.width.toFloat())
         }
         Ui.configure(this, store.darkTheme)
+        renderPairPage()
+    }
+
+    private fun renderPairPage() {
         val scroll = ScrollView(this).apply { isFillViewport = true; setBackgroundColor(Ui.BACKGROUND) }
         val outer = Ui.column(this).apply {
             setPadding(Ui.dp(context, 20), Ui.dp(context, 40), Ui.dp(context, 20), Ui.dp(context, 24))
@@ -476,18 +536,21 @@ internal class MainActivity : Activity() {
         serverInput = server
         card.addView(server, matchWidth(top = 9))
         val error = Ui.text(this, pairMessage, 12f, Ui.DANGER).apply {
-            visibility = if (pairMessage.isEmpty()) View.GONE else View.VISIBLE
+            visibility = if (pairMessage.isEmpty() || pairCall != null) View.GONE else View.VISIBLE
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE
         }
         pairError = error
         card.addView(error, matchWidth(top = 8))
-        val submit = Ui.button(this, "使用配对码连接") { submitManualPair() }
+        val submit = Ui.button(this, if (pairCall == null) "使用配对码连接" else "正在连接…") { submitManualPair() }.apply {
+            isEnabled = pairCall == null
+        }
         pairSubmit = submit
         card.addView(submit, matchWidth(top = 10))
         card.addView(Ui.text(this, "配对码有效期 10 分钟，仅可使用一次。\n只有完成配对的设备才能访问这台电脑。", 12f, Ui.DIM).apply {
             gravity = Gravity.CENTER; setLineSpacing(0f, 1.4f); setPadding(0, Ui.dp(context, 22), 0, 0)
         })
         if (devices.any { it.agentId !in expiredAgentIds }) card.addView(Ui.button(this, "返回已配对设备") { showMain() }, matchWidth(top = 12))
+        card.addView(Ui.button(this, "设置") { showAppSettings() }, matchWidth(top = 8))
         Ui.applyWindowInsets(scroll)
         pairPage = scroll
         setContentView(FrameLayout(this).apply { addView(scroll, backPageParams()) })
@@ -501,7 +564,7 @@ internal class MainActivity : Activity() {
 
     private fun pair(data: PairingData) {
         if (data.requiresCleartextWarning) {
-            styledDialog(AlertDialog.Builder(this)
+            styledDialog(MiuixDialog.Builder(this)
                 .setTitle("无加密连接")
                 .setMessage("无加密连接可能会泄露你的数据，自行承担风险")
                 .setNegativeButton("取消连接", null)
@@ -544,6 +607,8 @@ internal class MainActivity : Activity() {
                 device = paired; pairMessage = ""; restoreThreadId = ""
                 if (old != null && old.token != paired.token) Network.request(old.serverUrl, "/api/v1/client/revoke", old.token, JSONObject()) { _, _ -> }
                 toast("已配对 ${paired.serverName}")
+                settingsPage?.dismiss()
+                settingsPage = null
                 showMain(reset = true)
             } catch (exception: Exception) { showPairError(exception.message ?: "配对响应无效") }
         }
@@ -558,6 +623,16 @@ internal class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (workspaceFiles.onActivityResult(requestCode, resultCode, data)) {
             settingsPage?.refreshActionSummaries()
+            return
+        }
+        if (requestCode == PICK_APPEARANCE_IMAGE) {
+            val area = pendingBackgroundPicker
+            pendingBackgroundPicker = null
+            val uri = data?.data
+            if (area != null && uri != null && resultCode == RESULT_OK) {
+                if (settingsPage?.isShowing != true) showAppSettings()
+                settingsPage?.cropLocalImage(area, uri)
+            }
             return
         }
         if (requestCode == PICK_COMPOSER_ATTACHMENT) {
@@ -600,7 +675,7 @@ internal class MainActivity : Activity() {
             workspaceFiles.size(RemoteFile(currentCwd, currentThreadId, file.path), done)
         }, ::openMessageFile, { file ->
             workspaceFiles.isDownloaded(RemoteFile(currentCwd, currentThreadId, file.path))
-        }, ::showAsyncQuestions, ::asyncQuestionStatus)
+        }, ::showAsyncQuestions, ::asyncQuestionStatus, { message -> replySpeech.toggle(message.id, message.body) })
         adapter.showFileCards = directFilesAvailable()
         mainRoot = SidebarSwipeLayout(
             this,
@@ -683,6 +758,7 @@ internal class MainActivity : Activity() {
         body.addView(transcript, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         buildComposer(body)
         buildSidebar()
+        applyAppearance()
         applyReadingMode(resources.configuration)
     }
 
@@ -731,11 +807,14 @@ internal class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(Ui.dp(context, 48), Ui.dp(context, 48))
         }
         topbar.addView(connectionButton)
+        topbar.addView(Ui.iconButton(this, "monitor", "\u8fdc\u7a0b\u684c\u9762", 36) { openRemoteControl() }.apply {
+            layoutParams = LinearLayout.LayoutParams(Ui.dp(context, 48), Ui.dp(context, 48))
+        })
         deviceButton = Ui.column(this, false).apply {
             gravity = Gravity.CENTER_VERTICAL
             background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 20).toFloat(), Ui.BORDER)
             setPadding(Ui.dp(context, 10), 0, Ui.dp(context, 8), 0)
-            setOnClickListener { showDevices() }
+            setOnClickListener { showDevices(this) }
         }
         connectionDot = Ui.dot(this, Ui.DIM)
         deviceButton.addView(connectionDot, LinearLayout.LayoutParams(Ui.dp(this, 6), Ui.dp(this, 6)))
@@ -746,8 +825,6 @@ internal class MainActivity : Activity() {
         deviceButton.addView(deviceLabel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         deviceButton.addView(IconView(this, "chevron", Ui.MUTED), LinearLayout.LayoutParams(Ui.dp(this, 12), Ui.dp(this, 12)))
         topbar.addView(deviceButton, LinearLayout.LayoutParams(Ui.dp(this, 132), Ui.dp(this, 48)).apply { leftMargin = Ui.dp(this@MainActivity, 6) })
-        conversationMenu = Ui.iconButton(this, "more", "会话工具", 40) { showConversationTools() }
-        topbar.addView(conversationMenu)
         topbar.addView(Ui.iconButton(this, "chat-plus", "新会话") { newChat(showKeyboard = true) }.apply {
             (getChildAt(0) as IconView).apply {
                 setColor(Ui.TEXT)
@@ -817,19 +894,23 @@ internal class MainActivity : Activity() {
         composer = Ui.input(this, "给 Codex 发消息…", multiLine = true).apply {
             setHintTextColor(Ui.MUTED); minHeight = Ui.dp(context, 48); maxHeight = Ui.dp(context, 200)
             filters = arrayOf(android.text.InputFilter.LengthFilter(200000))
-            contentDescription = "消息输入，回车发送，Shift 加回车换行"
-            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEND
+            contentDescription = "消息输入，回车换行"
+            imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_ENTER_ACTION
         }
-        composer.setOnEditorActionListener { _, actionId, _ ->
-            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEND) {
-                sendMessage(false); true
-            } else false
-        }
-        composer.setOnKeyListener { _, keyCode, event ->
-            val enter = keyCode == android.view.KeyEvent.KEYCODE_ENTER || keyCode == android.view.KeyEvent.KEYCODE_NUMPAD_ENTER
-            val plainEnter = enter && event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
-                !event.isShiftPressed && !event.isCtrlPressed && !event.isAltPressed
-            if (plainEnter) { sendMessage(false); true } else false
+        ViewCompat.setOnReceiveContentListener(composer, arrayOf("image/*")) { _, payload ->
+            val parts = payload.partition { it.uri?.scheme == "content" && it.text == null && it.intent == null }
+            val images = parts.first ?: return@setOnReceiveContentListener payload
+            when {
+                !attachButton.isEnabled -> toast("当前无法添加图片，请稍后重试")
+                !online || !loaded -> toast("设备尚未连接或正在同步")
+                !info.has("attachments") -> toast("请更新本地 Agent 以支持图片")
+                else -> {
+                    val uris = images.clip.let { clip -> (0 until minOf(10, clip.itemCount)).map { clip.getItemAt(it).uri } }.distinct()
+                    // Keep the payload and any temporary IME grant alive until the copies finish.
+                    stageAttachments(attachmentDraftKey(), uris) { java.lang.ref.Reference.reachabilityFence(payload) }
+                }
+            }
+            parts.second
         }
         composer.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -853,20 +934,16 @@ internal class MainActivity : Activity() {
             (getChildAt(0) as IconView).setColor(Ui.TEXT)
         }
         toolbar.addView(attachButton)
-        modelButton = Ui.text(this, "默认模型", 12f, Ui.MUTED).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            minHeight = Ui.dp(context, 48)
-            maxLines = 2
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(Ui.dp(context, 6), Ui.dp(context, 4), Ui.dp(context, 6), Ui.dp(context, 4))
-            background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 8).toFloat())
-            contentDescription = "选择模型，当前为默认模型"
-            isFocusable = true
+        modelButton = MiuixButtonView(this, "默认模型").apply {
             setOnClickListener { showModelPicker() }
         }
-        toolbar.addView(modelButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        effortSpinner = Spinner(this).apply { contentDescription = "选择思考强度"; minimumHeight = Ui.dp(context, 48) }
-        toolbar.addView(effortSpinner, LinearLayout.LayoutParams(Ui.dp(this, 104), Ui.dp(this, 48)))
+        toolbar.addView(modelButton, LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1f).apply {
+            marginStart = Ui.dp(this@MainActivity, 4)
+        })
+        effortButton = MiuixButtonView(this, InteractionCopy.effortLabel("")).apply { setOnClickListener { showEffortChoices() } }
+        toolbar.addView(effortButton, LinearLayout.LayoutParams(Ui.dp(this, 96), Ui.dp(this, 48)).apply {
+            marginStart = Ui.dp(this@MainActivity, 6)
+        })
         stopButton = circleButton("stop", "停止任务") { stopTurn() }.apply { visibility = View.GONE }
         toolbar.addView(stopButton, LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)).apply { leftMargin = Ui.dp(this@MainActivity, 4) })
         sendButton = circleButton("arrow", "发送消息") { sendMessage(false) }
@@ -900,12 +977,12 @@ internal class MainActivity : Activity() {
             setOnLongClickListener { openWorkspaceFiles(currentCwd, currentThreadId) }
         }
         meta.addView(workspaceButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        meta.addView(Ui.iconButton(this, "folder", "管理当前工作目录文件") {
-            openWorkspaceFiles(currentCwd, currentThreadId)
+        meta.addView(Ui.iconButton(this, "folder", "电脑文件管理") {
+            openWorkspaceFiles(currentCwd, currentThreadId, startAtComputer = true)
         })
         zone.addView(meta, matchWidth())
         body.addView(zone, matchWidth())
-        configureSpinners()
+        refreshModelChoices()
     }
 
     private fun circleButton(icon: String, description: String, click: () -> Unit): FrameLayout = FrameLayout(this).apply {
@@ -935,7 +1012,6 @@ internal class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             addView(Ui.iconButton(context, "panel", "关闭侧栏") { closeSidebar() })
             addView(Ui.text(context, "CodexRM", 20f, bold = true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(Ui.iconButton(context, if (Ui.dark) "sun" else "moon", "切换明暗主题") { toggleTheme() })
         }
         sidebar.addView(brand, matchWidth(bottom = 8))
         val newConversation = Ui.column(this, false).apply {
@@ -1007,7 +1083,6 @@ internal class MainActivity : Activity() {
             setPadding(Ui.dp(context, 10), 0, Ui.dp(context, 10), 0)
             isClickable = true; isFocusable = true
             setOnClickListener { toggleDevices() }
-            setOnLongClickListener { device?.let(::confirmDeleteDevice); true }
             val icon = FrameLayout(context).apply {
                 background = Ui.rounded(Ui.SURFACE_ALT, Ui.dp(context, 8).toFloat())
                 addView(IconView(context, "monitor", Ui.MUTED), FrameLayout.LayoutParams(Ui.dp(context, 18), Ui.dp(context, 18), Gravity.CENTER))
@@ -1046,7 +1121,7 @@ internal class MainActivity : Activity() {
         val profile = Ui.column(this, false).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(sidebarDeviceButton, LinearLayout.LayoutParams(0, Ui.dp(context, 56), 1f))
-            addView(Ui.iconButton(context, "sliders", "工作区设置") { showSettings() })
+            addView(Ui.iconButton(context, "wrench", "工具") { showTools() })
             addView(Ui.iconButton(context, "settings", "设置") { showAppSettings() })
         }
         sidebar.addView(profile, matchWidth(top = 6))
@@ -1067,43 +1142,6 @@ internal class MainActivity : Activity() {
         }
     }
 
-    private fun configureSpinners() {
-        effortSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { if (!updatingSpinners) saveModelPreference() }
-        }
-        refreshModelSpinner()
-    }
-
-    private fun setSpinnerItems(
-        spinner: Spinner,
-        values: List<String>,
-        selectedLabels: List<String> = values,
-        dropdownNotes: List<String> = emptyList(),
-    ) {
-        spinner.backgroundTintList = android.content.res.ColorStateList.valueOf(Ui.MUTED)
-        spinner.adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, values) {
-            private fun style(view: View, position: Int, dropdown: Boolean): View {
-                val text = view.findViewById<TextView>(android.R.id.text1)
-                val notes = if (dropdown) dropdownNotes.getOrNull(position).orEmpty() else ""
-                val label = selectedLabels.getOrElse(position) { values[position] }
-                text.text = when {
-                    !dropdown -> label
-                    notes.isEmpty() -> label
-                    else -> "$label\n${notes.lineSequence().joinToString(" ")}"
-                }
-                if (notes.isNotEmpty()) text.isSingleLine = false
-                text.setTextColor(Ui.MUTED); text.textSize = if (dropdown) 13f else 12f
-                text.maxLines = if (notes.isEmpty()) 1 else 2
-                text.ellipsize = android.text.TextUtils.TruncateAt.END
-                view.setBackgroundColor(if (dropdown) Ui.SURFACE else Color.TRANSPARENT)
-                text.setPadding(Ui.dp(context, 6), 0, Ui.dp(context, 4), 0)
-                return view
-            }
-            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View = style(super.getView(position, convertView, parent), position, false)
-            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View = style(super.getDropDownView(position, convertView, parent), position, true)
-        }
-    }
 
     private fun toggleSidebar() { if (sidebarOpen) closeSidebar() else openSidebar() }
     private fun openSidebar() {
@@ -1180,6 +1218,7 @@ internal class MainActivity : Activity() {
                     }
                 }
                 renderDevices()
+                publishRemoteBridge()
                 // A fast restart can replace the peer without an intervening offline status.
                 if (online && (!wasOnline || (versionChanged && current.pendingAgentUpdateFrom.isNotBlank()))) {
                     conversationPrefs.edit().putLong("seen:${current.agentId}", System.currentTimeMillis()).apply()
@@ -1195,6 +1234,7 @@ internal class MainActivity : Activity() {
                 if (device?.agentId == current.agentId) {
                     updateConnectionIndicator()
                     updateDirectFiles()
+                    publishRemoteBridge()
                 }
             }
             override fun onAuthorizationExpired() {
@@ -1229,8 +1269,10 @@ internal class MainActivity : Activity() {
         conversationResults.values.forEach { it.dismiss() }
         conversationResults.clear()
         client?.stop(); client = null
+        RemoteBridge.clear()
         updateDirectFiles()
         connectionDialog?.dismiss()
+        desktopCloseDialog?.dismiss()
         invalidateSnapshots()
         devicePopup?.dismiss()
         devicesExpanded = false
@@ -1270,6 +1312,7 @@ internal class MainActivity : Activity() {
             requests.clear(); requestScopes.clear(); responding.clear()
             approvalRecoveryMessage = if (recoveringApprovals) "审批状态已从设备重新同步；仍待处理的审批会重新显示。" else ""
             info = result
+            settingsPage?.refreshActionSummaries()
             loadConversationPins()
             val version = info.string("version")
             val updated = current.confirmAgentUpdate(version)
@@ -1401,21 +1444,23 @@ internal class MainActivity : Activity() {
             if (result == null || requestGeneration != generation || sequence != modelLoadSequence) return@rpc
             val provider = JSONObject().put("name", "当前 Codex 配置").put("models", result.arrayAt("data"))
             modelCatalog = ModelCatalog(JSONObject().put("providers", JSONArray().put(provider)))
-            refreshModelSpinner()
+            refreshModelChoices()
         }
     }
 
     private fun parseProviderModels(result: JSONObject, showWarnings: Boolean) {
         modelCatalogLoaded = true
         modelCatalog = ModelCatalog(result)
-        refreshModelSpinner()
+        refreshModelChoices()
         val warnings = result.arrayAt("warnings")
         if (showWarnings && warnings.length() > 0) toast((0 until warnings.length()).joinToString("；") { warnings.optString(it) })
     }
 
-    private fun refreshModelSpinner() {
+    private fun refreshModelChoices() {
         if (!mainBuilt) return
         val thread = currentThread
+        val threadProvider = thread?.takeIf { it.string("model").isNotEmpty() }?.let(modelCatalog::threadProviderId)
+        if (applyExplicitChoice(threadProvider)) return
         if (thread != null && thread.string("model").isNotEmpty()) {
             showModelOptions(modelCatalog.threadProviderId(thread), thread.string("model"), selectedEffort())
         } else {
@@ -1427,10 +1472,8 @@ internal class MainActivity : Activity() {
     private fun showModelOptions(provider: String, model: String, effort: String) {
         models = modelCatalog.options(provider)
         selectedModelOption = modelCatalog.selectedOption(models, provider, model)
-        updatingSpinners = true
         updateModelButton()
-        updateEfforts(preserve = false, preferred = effort)
-        updatingSpinners = false
+        updateEfforts(preferred = effort)
     }
 
     private fun updateModelButton() {
@@ -1445,72 +1488,22 @@ internal class MainActivity : Activity() {
             toast(it)
             return
         }
-        val content = Ui.column(this).apply { setPadding(Ui.dp(context, 20), 0, Ui.dp(context, 20), 0) }
-        val search = Ui.boxInput(this, "搜索模型或供应商").apply { minHeight = Ui.dp(context, 48) }
-        content.addView(search, matchWidth(top = 8, bottom = 8))
-        val list = ListView(this).apply {
-            divider = null
-            dividerHeight = 0
-            isVerticalScrollBarEnabled = true
-        }
-        content.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, min(Ui.dp(this, 520), (resources.displayMetrics.heightPixels * 0.65).toInt())))
-        val dialog = AlertDialog.Builder(this).setTitle("选择模型").setView(content).setNegativeButton("关闭", null).create()
-        fun renderRows(rows: List<ModelPickerRow>) {
-            list.adapter = object : BaseAdapter() {
-                override fun getCount(): Int = rows.size
-                override fun getItem(position: Int): ModelPickerRow = rows[position]
-                override fun getItemId(position: Int): Long = position.toLong()
-                override fun isEnabled(position: Int): Boolean = !rows[position].header
-                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                    val row = rows[position]
-                    if (row.header) return Ui.text(this@MainActivity, row.title, 12f, Ui.MUTED, true).apply {
-                        minHeight = Ui.dp(context, 48)
-                        setPadding(Ui.dp(context, 12), Ui.dp(context, 8), Ui.dp(context, 12), Ui.dp(context, 4))
-                    }
-                    val selected = row.defaultChoice && selectedModelOption == null || row.option != null && row.option == selectedModelOption
-                    val value = Ui.column(this@MainActivity).apply {
-                        minimumHeight = Ui.dp(context, 56)
-                        gravity = Gravity.CENTER_VERTICAL
-                        setPadding(Ui.dp(context, 14), Ui.dp(context, 8), Ui.dp(context, 14), Ui.dp(context, 8))
-                        background = Ui.ripple(if (selected) Ui.SURFACE_ALT else Color.TRANSPARENT, Ui.dp(context, 8).toFloat())
-                        contentDescription = "${row.title}，${row.option?.model.orEmpty()}，${row.notes}${if (selected) "，当前选中" else ""}"
-                    }
-                    value.addView(Ui.text(this@MainActivity, "${if (selected) "✓ " else ""}${row.title}", 14f, if (selected) Ui.GREEN else Ui.TEXT, selected))
-                    row.option?.model?.takeIf { it != row.title }?.let { modelId ->
-                        value.addView(Ui.text(this@MainActivity, modelId, 12f, Ui.MUTED).apply { maxLines = 2 })
-                    }
-                    if (row.notes.isNotEmpty()) value.addView(Ui.text(this@MainActivity, row.notes, 12f, Ui.MUTED).apply { maxLines = 2 })
-                    return value
-                }
+        selectionDialog?.dismiss()
+        selectionDialog = showMiuixSelectionDialog(this, "选择模型") { close ->
+            MiuixModelChoices(models, selectedModelOption, close) { row ->
+                close()
+                if (row.defaultChoice) useDefaultModel()
+                else row.option?.let(::chooseModel)
             }
         }
-        renderRows(ModelPicker.rows(models, ""))
-        search.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
-            override fun afterTextChanged(s: Editable?) { renderRows(ModelPicker.rows(models, s?.toString().orEmpty())) }
-        })
-        list.setOnItemClickListener { _, _, position, _ ->
-            val row = list.adapter.getItem(position) as ModelPickerRow
-            if (row.header) return@setOnItemClickListener
-            if (row.emptyChoice) {
-                search.setText("")
-                return@setOnItemClickListener
-            }
-            dialog.dismiss()
-            when {
-                row.defaultChoice -> useDefaultModel()
-                row.option != null -> chooseModel(row.option)
-            }
-        }
-        styledDialog(dialog)
     }
 
     private fun useDefaultModel() {
         val currentThreadKeepsModel = currentThread?.string("model")?.isNotEmpty() == true
+        explicitModelChoice = null
         selectedModelOption = null
         updateModelButton()
-        updateEfforts(preserve = false)
+        updateEfforts()
         saveModelPreference()
         toast(if (currentThreadKeepsModel) "默认模型将用于新会话；当前会话继续使用原有模型" else "新会话将使用默认模型")
     }
@@ -1537,8 +1530,10 @@ internal class MainActivity : Activity() {
                 if (result != null && error == null) {
                     val provider = result.string("providerId")
                     val switchedModel = result.string("model")
-                    currentThread?.put("codexrmProvider", provider)?.put("model", switchedModel)
+                    currentThread?.put("codexrmProvider", provider)?.put("model", switchedModel)?.remove("codexrmProviderUnavailable")
+                    renderQueue()
                     showModelOptions(provider, switchedModel, effort)
+                    rememberExplicitChoice()
                     saveModelPreference()
                     toast("已在当前会话切换模型")
                 } else toast(error?.message ?: "无法切换模型")
@@ -1548,22 +1543,67 @@ internal class MainActivity : Activity() {
         }
         selectedModelOption = model
         updateModelButton()
-        updateEfforts(preserve = false, preferred = model.defaultEffort)
+        updateEfforts(preferred = model.defaultEffort)
+        rememberExplicitChoice()
         saveModelPreference()
     }
 
-    private fun updateEfforts(preserve: Boolean, preferred: String = "") {
-        val previous = if (preserve) selectedEffort() else preferred
-        val model = selectedModel(); val values = listOf("") + model?.efforts.orEmpty()
-        updatingSpinners = true
-        setSpinnerItems(effortSpinner, values, values.map(InteractionCopy::effortLabel))
-        val wanted = previous.ifEmpty { model?.defaultEffort.orEmpty() }
-        val index = values.indexOf(wanted); effortSpinner.setSelection(if (index >= 0) index else 0); updatingSpinners = false
+    private fun updateEfforts(preferred: String = "") {
+        val model = selectedModel()
+        val wanted = preferred.ifEmpty { model?.defaultEffort.orEmpty() }
+        effortSelection = wanted.takeIf { it in model?.efforts.orEmpty() }.orEmpty()
+        updateEffortButton()
+    }
+
+    private fun updateEffortButton() {
+        val label = InteractionCopy.effortLabel(effortSelection)
+        effortButton.text = label
+        effortButton.contentDescription = "选择思考强度，当前为$label"
+    }
+
+    private fun showEffortChoices() {
+        val model = selectedModel()
+        val values = listOf("") + model?.efforts.orEmpty()
+        val pickerGeneration = generation
+        MiuixDialog.Builder(this).setTitle("选择思考强度")
+            .setSingleChoiceItems(values.map(InteractionCopy::effortLabel).toTypedArray(), values.indexOf(effortSelection)) { dialog, index ->
+                dialog.dismiss()
+                if (active(pickerGeneration) && selectedModel() == model && !running) {
+                    effortSelection = values[index]
+                    updateEffortButton()
+                    rememberExplicitChoice()
+                    saveModelPreference()
+                }
+            }.setNegativeButton("取消", null).show()
     }
 
     private fun saveModelPreference() {
         val model = selectedModel()
         store.saveModelPreference(currentAgent(), pathKey(currentCwd), model?.providerId.orEmpty(), model?.model.orEmpty(), selectedEffort())
+    }
+
+    private fun rememberExplicitChoice() {
+        val model = selectedModel() ?: return
+        explicitModelChoice = ModelChoice(currentThreadId, model.providerId, model.model, selectedEffort())
+    }
+
+    private fun applyExplicitChoice(threadProviderId: String?): Boolean {
+        val retained = ModelSelection.retain(modelCatalog, explicitModelChoice, currentThreadId, threadProviderId) ?: return false
+        explicitModelChoice = explicitModelChoice?.copy(providerId = retained.first, model = retained.second)
+        showModelOptions(retained.first, retained.second, retained.third)
+        return true
+    }
+
+    private fun restoreModelChoice(state: Bundle?) {
+        val model = state?.getString("modelChoiceModel").orEmpty()
+        if (model.isEmpty()) return
+        explicitModelChoice = ModelChoice(
+            state?.getString("modelChoiceThread").orEmpty(),
+            state?.getString("modelChoiceProvider").orEmpty(),
+            model,
+            state?.getString("modelChoiceEffort").orEmpty(),
+        )
+        if (mainBuilt) refreshModelChoices()
     }
 
     private fun showWorkspaceChoices() {
@@ -1573,7 +1613,7 @@ internal class MainActivity : Activity() {
             threads.asSequence().sortedByDescending { it.lastActivityAt }.map { it.cwd })
             .filter { it.isNotBlank() }.distinctBy(::pathKey).toList()
         val pickerGeneration = generation
-        styledDialog(AlertDialog.Builder(this)
+        styledDialog(MiuixDialog.Builder(this)
             .setTitle("选择工作目录")
             .setSingleChoiceItems(paths.toTypedArray(), paths.indexOfFirst { pathKey(it) == currentKey }) { dialog, index ->
                 dialog.dismiss()
@@ -1587,12 +1627,13 @@ internal class MainActivity : Activity() {
     }
 
     private fun selectedModel(): ModelOption? = selectedModelOption
-    private fun selectedEffort(): String = selectedModel()?.efforts?.getOrNull(effortSpinner.selectedItemPosition - 1).orEmpty()
+    private fun selectedEffort(): String = effortSelection.takeIf { it in selectedModel()?.efforts.orEmpty() }.orEmpty()
 
     private fun resetConversation() {
         generation++; openGeneration++; invalidateSnapshots()
         currentThread = null; currentThreadId = ""; openingThreadId = ""; currentCwd = ""; info = JSONObject()
         modelCatalog = ModelCatalog(); selectedModelOption = null
+        explicitModelChoice = null
         modelCatalogLoaded = false
         threadList.clear()
         pinRequestVersion++
@@ -1611,7 +1652,7 @@ internal class MainActivity : Activity() {
         collapsedPaths = store.collapsed(currentAgent())
         rebindComposer(ComposerBinding(currentAgent(), "", ""))
         clearTranscript()
-        if (mainBuilt) { refreshModelSpinner(); renderApproval(); renderQueue(); updateControls() }
+        if (mainBuilt) { refreshModelChoices(); renderApproval(); renderQueue(); updateControls() }
     }
 
     private fun newChat(showKeyboard: Boolean = false) {
@@ -1622,7 +1663,7 @@ internal class MainActivity : Activity() {
         archivedThreadId = ""; conversationJump = null; pendingBranchDraft = null
         activeTurnId = ""; historyCursor = null; historyOlder = false; messageQueues.remove("")
         val restore = rebindComposer(ComposerBinding(currentAgent(), "", currentCwd))
-        clearTranscript(); restoreDraft(restore); renderApproval(); renderQueue(); refreshModelSpinner(); updateControls()
+        clearTranscript(); restoreDraft(restore); renderApproval(); renderQueue(); refreshModelChoices(); updateControls()
         if (showKeyboard) {
             if (sidebarOpen) closeSidebar(hideKeyboard = false)
             val input = composer
@@ -1636,6 +1677,7 @@ internal class MainActivity : Activity() {
     }
 
     private fun clearTranscript() {
+        replySpeech.stop()
         if (mainBuilt) messageList.restoreReadingPosition(null)
         latestTurn = null
         latestDiff = ""
@@ -1651,10 +1693,15 @@ internal class MainActivity : Activity() {
         if (sending || loading) return
         store.selectWorkspace(currentAgent(), path); currentCwd = path; collapsedPaths.remove(pathKey(path)); store.saveCollapsed(currentAgent(), collapsedPaths)
         restoreThreadId = ""
-        newChat(showKeyboard); refreshModelSpinner(); renderWorkspaces()
+        newChat(showKeyboard); refreshModelChoices(); renderWorkspaces()
     }
 
-    private fun openThread(id: String, silent: Boolean = false, archived: Boolean = false) {
+    private fun openThread(
+        id: String,
+        silent: Boolean = false,
+        archived: Boolean = false,
+        onOpened: ((readOnly: Boolean) -> Unit)? = null,
+    ) {
         if (id.isEmpty() || id in deletingThreads) return
         if (loading || sending || bootstrapping) {
             pendingOpenThread = DeferredOpen(currentAgent(), id, silent, archived)
@@ -1682,19 +1729,22 @@ internal class MainActivity : Activity() {
         }
         rpc("thread/resume", JSONObject().put("threadId", id)) { result, error ->
             if (!openActive(id, currentOpen)) return@rpc
-            if (result != null) { finishOpenThread(id, currentOpen, result, false); return@rpc }
+            if (result != null) { finishOpenThread(id, currentOpen, result, false, onOpened); return@rpc }
             val message = error?.message.orEmpty()
             when {
-                message.contains("active writer", true) -> {
+                desktopWriterConflict(error) -> {
                     val method = if (info.optBoolean("threadSnapshots")) "codexrm/thread/snapshot" else "thread/read"
                     val params = JSONObject().put("threadId", id); if (method == "thread/read") params.put("includeTurns", true)
-                    rpc(method, params) { fallback, fallbackError ->
-                        if (fallback != null) finishOpenThread(id, currentOpen, fallback, true) else failOpenThread(currentOpen, fallbackError?.message)
+                    rpc(method, params) fallback@{ fallback, fallbackError ->
+                        if (!openActive(id, currentOpen)) return@fallback
+                        if (fallback != null) finishOpenThread(id, currentOpen, fallback, true, onOpened)
+                        else failOpenThread(currentOpen, fallbackError?.message)
                     }
                 }
                 message.contains("paginat", true) || message.contains("excludeTurns", true) || message.contains("history mode", true) ->
                     rpc("thread/resume", JSONObject().put("threadId", id).put("excludeTurns", true)) { fallback, fallbackError ->
-                        if (fallback != null) finishOpenThread(id, currentOpen, fallback, false) else failOpenThread(currentOpen, fallbackError?.message)
+                        if (fallback != null) finishOpenThread(id, currentOpen, fallback, false, onOpened)
+                        else failOpenThread(currentOpen, fallbackError?.message)
                     }
                 else -> failOpenThread(currentOpen, message)
             }
@@ -1708,10 +1758,22 @@ internal class MainActivity : Activity() {
         if (pending.agentId == currentAgent()) openThread(pending.threadId, pending.silent, pending.archived)
     }
 
-    private fun finishOpenThread(id: String, currentOpen: Int, result: JSONObject, isReadOnly: Boolean) {
+    private fun finishOpenThread(
+        id: String,
+        currentOpen: Int,
+        result: JSONObject,
+        isReadOnly: Boolean,
+        onOpened: ((readOnly: Boolean) -> Unit)? = null,
+    ) {
         if (!openActive(id, currentOpen)) return
         val thread = result.optJSONObject("thread"); if (thread == null) { failOpenThread(currentOpen, "会话响应无效"); return }
-        if (thread.string("historyMode") == "paginated" && !(isReadOnly && info.optBoolean("threadSnapshots"))) {
+        fun render() {
+            renderOpenThread(id, result, thread, isReadOnly)
+            onOpened?.invoke(readOnly)
+        }
+        val hasSnapshotHistory = (isReadOnly && info.optBoolean("threadSnapshots")) ||
+            (thread.optBoolean("codexrmProviderUnavailable") && result.has("nextCursor"))
+        if (thread.string("historyMode") == "paginated" && !hasSnapshotHistory) {
             val params = JSONObject().put("threadId", id).put("limit", 30).put("sortDirection", "desc").put("itemsView", "full")
             rpc("thread/turns/list", params) { page, error ->
                 if (!openActive(id, currentOpen)) return@rpc
@@ -1719,9 +1781,9 @@ internal class MainActivity : Activity() {
                 val data = page.arrayAt("data"); val turns = JSONArray()
                 for (index in data.length() - 1 downTo 0) turns.put(data.opt(index))
                 thread.put("turns", turns); result.put("nextCursor", page.opt("nextCursor") ?: JSONObject.NULL)
-                renderOpenThread(id, result, thread, isReadOnly)
+                render()
             }
-        } else renderOpenThread(id, result, thread, isReadOnly)
+        } else render()
     }
 
     private fun renderOpenThread(id: String, result: JSONObject, thread: JSONObject, isReadOnly: Boolean) {
@@ -1749,11 +1811,7 @@ internal class MainActivity : Activity() {
         clearTranscript()
         val turns = thread.arrayAt("turns")
         for (index in 0 until turns.length()) renderTurn(turns.optJSONObject(index) ?: continue)
-        if (readOnly) {
-            val message = if (archivedThreadId == id) "此会话已归档，可在会话工具中恢复。"
-                else "此会话由桌面客户端管理，自动同步已保存的消息。结束原会话后可重新打开继续。"
-            adapter.add(ChatMessage("readonly", MessageKind.STATUS, "", message))
-        }
+        if (readOnly) adapter.add(readOnlyMessage())
         if (retainedHistory.isNotEmpty()) {
             val merged = TranscriptState.prepend(adapter.snapshot(), retainedHistory)
             if (merged.historyIds.isNotEmpty()) {
@@ -1812,7 +1870,9 @@ internal class MainActivity : Activity() {
         val runtimeId = result.string("modelProvider").ifEmpty { thread.string("modelProvider") }
         thread.put("model", model)
         if (runtimeId.isNotEmpty()) thread.put("modelProvider", runtimeId)
-        showModelOptions(modelCatalog.threadProviderId(thread), model, result.string("reasoningEffort"))
+        val provider = modelCatalog.threadProviderId(thread)
+        if (applyExplicitChoice(provider)) return
+        showModelOptions(provider, model, result.string("reasoningEffort"))
     }
 
     private fun loadOlderTurns(onLoaded: (() -> Unit)? = null) {
@@ -1870,17 +1930,15 @@ internal class MainActivity : Activity() {
         snapshotRunning = true
         val requestVersion = ++snapshotRequestVersion
         val id = currentThreadId; val currentGeneration = generation
-        rpc("codexrm/thread/snapshot", JSONObject().put("threadId", id)) { result, error ->
+        rpc("codexrm/thread/snapshot", JSONObject().put("threadId", id)) { result, _ ->
             if (requestVersion != snapshotRequestVersion) return@rpc
             snapshotRunning = false
             val polling = readOnly || detachedThreads.isDetached(id)
             if (result != null && active(currentGeneration) && id == currentThreadId && polling) {
                 val thread = result.optJSONObject("thread")
                 if (thread != null) {
-                    if (thread.objectAt("status").string("type") == "active") readOnly = true
                     val cursor = result.optString("nextCursor").takeIf { !result.isNull("nextCursor") && it.isNotEmpty() }
                     replaceLatestSnapshot(thread, cursor)
-                    updateControls()
                 }
             }
             scheduleSnapshot()
@@ -1904,13 +1962,25 @@ internal class MainActivity : Activity() {
         }
     }
 
+    private fun readOnlyMessage(): ChatMessage {
+        val text = if (archivedThreadId == currentThreadId) "此会话已归档，可在侧栏底部的「工具」中恢复。"
+            else if (canCloseDesktopForSend()) "此会话被其他客户端占用。点发送可选择关闭桌面 Codex 并继续。"
+            else "此会话被其他客户端占用，自动同步已保存的消息。结束原会话后可重新打开继续。"
+        return ChatMessage("readonly", MessageKind.STATUS, "", text)
+    }
+
     private fun replaceLatestSnapshot(thread: JSONObject, nextCursor: String?) {
-        val readingPosition = messageList.readingPosition()
+        val wasReadOnly = readOnly
+        val wasRunning = running
+        val previousTurnId = activeTurnId
+        val couldContinue = latestTurn?.canContinue == true
+        val previousName = currentThread?.string("name").orEmpty()
+        if (thread.objectAt("status").string("type") == "active") readOnly = true
         val turns = thread.arrayAt("turns")
-        retainOverlappingHistory(turns, readOnly)
+        retainOverlappingHistory(turns, wasReadOnly)
         if (!historyOlder) historyCursor = nextCursor
         currentThread?.let { current ->
-            for (key in listOf("model", "codexrmProvider")) {
+            for (key in listOf("model", "codexrmProvider", "codexrmProviderUnavailable")) {
                 if (!thread.has(key) && current.has(key)) thread.put(key, current.opt(key))
             }
         }
@@ -1921,11 +1991,13 @@ internal class MainActivity : Activity() {
         for (index in 0 until turns.length()) {
             val turn = turns.optJSONObject(index) ?: continue
             if (!readOnly && turn.string("status") == "inProgress") {
-                running = true; activeTurnId = turn.string("id"); startedAt = System.currentTimeMillis()
+                running = true
+                activeTurnId = turn.string("id")
             }
             renderTurn(turn, latest)
         }
-        if (readOnly) latest += ChatMessage("readonly", MessageKind.STATUS, "", "此会话由桌面客户端管理，自动同步已保存的消息。")
+        if (running && (!wasRunning || previousTurnId != activeTurnId)) startedAt = System.currentTimeMillis()
+        if (readOnly) latest += readOnlyMessage()
         val merged = TranscriptState.latest(adapter.snapshot(), historyMessageIds, latest, historyOlder)
 
         items.clear(); deltaBuffers.clear(); dirtyDeltaIds.clear(); dirtyMessageIds.clear(); userMessages.clear()
@@ -1942,8 +2014,10 @@ internal class MainActivity : Activity() {
             }
         }
         historyMessageIds.clear(); historyMessageIds += merged.historyIds
-        adapter.replace(merged.messages)
-        messageList.restoreReadingPosition(readingPosition)
+        adapter.replaceSnapshot(merged.messages, messageList)
+        if (wasReadOnly != readOnly || wasRunning != running || couldContinue != (latestTurn?.canContinue == true) ||
+            previousName != thread.string("name")
+        ) updateControls()
     }
 
     private fun attachmentDraftKey(): String = composerBinding.attachmentKey(::pathKey)
@@ -1953,7 +2027,7 @@ internal class MainActivity : Activity() {
         if (!online || !loaded) { toast("设备尚未连接或正在同步"); return }
         if (!info.has("attachments")) { toast("请更新本地 Agent 以支持文件和图片"); return }
 
-        val sheet = Dialog(this)
+        val sheet = PredictiveBackDialog(this)
         sheet.requestWindowFeature(Window.FEATURE_NO_TITLE)
         sheet.setTitle("添加附件")
         val panel = Ui.column(this).apply {
@@ -2004,7 +2078,8 @@ internal class MainActivity : Activity() {
             setPadding(margin, 0, margin, margin)
             addView(panel)
         }
-        sheet.setContentView(container)
+        Ui.applyWindowInsets(container)
+        sheet.setBackContent(container, BackMotion.SHEET)
         sheet.setCanceledOnTouchOutside(true)
         sheet.setOnDismissListener { if (attachmentSheet === sheet) attachmentSheet = null }
         sheet.window?.apply {
@@ -2066,11 +2141,12 @@ internal class MainActivity : Activity() {
         }
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 907) {
             if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) toast("任务通知已开启")
             else TaskMonitor.enable(this, currentAgent(), false)
+            settingsPage?.refreshActionSummaries()
             return
         }
         if (workspaceFiles.onRequestPermissionsResult(requestCode, grantResults)) return
@@ -2093,7 +2169,7 @@ internal class MainActivity : Activity() {
     }
 
     private fun showCameraPermissionSettings() {
-        styledDialog(AlertDialog.Builder(this)
+        styledDialog(MiuixDialog.Builder(this)
             .setTitle("相机权限已关闭")
             .setMessage("系统不会再次弹出授权框。可在系统设置中允许相机；不授权也可以继续从相册或文件中添加。")
             .setPositiveButton("去系统设置") { _, _ ->
@@ -2167,6 +2243,41 @@ internal class MainActivity : Activity() {
         }
     }
 
+    private fun editAttachmentMarkup(file: JSONObject, local: java.io.File) {
+        if (openingMarkup || markupDialog != null || sending || preparingAttachments) return
+        val key = attachmentDraftKey()
+        val composerSession = openGeneration
+        openingMarkup = true
+        Thread({
+            val result = runCatching { decodeMarkupBitmap(local) }
+            handler.post {
+                openingMarkup = false
+                if (isDestroyed || !mainVisible || !resumed || sending || loading || preparingAttachments || composerSession != openGeneration ||
+                    key != attachmentDraftKey() || attachmentFiles.none { it.string("draftId") == file.string("draftId") }) {
+                    result.getOrNull()?.recycle()
+                    return@post
+                }
+                result.onSuccess { bitmap ->
+                    markupDialog = showAttachmentMarkup(this, bitmap, "标注图片") { annotated ->
+                        preparingAttachments = true
+                        renderAttachments()
+                        updateControls()
+                        attachmentStore.replaceWithMarkup(key, file, annotated) { error ->
+                            if (!isDestroyed) {
+                                preparingAttachments = false
+                                renderAttachments()
+                                updateControls()
+                                toast(error ?: "标注已保存到草稿")
+                            }
+                        }
+                    }.apply {
+                        setOnDismissListener { markupDialog = null }
+                    }
+                }.onFailure { toast(if (it is IllegalArgumentException) it.message else "无法读取图片") }
+            }
+        }, "attachment-markup").start()
+    }
+
     private fun renderAttachments() {
         if (!mainBuilt) return
         attachmentFiles = attachmentStore.load(attachmentDraftKey())
@@ -2194,6 +2305,12 @@ internal class MainActivity : Activity() {
                     val bitmap = BitmapFactory.decodeFile(local.path, options)
                     if (bitmap != null) {
                         val thumbnail = FrameLayout(this)
+                        if (file.string("mimeType") != "image/gif" && !sending && !preparingAttachments) {
+                            thumbnail.contentDescription = "标注 ${file.string("name")}"
+                            thumbnail.isFocusable = true
+                            thumbnail.background = Ui.ripple(Color.TRANSPARENT, Ui.dp(this, 6).toFloat())
+                            thumbnail.setOnClickListener { editAttachmentMarkup(file, local) }
+                        }
                         thumbnail.addView(ImageView(this).apply {
                             setImageBitmap(bitmap)
                             scaleType = ImageView.ScaleType.CENTER_CROP
@@ -2204,7 +2321,7 @@ internal class MainActivity : Activity() {
                             visibility = View.GONE
                         }
                         thumbnail.addView(imageProgress, FrameLayout.LayoutParams(-1, -1))
-                        row.addView(thumbnail, LinearLayout.LayoutParams(Ui.dp(this, 40), Ui.dp(this, 40)))
+                        row.addView(thumbnail, LinearLayout.LayoutParams(Ui.dp(this, 48), Ui.dp(this, 48)))
                     }
                 }
             }
@@ -2235,14 +2352,14 @@ internal class MainActivity : Activity() {
     }
 
     private fun canContinueTurn(): Boolean {
-        if (currentThreadId.isEmpty() || readOnly || running || latestTurn?.canContinue != true) return false
+        if (currentThreadId.isEmpty() || readOnly || providerUnavailable || running || latestTurn?.canContinue != true) return false
         if (composer.text.isNotBlank() || attachmentFiles.isNotEmpty() || preparingAttachments || editingQueueDraft == composerBinding) return false
         val queue = messageQueues[currentThreadId]
         return queue == null || (!queue.optBoolean("dispatching") &&
             (queue.arrayAt("entries").length() == 0 || queue.optBoolean("paused")))
     }
 
-    private fun continueTurn() {
+    private fun continueTurn(offerDesktopClose: Boolean = true) {
         if (!canContinueTurn() || !online || !loaded || sending || loading || currentThreadId in deletingThreads) return
         val unresolved = outbox.matching(composerBinding, ::pathKey)
         if (unresolved.isNotEmpty()) { showPendingSend(unresolved.last().id); return }
@@ -2253,10 +2370,13 @@ internal class MainActivity : Activity() {
         )
         outbox.begin(pending); activePendingSendId = pending.id; persistOutbox()
         sending = true; updateControls()
-        startTurn(text, creating = false, openGeneration, emptyList(), pending)
+        startTurn(text, creating = false, openGeneration, emptyList(), pending, offerDesktopClose = offerDesktopClose)
     }
 
-    private fun sendMessage(steer: Boolean) {
+    private fun sendMessage(steer: Boolean) = submitMessage(steer, offerDesktopClose = true)
+
+    private fun submitMessage(steer: Boolean, offerDesktopClose: Boolean) {
+        if (providerUnavailable) { toast(providerSwitchHint); return }
         if (currentThreadId in deletingThreads) { toast("正在归档此对话"); return }
         if (editingQueueDraft == composerBinding) return
         val unresolved = outbox.matching(composerBinding, ::pathKey)
@@ -2266,7 +2386,21 @@ internal class MainActivity : Activity() {
         val files = attachmentFiles.toList()
         if ((text.isEmpty() && files.isEmpty()) || sending || loading || preparingAttachments) return
         if (!online || !loaded) { toast("设备尚未连接或正在同步"); return }
-        if (readOnly) { toast("此会话为只读，请新建会话"); return }
+        if (readOnly) {
+            if (!offerDesktopClose || !canCloseDesktopForSend()) {
+                toast("此会话为只读，请新建会话")
+                return
+            }
+            // The desktop may have released its writer since the last snapshot.
+            val attachmentState = files.map { it.toString() }
+            openThread(currentThreadId, silent = true) { stillReadOnly ->
+                if (stillReadOnly) confirmDesktopCloseForSend()
+                else if (composer.text.toString() == submittedText && attachmentFiles.map { it.toString() } == attachmentState) {
+                    submitMessage(steer, offerDesktopClose = true)
+                }
+            }
+            return
+        }
         if (running && !steer && !info.optBoolean("messageQueue")) { toast("请更新本地 Agent 以支持排队发送"); return }
         if (files.isNotEmpty() && !info.has("attachments")) { toast("请更新本地 Agent 以支持文件和图片"); return }
         val sender = client ?: return
@@ -2280,7 +2414,8 @@ internal class MainActivity : Activity() {
         uploadingDraft = ""
         failedUploadDraft = ""
         sending = true; updateControls()
-        AttachmentUploader(attachmentStore, sender).upload(key, files, { file, percent ->
+        val relayImages = info.optJSONObject("attachments")?.optBoolean("relayImages") == true
+        AttachmentUploader(attachmentStore, sender, relayImages).upload(key, files, { file, percent ->
             if (active(currentGeneration)) {
                 uploadingDraft = file.string("draftId")
                 attachmentProgress[uploadingDraft]?.apply {
@@ -2305,12 +2440,12 @@ internal class MainActivity : Activity() {
                 val remaining = ComposerText.afterSuccessfulSend(composer.text.toString(), submittedText)
                 if (remaining != composer.text.toString()) setComposerText(remaining)
                 saveDraft()
-                dispatchMessage(text, steer, files, pending)
+                dispatchMessage(text, steer, files, pending, offerDesktopClose)
             }
         }
     }
 
-    private fun dispatchMessage(text: String, steer: Boolean, files: List<JSONObject>, pending: PendingSend) {
+    private fun dispatchMessage(text: String, steer: Boolean, files: List<JSONObject>, pending: PendingSend, offerDesktopClose: Boolean) {
         val sendOpenGeneration = openGeneration
         if (running) sendFollowup(text, steer, sendOpenGeneration, files, pending)
         else if (currentThread == null) {
@@ -2358,10 +2493,18 @@ internal class MainActivity : Activity() {
                 updateControls()
                 startTurn(text, creating = true, sendOpenGeneration, files, threadPending)
             }
-        } else startTurn(text, creating = false, sendOpenGeneration, files, pending)
+        } else startTurn(text, creating = false, sendOpenGeneration, files, pending, offerDesktopClose = offerDesktopClose)
     }
 
-    private fun startTurn(text: String, creating: Boolean, sendOpenGeneration: Int, files: List<JSONObject>, pending: PendingSend) {
+    private fun startTurn(
+        text: String,
+        creating: Boolean,
+        sendOpenGeneration: Int,
+        files: List<JSONObject>,
+        pending: PendingSend,
+        resumeIfUnloaded: Boolean = !creating,
+        offerDesktopClose: Boolean = true,
+    ) {
         val optimisticId = "optimistic-${System.nanoTime()}"
         val input = ProtocolFormatter.input(text, files)
         userMessages.begin(optimisticId, input)
@@ -2370,10 +2513,24 @@ internal class MainActivity : Activity() {
         val previousTurn = latestTurn
         val params = turnParams(threadId, text, files)
         rpc("turn/start", params) { result, error ->
-            if (sendOpenGeneration != openGeneration || currentThreadId != threadId) return@rpc
+            if (sendOpenGeneration != openGeneration || currentThreadId != threadId || activePendingSendId != pending.id) return@rpc
             if (error != null || result == null) {
                 userMessages.cancel(optimisticId); adapter.remove(optimisticId)
-                retainSentAttachments(pending.attachmentKey, files); failSend(pending, error); return@rpc
+                if (resumeIfUnloaded && threadNeedsResume(error, threadId)) {
+                    val params = JSONObject().put("threadId", threadId).put("excludeTurns", true)
+                    rpc("thread/resume", params) resume@{ resumed, resumeError ->
+                        if (sendOpenGeneration != openGeneration || currentThreadId != threadId || activePendingSendId != pending.id) return@resume
+                        val resumedThread = resumed?.optJSONObject("thread")
+                        if (resumedThread?.optBoolean("codexrmProviderUnavailable") == true) {
+                            currentThread?.put("codexrmProviderUnavailable", true)
+                            renderQueue()
+                            failStartTurn(pending, files, IllegalStateException(providerSwitchHint), offerDesktopClose = false)
+                        } else if (resumedThread?.string("id") == threadId) {
+                            startTurn(text, creating, sendOpenGeneration, files, pending, resumeIfUnloaded = false, offerDesktopClose = offerDesktopClose)
+                        } else failStartTurn(pending, files, resumeError ?: error, offerDesktopClose)
+                    }
+                } else failStartTurn(pending, files, error, offerDesktopClose)
+                return@rpc
             }
             sending = false; activePendingSendId = ""; outbox.confirmed(pending.id); persistOutbox()
             finishSentAttachments(pending.attachmentKey, files)
@@ -2426,17 +2583,72 @@ internal class MainActivity : Activity() {
         }
     }
 
-    private fun failSend(pending: PendingSend, error: Exception?, fallback: String = "消息发送失败") {
+    private fun failStartTurn(pending: PendingSend, files: List<JSONObject>, error: Exception?, offerDesktopClose: Boolean) {
+        val conflict = desktopWriterConflict(error)
+        val confirmClose = conflict && offerDesktopClose && canCloseDesktopForSend()
+        retainSentAttachments(pending.attachmentKey, files)
+        failSend(pending, error, showToast = !conflict)
+        if (confirmClose) confirmDesktopCloseForSend(pending.continuation)
+        else if (conflict) toast("会话仍被占用，请关闭桌面 Codex 后重试")
+    }
+
+    private fun canCloseDesktopForSend(): Boolean = online && loaded && mainVisible && cachedAt == 0L &&
+        currentThreadId.isNotEmpty() && archivedThreadId != currentThreadId &&
+        currentThreadId !in deletingThreads && info.optBoolean("desktopControl")
+
+    private fun confirmDesktopCloseForSend(continuation: Boolean = false) {
+        if (desktopCloseDialog != null || !canCloseDesktopForSend()) return
+        val agentId = currentAgent()
+        val threadId = currentThreadId
+        val session = openGeneration
+        val connection = client ?: return
+        val draft = composer.text.toString()
+        val attachments = attachmentFiles.map { it.toString() }
+        val editVersion = composerEditVersion
+        fun sameConversation(): Boolean = client === connection && currentAgent() == agentId && currentThreadId == threadId
+        val dialog = styledDialog(MiuixDialog.Builder(this)
+            .setTitle("关闭桌面 Codex？")
+            .setMessage("此会话被其他客户端占用。关闭这台电脑上的 Codex 桌面端后，将尝试继续发送。桌面端正在运行的任务会中断，未保存的内容可能丢失。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("关闭并继续") { _, _ ->
+                if (!sameConversation() || session != openGeneration || sending || loading || !canCloseDesktopForSend()) return@setPositiveButton
+                saveDraft()
+                sending = true
+                updateControls()
+                rpc("codexrm/desktop/close") { result, error ->
+                    if (!sameConversation() || session != openGeneration) return@rpc
+                    sending = false
+                    if (error != null || result == null || !online || !loaded) {
+                        updateControls()
+                        toast(error?.message ?: "恢复会话未完成，消息草稿已保留")
+                        return@rpc
+                    }
+                    openThread(threadId, silent = true) { stillReadOnly ->
+                        if (stillReadOnly) toast("会话仍被占用，消息草稿已保留")
+                        else if (sameConversation() && editVersion == composerEditVersion && composer.text.toString() == draft &&
+                            attachmentFiles.map { it.toString() } == attachments
+                        ) {
+                            if (continuation) continueTurn(offerDesktopClose = false)
+                            else submitMessage(steer = false, offerDesktopClose = false)
+                        }
+                    }
+                }
+            })
+        desktopCloseDialog = dialog
+        dialog.setOnDismissListener { if (desktopCloseDialog === dialog) desktopCloseDialog = null }
+    }
+
+    private fun failSend(pending: PendingSend, error: Exception?, fallback: String = "消息发送失败", showToast: Boolean = true) {
         val unknown = error is RpcOutcomeUnknown
         sending = false; activePendingSendId = ""
         outbox.failed(pending.id, unknown); persistOutbox()
-        if (!pending.continuation) {
+        if (!unknown && !pending.continuation) {
             val restored = ComposerText.afterFailedSend(composer.text.toString(), pending.submittedText)
             if (restored != composer.text.toString()) setComposerText(restored)
             saveDraft()
         }
         updateControls()
-        toast(if (unknown) "发送状态未确认，内容已保留。请先核对会话历史；不会自动重发。" else error?.message ?: fallback)
+        if (showToast) toast(if (unknown) "发送状态未确认，内容已保留。请先核对会话历史；不会自动重发。" else error?.message ?: fallback)
     }
 
     private fun turnParams(threadId: String, text: String, files: List<JSONObject> = emptyList()): JSONObject {
@@ -2470,8 +2682,10 @@ internal class MainActivity : Activity() {
                 val provider = params.string("providerId")
                 val model = params.string("model")
                 val effort = if (currentThread?.string("model") == model) selectedEffort() else ""
-                currentThread?.put("codexrmProvider", provider)?.put("model", model)
+                currentThread?.put("codexrmProvider", provider)?.put("model", model)?.remove("codexrmProviderUnavailable")
                 showModelOptions(provider, model, effort)
+                if (model.isNotEmpty()) explicitModelChoice = ModelChoice(currentThreadId, provider, model, selectedEffort())
+                renderQueue(); updateControls()
                 return
             }
             "codexrm/thread/detached" -> {
@@ -2556,7 +2770,13 @@ internal class MainActivity : Activity() {
                     deltaBuffers.remove("${reply.id}:text")
                     adapter.message(reply.id)?.let { adapter.prepareReply(it, streaming = false) }
                 }
-                turn.optJSONObject("error")?.let { adapter.add(ChatMessage("error-${turn.string("id")}", MessageKind.ERROR, "错误", it.string("message"))) }
+                val retryId = TurnRenderer.retryErrorId(finished.id)
+                val error = turn.optJSONObject("error")
+                if (error != null) {
+                    adapter.replaceMessage(retryId, TurnRenderer.errorMessage(finished.id, error))
+                } else {
+                    adapter.remove(retryId)
+                }
                 if (turn.string("status") == "interrupted") adapter.add(ChatMessage("stopped-${turn.string("id")}", MessageKind.STATUS, "", "任务已停止"))
                 adapter.snapshot().filter { it.turnId == finished.id && it.title == "思考过程" }.forEach { message ->
                     if (message.status == "思考中" || message.status.isBlank()) {
@@ -2598,14 +2818,21 @@ internal class MainActivity : Activity() {
             }
             "error" -> {
                 val turnId = params.string("turnId")
-                if (threadId == currentThreadId && turnId.isNotEmpty() && !params.optBoolean("willRetry") &&
+                val willRetry = params.optBoolean("willRetry")
+                if (threadId == currentThreadId && turnId.isNotEmpty() && !willRetry &&
                     (latestTurn == null || latestTurn?.id == turnId)) {
                     latestTurn = TurnProgress(turnId, "failed")
                     running = false
                     handler.removeCallbacks(elapsedTicker)
                 }
                 val error = params.optJSONObject("error")
-                adapter.add(ChatMessage("error-${System.nanoTime()}", MessageKind.ERROR, "Codex 错误", error?.string("message").ifNullOrEmpty("Codex 发生错误")))
+                val retryId = TurnRenderer.retryErrorId(turnId)
+                when {
+                    turnId.isEmpty() -> adapter.add(TurnRenderer.errorMessage(turnId, error, "error-${System.nanoTime()}"))
+                    !willRetry -> adapter.replaceMessage(retryId, TurnRenderer.errorMessage(turnId, error))
+                    adapter.message(TurnRenderer.errorId(turnId)) == null ->
+                        adapter.replaceMessage(retryId, TurnRenderer.errorMessage(turnId, error, retryId))
+                }
                 scheduleRender(); updateControls()
             }
         }
@@ -2721,7 +2948,7 @@ internal class MainActivity : Activity() {
         val card = Ui.column(this).apply { setPadding(Ui.dp(context, 12), Ui.dp(context, 10), Ui.dp(context, 12), Ui.dp(context, 10)); background = Ui.rounded(Ui.SURFACE, Ui.dp(context, 12).toFloat(), Ui.BORDER) }
         val header = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(Ui.text(this, "${if (queue.optBoolean("paused")) "排队已暂停" else "待发送"} · ${entries.length()} 条", 12f, Ui.MUTED), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        if (queue.optBoolean("paused")) header.addView(Ui.button(this, "继续排队") { changeMessageQueue("resume") })
+        if (queue.optBoolean("paused") && !providerUnavailable) header.addView(Ui.button(this, "继续排队") { changeMessageQueue("resume") })
         card.addView(header, matchWidth())
         for (index in 0 until entries.length()) {
             val entry = entries.optJSONObject(index) ?: continue
@@ -2752,6 +2979,7 @@ internal class MainActivity : Activity() {
     private fun changeMessageQueue(action: String, id: String = "", draft: QueuedComposerDraft? = null) {
         val threadId = currentThreadId
         if (!online || sending || loading || readOnly || threadId.isEmpty()) return
+        if (action == "resume" && providerUnavailable) return
         val binding = composerBinding
         if (draft != null && (preparingAttachments || editingQueueDraft != null || binding.threadId != threadId)) return
         val requestClient = client ?: return
@@ -2806,15 +3034,30 @@ internal class MainActivity : Activity() {
             }, matchWidth())
         }
         val permissions = visible.filter(::isPermission)
-        val permissionScopes = permissions.map { requestScopes[requestKey(it.opt("id"))] ?: ApprovalScope("", "", "") }
+        val firstPermission = permissions.firstOrNull()
+        val permissionKeys = permissions.map { requestKey(it.opt("id")) }
+        val permissionScopes = permissionKeys.map { requestScopes[it] ?: ApprovalScope("", "", "") }
         if (ApprovalFilter.canBatch(permissionScopes)) {
+            val batchEnabled = online && loaded && permissionKeys.none { it in responding }
             val batch = Ui.column(this)
-            batch.addView(Ui.button(this, "全部允许 (${permissions.size})", primary = true) { permissions.forEach { answerPermission(it, "accept") } })
-            batch.addView(Ui.button(this, "全部拒绝") { permissions.forEach { answerPermission(it, "decline") } })
-            approvalArea.addView(batch, matchWidth())
+            if (permissions.all { "accept" in ProtocolFormatter.permissionDecisions(it) }) {
+                batch.addView(Ui.button(this, "全部允许 (${permissions.size})", primary = true) {
+                    answerPermissions(permissions, "accept")
+                }.apply { isEnabled = batchEnabled })
+            }
+            if (permissions.all { "decline" in ProtocolFormatter.permissionDecisions(it) }) {
+                batch.addView(Ui.button(this, "全部拒绝") {
+                    answerPermissions(permissions, "decline")
+                }.apply { isEnabled = batchEnabled })
+            }
+            if (batch.childCount > 0) approvalArea.addView(batch, matchWidth())
         }
-        visible.forEach { message ->
-            val key = requestKey(message.opt("id")); val busy = responding.contains(key); val permission = isPermission(message)
+        for (message in visible) {
+            val permission = isPermission(message)
+            // Keep the head visible until its resolution arrives, including while sending a reply.
+            if (permission && message !== firstPermission) continue
+            val key = requestKey(message.opt("id"))
+            val busy = key in responding
             val card = Ui.column(this).apply {
                 setPadding(Ui.dp(context, 16), Ui.dp(context, 14), Ui.dp(context, 16), Ui.dp(context, 14))
                 background = Ui.rounded(Ui.SURFACE, Ui.dp(context, 12).toFloat(), 0x55bd9c55); alpha = if (busy) .65f else 1f
@@ -2823,9 +3066,18 @@ internal class MainActivity : Activity() {
             card.addView(Ui.text(this, ProtocolFormatter.requestDetails(message), 12f, Ui.MUTED).apply { maxLines = 7; ellipsize = android.text.TextUtils.TruncateAt.END }, matchWidth(top = 7))
             val actions = Ui.column(this)
             if (permission) {
-                actions.addView(Ui.button(this, "允许一次", primary = true) { answerPermission(message, "accept") })
-                actions.addView(Ui.button(this, "本次会话允许") { answerPermission(message, "acceptForSession") })
-                actions.addView(Ui.button(this, "拒绝") { answerPermission(message, "decline") })
+                for (decision in ProtocolFormatter.permissionDecisions(message)) {
+                    val label = when (decision) {
+                        "accept" -> "允许一次"
+                        "acceptForSession" -> "本次会话允许"
+                        "decline" -> "拒绝"
+                        "cancel" -> "取消当前任务"
+                        else -> continue
+                    }
+                    actions.addView(Ui.button(this, label, primary = decision == "accept") {
+                        answerPermissions(listOf(message), decision)
+                    })
+                }
             } else if (message.objectAt("params").has("questions")) {
                 actions.addView(Ui.button(this, "提交回答", primary = true) { if (!busy) showUserInput(message) })
                 actions.addView(Ui.button(this, "取消") { respondError(message) })
@@ -2839,13 +3091,19 @@ internal class MainActivity : Activity() {
         }
     }
 
-    private fun answerPermission(message: JSONObject, decision: String) {
-        val key = requestKey(message.opt("id")); if (responding.contains(key)) return
-        if (!ApprovalFilter.visible(requestScopes[key], currentAgent(), currentThreadId, activeTurnId)) {
-            toast("该审批不属于当前会话或轮次，已阻止操作"); renderApproval(); return
+    private fun answerPermissions(messages: List<JSONObject>, decision: String) {
+        if (!online || !loaded) return
+        val connection = client ?: return
+        for (message in messages) {
+            val id = message.opt("id") ?: continue
+            val key = requestKey(id)
+            if (key in responding || requests[key] !== message ||
+                !ApprovalFilter.visible(requestScopes[key], currentAgent(), currentThreadId, activeTurnId) ||
+                decision !in ProtocolFormatter.permissionDecisions(message)) continue
+            if (!connection.respond(id, ProtocolFormatter.permissionResult(message, decision))) break
+            responding.add(key)
         }
-        val id = message.opt("id") ?: return
-        if (client?.respond(id, ProtocolFormatter.permissionResult(message, decision)) == true) { responding.add(key); renderApproval() }
+        renderApproval()
     }
 
     private data class QuestionSubmission(val agentId: String, val threadId: String, val itemId: String)
@@ -2874,40 +3132,26 @@ internal class MainActivity : Activity() {
         val column = Ui.column(this).apply { setPadding(Ui.dp(context, 22), Ui.dp(context, 8), Ui.dp(context, 22), 0) }
         val inputs = message.questions.map { question ->
             column.addView(Ui.text(this, question.title, 15f, bold = true), matchWidth(top = 12))
-            val choices = android.widget.RadioGroup(this)
-            if (question.options.isNotEmpty()) {
-                question.options.forEach { label ->
-                    choices.addView(android.widget.RadioButton(this).apply {
-                        id = View.generateViewId()
-                        text = label
-                        setTextColor(Ui.TEXT)
-                        minimumHeight = Ui.dp(context, 48)
-                    })
-                }
-                choices.check(choices.getChildAt(0).id)
-                column.addView(choices, matchWidth())
-            }
-            val custom = Ui.boxInput(this, if (question.options.isEmpty()) "请输入回答" else "也可以输入自己的回答")
+            val custom = MiuixFieldView(this, if (question.options.isEmpty()) "请输入回答" else "也可以输入自己的回答")
+            val choices = MiuixChoicesView(this, question.options) { custom.text = "" }
+            if (question.options.isNotEmpty()) column.addView(choices, matchWidth())
             column.addView(custom, matchWidth(bottom = 10))
-            for (index in 0 until choices.childCount) {
-                choices.getChildAt(index).setOnClickListener { custom.text.clear() }
-            }
             choices to custom
         }
         val scroll = ScrollView(this).apply { addView(column) }
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("回答 Codex").setView(scroll)
+        val dialog = styledDialog(MiuixDialog.Builder(this).setTitle("回答 Codex").setView(scroll)
             .setPositiveButton("提交", null).setNegativeButton("取消", null))
-        val submit = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        val submit = dialog.getButton(MiuixDialog.POSITIVE)
         submit.setOnClickListener {
             val answers = inputs.map { (choices, custom) ->
-                custom.text.toString().trim().ifEmpty {
-                    choices.findViewById<TextView>(choices.checkedRadioButtonId)?.text?.toString().orEmpty()
+                custom.text.trim().ifEmpty {
+                    choices.value
                 }
             }
             val missing = answers.indexOfFirst(String::isBlank)
             if (missing >= 0) {
                 inputs[missing].second.error = "请输入回答"
-                inputs[missing].second.requestFocus()
+                inputs[missing].second.focusInput()
                 return@setOnClickListener
             }
             if (scope.agentId != currentAgent() || scope.threadId != currentThreadId ||
@@ -2956,28 +3200,42 @@ internal class MainActivity : Activity() {
             val options = question.arrayAt("options")
             if (options.length() > 0) {
                 val labels = (0 until options.length()).map { options.optJSONObject(it)?.string("label").orEmpty() }
-                val spinner = Spinner(this); setSpinnerItems(spinner, labels); column.addView(spinner, matchWidth())
-                val other = Ui.boxInput(this, "也可以输入自己的回答"); column.addView(other, matchWidth())
-                fields += AnswerField(question.string("id")) { other.text.toString().ifEmpty { spinner.selectedItem?.toString().orEmpty() } }
+                val choices = MiuixChoicesView(this, labels, dropdown = true)
+                column.addView(choices, matchWidth())
+                val other = MiuixFieldView(this, "也可以输入自己的回答"); column.addView(other, matchWidth())
+                fields += AnswerField(question.string("id")) { other.text.ifEmpty { choices.value } }
             } else {
-                val input = Ui.boxInput(this, "请输入回答")
-                if (question.optBoolean("isSecret")) input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                column.addView(input, matchWidth()); fields += AnswerField(question.string("id")) { input.text.toString() }
+                val secret = question.optBoolean("isSecret")
+                val input = MiuixFieldView(
+                    this, "请输入回答", keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
+                    secret = secret,
+                )
+                column.addView(input, matchWidth())
+                fields += AnswerField(question.string("id")) { input.text }
             }
         }
         scroll.addView(column)
-        styledDialog(AlertDialog.Builder(this).setTitle("回答 Codex").setView(scroll).setPositiveButton("提交") { _, _ ->
+        styledDialog(MiuixDialog.Builder(this).setTitle("回答 Codex").setView(scroll).setPositiveButton("提交") { _, _ ->
             val answers = JSONObject(); fields.forEach { answers.put(it.id, JSONObject().put("answers", JSONArray().put(it.value()))) }
             respondResult(message, JSONObject().put("answers", answers))
         }.setNegativeButton("取消", null))
     }
 
     private fun showRawResponse(message: JSONObject) {
-        val input = Ui.boxInput(this, "JSON 结果，例如 {}").apply { setText("{}") }
-        val container = FrameLayout(this).apply { setPadding(Ui.dp(context, 24), 0, Ui.dp(context, 24), 0) }; container.addView(input)
-        styledDialog(AlertDialog.Builder(this).setTitle("返回 JSON 结果").setView(container).setPositiveButton("返回结果") { _, _ ->
-            try { respondResult(message, JSONTokener(input.text.toString()).nextValue()) } catch (error: Exception) { toast("JSON 无效：${error.message}") }
-        }.setNegativeButton("取消", null))
+        val input = MiuixFieldView(this, "JSON 结果", "{}", supportingText = "例如 {}")
+        val dialog = MiuixDialog.Builder(this).setTitle("返回 JSON 结果").setView(input)
+            .setPositiveButton("返回结果", null).setNegativeButton("取消", null).show()
+        dialog.getButton(MiuixDialog.POSITIVE).setOnClickListener {
+            val parsed = try {
+                JSONTokener(input.text).nextValue()
+            } catch (_: org.json.JSONException) {
+                input.error = "请输入有效的 JSON"
+                input.focusInput()
+                return@setOnClickListener
+            }
+            dialog.dismiss()
+            respondResult(message, parsed)
+        }
     }
 
     private fun respondResult(message: JSONObject, result: Any) {
@@ -3056,22 +3314,25 @@ internal class MainActivity : Activity() {
         showMain(reset = true)
     }
 
+    private fun deviceStatus(item: Device, selected: Boolean): String {
+        val version = (if (selected) info.string("version").ifEmpty { item.appVersion } else item.appVersion)
+            .takeIf { it.isNotEmpty() }?.let { "Agent v$it · " }.orEmpty()
+        return when {
+            item.agentId in expiredAgentIds -> "配对已失效 · 点击重新配对"
+            selected && item.online -> "${version}当前设备 · 已连接"
+            selected -> "${version}当前设备 · 等待连接"
+            else -> "${version}已配对 · 点击切换"
+        }
+    }
+
     private fun deviceRow(item: Device, selected: Boolean, inSidebar: Boolean = false): LinearLayout = Ui.column(this, false).apply {
         gravity = Gravity.CENTER_VERTICAL
         minimumHeight = Ui.dp(context, 56)
         background = Ui.ripple(if (selected) Ui.SURFACE_ALT else Color.TRANSPARENT, Ui.dp(context, 9).toFloat())
         setPadding(Ui.dp(context, 10), 0, Ui.dp(context, 10), 0)
         isClickable = true; isFocusable = true; isSelected = selected
-        setOnLongClickListener { confirmDeleteDevice(item); true }
         val name = item.serverName.ifBlank { "未命名设备" }
-        val version = (if (selected) info.string("version").ifEmpty { item.appVersion } else item.appVersion)
-            .takeIf { it.isNotEmpty() }?.let { "Agent v$it · " }.orEmpty()
-        val status = when {
-            item.agentId in expiredAgentIds -> "配对已失效 · 点击重新配对"
-            selected && item.online -> "${version}当前设备 · 已连接"
-            selected -> "${version}当前设备 · 等待连接"
-            else -> "${version}已配对 · 点击切换"
-        }
+        val status = deviceStatus(item, selected)
         contentDescription = if (selected) "$name，$status" else "$name，$status，点击切换"
         val icon = FrameLayout(context).apply {
             background = Ui.rounded(if (selected) Ui.SURFACE else Ui.SURFACE_ALT, Ui.dp(context, 7).toFloat())
@@ -3131,9 +3392,6 @@ internal class MainActivity : Activity() {
             query.isNotEmpty() -> "搜索结果"
             showSidebarWorkspaces -> "所有工作区"
             else -> "最近会话"
-        }
-        if (query.isEmpty() && info.optBoolean("conversationTools") && !showSidebarWorkspaces) {
-            workspaceRows.addView(Ui.button(this, "已归档会话") { showArchivedConversations() }, matchWidth(bottom = 6))
         }
         val pinned = pinnedThreads.filter { query.isEmpty() || "${it.title} ${it.cwd}".lowercase().contains(query) }
         if (pinned.isNotEmpty() && !showSidebarWorkspaces) {
@@ -3202,10 +3460,6 @@ internal class MainActivity : Activity() {
                         val older = Ui.button(this, label) {
                             if (showOlder) expandedWorkspaceThreads.remove(folder) else expandedWorkspaceThreads.add(folder)
                             renderWorkspaces()
-                        }.apply {
-                            gravity = Gravity.CENTER_VERTICAL or Gravity.START
-                            setTextColor(Ui.MUTED)
-                            background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 7).toFloat())
                         }
                         history.addView(older, matchWidth())
                     }
@@ -3236,23 +3490,12 @@ internal class MainActivity : Activity() {
         if (thread.id in pinnedThreadIds && showSidebarWorkspaces) {
             addView(Ui.text(context, "置顶", 11f, Ui.MUTED))
         }
-        if (thread.active) addView(ProgressBar(context, null, android.R.attr.progressBarStyleSmall).apply {
-            isIndeterminate = true
-            indeterminateTintList = android.content.res.ColorStateList.valueOf(Ui.GREEN)
+        if (thread.active) addView(MiuixProgressView(context, diameter = 14).apply {
             contentDescription = "进行中"
         }, LinearLayout.LayoutParams(Ui.dp(context, 14), Ui.dp(context, 14)).apply { marginStart = Ui.dp(this@MainActivity, 8) })
         addView(Ui.iconButton(context, "more", "会话操作：${thread.title}") { anchor ->
-            showThreadActions(thread, anchor)
+            showSidebarThreadActions(thread)
         })
-    }
-
-    private fun showThreadActions(thread: ThreadSummary, anchor: View) {
-        PopupMenu(this, anchor).apply {
-            for ((label, action) in sidebarThreadActions(thread)) {
-                menu.add(label).setOnMenuItemClickListener { action(); true }
-            }
-            show()
-        }
     }
 
     private fun renderSidebarListEnd(empty: Boolean, query: String) {
@@ -3303,27 +3546,30 @@ internal class MainActivity : Activity() {
         if (!online) { toast("先连接设备，再添加工作区"); return }
         if (!info.optBoolean("workspaces")) { toast("请更新本地连接器，以使用目录浏览"); return }
         val scroll = ScrollView(this); val column = Ui.column(this).apply { setPadding(Ui.dp(context, 20), 0, Ui.dp(context, 20), Ui.dp(context, 10)) }
-        val pathRow = Ui.column(this, false); val pathInput = Ui.boxInput(this, "输入设备上的绝对目录路径")
+        // Baseline alignment probes weighted Compose views with an unspecified width.
+        val pathRow = Ui.column(this, false).apply { isBaselineAligned = false }
+        val pathInput = MiuixFieldView(this, "输入设备上的绝对目录路径")
         pathRow.addView(pathInput, LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1f))
         lateinit var browseDirectory: (String) -> Unit
-        val go = Ui.button(this, "前往") { browseDirectory(pathInput.text.toString()) }; pathRow.addView(go)
+        val go = Ui.button(this, "前往") { browseDirectory(pathInput.text) }; pathRow.addView(go)
         column.addView(pathRow, matchWidth())
         val shortcuts = Ui.column(this, false); column.addView(shortcuts, matchWidth(top = 10))
         val errorText = Ui.text(this, "", 12f, Ui.DANGER); column.addView(errorText, matchWidth())
         val list = Ui.column(this); column.addView(list, matchWidth())
-        val hidden = CheckBox(this).apply { text = "显示隐藏目录"; setTextColor(Ui.MUTED) }
+        val hidden = MiuixCheckboxView(this, "显示隐藏目录")
         val add = Ui.button(this, "添加此文件夹", primary = true) { }
         add.isEnabled = false
-        val footer = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL; addView(hidden, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)); addView(add) }
-        column.addView(footer, matchWidth(top = 14))
+        // Give the checkbox the full row, including on narrow screens or at large font sizes.
+        column.addView(hidden, matchWidth(top = 14))
+        column.addView(add, matchWidth(top = 8))
         column.addView(Ui.text(this, "添加后可切换多个工作区。移出列表只删除记录，保留文件和会话。", 12f, Ui.DIM), matchWidth(top = 10))
         scroll.addView(column)
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("添加工作区").setView(scroll).setNegativeButton("取消", null))
+        val dialog = styledDialog(MiuixDialog.Builder(this).setTitle("添加工作区").setView(scroll).setNegativeButton("取消", null))
         val pickerGeneration = generation
         var version = 0; var selectedPath = ""
         var adding = false
         fun render(result: JSONObject) {
-            selectedPath = result.string("path"); pathInput.setText(selectedPath); pathInput.setSelection(pathInput.text.length)
+            selectedPath = result.string("path"); pathInput.text = selectedPath
             errorText.text = ""; add.isEnabled = selectedPath.isNotEmpty(); shortcuts.removeAllViews(); list.removeAllViews()
             val links = ArrayList<Workspace>()
             result.string("parent").takeIf { it.isNotEmpty() }?.let { links += Workspace("上一级", it) }
@@ -3351,13 +3597,13 @@ internal class MainActivity : Activity() {
         browseDirectory = fun(path: String) {
             if (adding || !active(pickerGeneration)) return
             val requestVersion = ++version; add.isEnabled = false; errorText.text = "正在读取…"
-            rpc("codexrm/fs/list", JSONObject().put("path", path).put("showHidden", hidden.isChecked)) { result, error ->
+            rpc("codexrm/fs/list", JSONObject().put("path", path).put("showHidden", hidden.checked)) { result, error ->
                 if (!active(pickerGeneration) || requestVersion != version || !dialog.isShowing) return@rpc
                 if (result != null) render(result) else { errorText.text = error?.message; add.isEnabled = false }
             }
         }
-        go.setOnClickListener { browseDirectory(pathInput.text.toString()) }
-        hidden.setOnCheckedChangeListener { _, _ -> if (selectedPath.isNotEmpty()) browseDirectory(selectedPath) }
+        go.setOnClickListener { browseDirectory(pathInput.text) }
+        hidden.onChanged = { if (selectedPath.isNotEmpty()) browseDirectory(selectedPath) }
         add.setOnClickListener {
             if (adding || !active(pickerGeneration) || sending || loading) return@setOnClickListener
             val path = selectedPath
@@ -3380,52 +3626,71 @@ internal class MainActivity : Activity() {
         browseDirectory(currentCwd.ifEmpty { info.string("cwd") })
     }
 
-    private fun showDevices() {
+    private fun showDevices(anchor: View = deviceButton) {
         if (devicePopup?.isShowing == true) {
             devicePopup?.dismiss()
             return
         }
-        val content = Ui.column(this).apply {
-            setPadding(Ui.dp(context, 8), Ui.dp(context, 8), Ui.dp(context, 8), Ui.dp(context, 8))
-            background = Ui.rounded(Ui.SURFACE, Ui.dp(context, 16).toFloat(), Ui.BORDER)
-            accessibilityPaneTitle = "选择设备"
-        }
-        val heading = Ui.column(this).apply { setPadding(Ui.dp(context, 12), Ui.dp(context, 6), Ui.dp(context, 12), Ui.dp(context, 8)) }
-        heading.addView(Ui.text(this, "选择设备", 16f, bold = true))
-        heading.addView(Ui.text(this, "任务将在所选电脑上运行", 12f, Ui.MUTED), matchWidth(top = 2))
-        content.addView(heading, matchWidth())
-        val rows = Ui.column(this)
-        devices.forEach { item ->
-            val row = deviceRow(item, item.agentId == device?.agentId)
-            row.setOnClickListener { selectDevice(item, closeSidebarAfter = false) }
-            rows.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 56)))
-        }
-        val scroll = ScrollView(this).apply {
-            isFillViewport = true; isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-            addView(rows)
-        }
-        content.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, min(Ui.dp(this, 56) * devices.size, Ui.dp(this, 280))))
-        content.addView(View(this).apply { setBackgroundColor(Ui.BORDER) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 1)).apply {
-            topMargin = Ui.dp(this@MainActivity, 6); bottomMargin = Ui.dp(this@MainActivity, 6)
-        })
-        lateinit var popup: PopupWindow
-        content.addView(addDeviceRow { popup.dismiss(); showPair() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 54)))
-        val width = min(Ui.dp(this, 320), resources.displayMetrics.widthPixels - Ui.dp(this, 24))
-        popup = PopupWindow(content, width, ViewGroup.LayoutParams.WRAP_CONTENT, true).apply {
-            isOutsideTouchable = true
-            isClippingEnabled = true
-            inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
-            setBackgroundDrawable(Ui.rounded(Color.TRANSPARENT, 0f))
-            elevation = Ui.dp(this@MainActivity, 18).toFloat()
+        val popup = MiuixDialogHost(this)
+        val paired = devices.toList()
+        popup.setPopup(anchor) { close ->
+            SmallTitle("选择设备")
+            paired.forEach { item ->
+                val selected = item.agentId == device?.agentId
+                BasicComponent(
+                    title = item.serverName.ifBlank { "未命名设备" },
+                    summary = deviceStatus(item, selected),
+                    endActions = { RadioButton(selected = selected, onClick = null) },
+                    modifier = Modifier.combinedClickable(
+                        onClick = { close(); selectDevice(item, closeSidebarAfter = false) },
+                        onLongClickLabel = "删除电脑",
+                        onLongClick = { confirmDeleteDevice(item) },
+                    ),
+                )
+            }
+            BasicComponent(title = "添加新设备", onClick = { close(); showPair() })
         }
         popup.setOnDismissListener { if (devicePopup === popup) devicePopup = null }
         devicePopup = popup
-        popup.showAsDropDown(deviceButton, deviceButton.width - width, Ui.dp(this, 6))
+        popup.show()
+    }
+
+    private fun applyAppearance(area: AppearanceArea? = null) {
+        if (mainBuilt) {
+            if (area == null || area == AppearanceArea.CHAT) mainRoot.background = appearance.drawable(AppearanceArea.CHAT)
+            if (area == null || area == AppearanceArea.SIDEBAR) sidebar.background = appearance.drawable(AppearanceArea.SIDEBAR)
+            if (area == null) adapter.bubbleOpacity = appearance.bubbleOpacity()
+        }
+        settingsPage?.refreshAppearance()
+    }
+
+    internal fun backgroundTarget(area: AppearanceArea): View? = when {
+        !mainBuilt -> null
+        area == AppearanceArea.CHAT -> mainRoot
+        area == AppearanceArea.SIDEBAR -> sidebar
+        else -> null
+    }
+
+    private fun pickBackgroundImage(area: AppearanceArea) {
+        pendingBackgroundPicker = area
+        try {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "image/*"
+            }, PICK_APPEARANCE_IMAGE)
+        } catch (_: android.content.ActivityNotFoundException) {
+            pendingBackgroundPicker = null
+            reportBackgroundResult(false)
+        }
+    }
+
+    private fun reportBackgroundResult(success: Boolean) {
+        val message = if (success) "背景已更新" else "无法读取图片，请换一张或重试"
+        android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_SHORT).show()
     }
 
     private fun showAppSettings() {
-        closeSidebar()
+        if (mainVisible) closeSidebar()
         settingsPage?.dismiss()
         val agent = currentAgent()
         fun availability(): String? = when {
@@ -3435,6 +3700,9 @@ internal class MainActivity : Activity() {
         }
         settingsPage = SettingsPage(
             this, device?.serverName.orEmpty(), ::availability,
+            appearance = appearance,
+            pickBackground = ::pickBackgroundImage,
+            reportBackground = ::reportBackgroundResult,
             direct = { client?.usingDirect == true },
             request = { operation, params, requireDirect, callback ->
                 val current = client
@@ -3446,17 +3714,69 @@ internal class MainActivity : Activity() {
                 }
             },
             catalogChanged = { if (agent == currentAgent()) loadModels() },
-            actions = listOf(
-                SettingsPage.Action("工作区设置", ::showSettings),
-                SettingsPage.Action("下载位置", ::showDownloadSettings) { workspaceFiles.downloadLocation },
-                SettingsPage.Action("检查更新", ::checkForUpdates),
-                SettingsPage.Action("关于", ::showAbout),
-            ),
+            sections = { agentSettings ->
+                listOfNotNull(
+                    SettingsPage.Section(
+                        "外观", actions = listOf(SettingsPage.Action("背景与透明度", { settingsPage?.showAppearance() })),
+                        toggle = SettingsPage.Toggle("深色模式", { store.darkTheme }, ::setDarkTheme),
+                    ),
+                    device?.let { current ->
+                        SettingsPage.Section("通知", toggle = SettingsPage.Toggle(
+                            title = "后台任务通知",
+                            checked = { TaskMonitor.enabled(this, current.agentId) },
+                            change = ::toggleTaskMonitor,
+                            summary = current.serverName,
+                        ))
+                    },
+                    SettingsPage.Section("电脑与连接", actions = listOf(
+                        agentSettings,
+                        SettingsPage.Action("已配对电脑", ::showPairedComputers) { "${devices.size} 台" },
+                        SettingsPage.Action("添加电脑", ::showPair),
+                    )),
+                    SettingsPage.Section(
+                        title = "文件与系统分享",
+                        actions = listOf(SettingsPage.Action("下载位置", ::showDownloadSettings) { workspaceFiles.downloadLocation }),
+                        choice = SettingsPage.Choice(
+                            title = "系统分享",
+                            options = listOf("每次选择去向", "直接加入新会话草稿"),
+                            selectedIndex = { if (store.shareToNewDraft) 1 else 0 },
+                            select = { store.shareToNewDraft = it == 1 },
+                        ),
+                    ),
+                    SettingsPage.Section("应用", actions = listOf(
+                        SettingsPage.Action("检查更新", ::checkForUpdates),
+                        SettingsPage.Action("关于", ::showAbout) { UpdateChecker.currentVersionName(this) },
+                        SettingsPage.Action("开放源代码许可", { settingsPage?.showOpenSourceLicenses() }),
+                        SettingsPage.Action("开源仓库", { settingsPage?.openRepository() }) {
+                            OpenSourceLicenses.REPOSITORY.removePrefix("https://")
+                        },
+                    )),
+                )
+            },
+            agentSections = { providers ->
+                val current = device
+                buildList {
+                    add(SettingsPage.Section("权限", actions = listOf(
+                        SettingsPage.Action("工作区设置", ::showSettings) { "文件访问与审批策略" },
+                    )))
+                    if (current != null) {
+                        add(SettingsPage.Section("服务与模型", actions = buildList {
+                            add(providers)
+                            add(SettingsPage.Action("检查并更新电脑 Agent", ::confirmAgentUpdate))
+                            if (info.optBoolean("desktopControl")) {
+                                add(SettingsPage.Action("关闭 Codex 桌面客户端", {
+                                    rpc("codexrm/desktop/close") { result, error -> toast(result?.string("message") ?: error?.message) }
+                                }))
+                            }
+                        }))
+                    }
+                }
+            },
         ).also { it.show() }
     }
 
     private fun showDownloadSettings() {
-        val builder = AlertDialog.Builder(this)
+        val builder = MiuixDialog.Builder(this)
             .setTitle("下载位置")
             .setMessage(workspaceFiles.downloadLocation)
             .setPositiveButton("选择文件夹") { _, _ -> workspaceFiles.chooseDownloadLocation() }
@@ -3467,7 +3787,7 @@ internal class MainActivity : Activity() {
                 settingsPage?.refreshActionSummaries()
             }
         }
-        styledDialog(builder).show()
+        styledDialog(builder)
     }
 
     private fun showAbout() {
@@ -3481,7 +3801,7 @@ internal class MainActivity : Activity() {
         val history = Ui.column(this)
         content.addView(history, matchWidth(top = 8))
         val scroll = ScrollView(this).apply { addView(content) }
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("关于 CodexRM").setView(scroll).setPositiveButton("关闭", null))
+        val dialog = styledDialog(MiuixDialog.Builder(this).setTitle("关于 CodexRM").setView(scroll).setPositiveButton("关闭", null))
         var historyCall: Call? = null
 
         fun loadHistory() {
@@ -3510,38 +3830,66 @@ internal class MainActivity : Activity() {
     }
 
     private fun showSettings() {
-        closeSidebar(); val column = Ui.column(this).apply { setPadding(Ui.dp(context, 22), 0, Ui.dp(context, 22), Ui.dp(context, 12)) }
-        column.addView(Ui.text(this, "在左侧“工作区”添加或切换文件夹。同一台设备可以管理多个目录。", 12f, Ui.DIM))
-        column.addView(Ui.text(this, "文件访问", 12f, Ui.MUTED), matchWidth(top = 16))
-        val sandbox = Spinner(this); setSpinnerItems(sandbox, listOf("允许修改工作目录", "只读", "完整访问"))
-        sandbox.setSelection(arrayOf("workspace-write", "read-only", "danger-full-access").indexOf(store.sandbox)); column.addView(sandbox, matchWidth())
-        column.addView(Ui.text(this, "审批策略", 12f, Ui.MUTED), matchWidth(top = 16))
-        val approval = Spinner(this); setSpinnerItems(approval, listOf("需要时请求审批", "不受信任命令需审批", "从不请求审批"))
-        approval.setSelection(arrayOf("on-request", "untrusted", "never").indexOf(store.approvalPolicy)); column.addView(approval, matchWidth())
-        val current = device
-        val agentVersion = info.string("version").ifEmpty { current?.appVersion.orEmpty() }.ifEmpty { "未知" }
-        column.addView(Ui.text(this, "${current?.serverName}\n${current?.os} · ${current?.agentId}\n电脑 Agent v$agentVersion\n${current?.serverUrl}", 12f, Ui.MUTED), matchWidth(top = 18))
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("工作区设置").setView(column).setPositiveButton("保存设置") { _, _ ->
-            store.sandbox = arrayOf("workspace-write", "read-only", "danger-full-access")[sandbox.selectedItemPosition]
-            store.approvalPolicy = arrayOf("on-request", "untrusted", "never")[approval.selectedItemPosition]
-            toast("设置已保存，将在新会话及下一次发送时生效")
-        }.setNegativeButton("取消", null))
-        if (online && info.optBoolean("remoteUpdate")) column.addView(Ui.button(this, "检查并更新电脑 Agent") {
-            dialog.dismiss()
-            confirmAgentUpdate()
-        }, matchWidth(top = 10))
-        if (info.optBoolean("desktopControl")) column.addView(Ui.button(this, "关闭 Codex 桌面客户端") {
-            rpc("codexrm/desktop/close") { result, error -> toast(result?.string("message") ?: error?.message) }
-        }, matchWidth(top = 10))
-        if (current != null) column.addView(Ui.text(this, "解除当前设备配对", 12f, Ui.DANGER).apply {
-            gravity = Gravity.CENTER; background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 7).toFloat(), Ui.BORDER)
-            setOnClickListener { dialog.dismiss(); confirmDeleteDevice(current) }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 46)).apply { topMargin = Ui.dp(this@MainActivity, 12) })
+        val sandboxModes = listOf("workspace-write", "read-only", "danger-full-access")
+        val approvalPolicies = listOf("on-request", "untrusted", "never")
+        val initialSandbox = sandboxModes.indexOf(store.sandbox).coerceAtLeast(0)
+        val initialApproval = approvalPolicies.indexOf(store.approvalPolicy).coerceAtLeast(0)
+        selectionDialog?.dismiss()
+        selectionDialog = showMiuixSelectionDialog(this, "工作区设置", "在侧栏的“工作区”添加或切换文件夹。") { close ->
+            MiuixWorkspaceChoices(initialSandbox, initialApproval, close) { sandbox, approval ->
+                store.sandbox = sandboxModes[sandbox]
+                store.approvalPolicy = approvalPolicies[approval]
+                close()
+                toast("设置已保存，将在新会话及下一次发送时生效")
+            }
+        }
+    }
+
+    private fun showPairedComputers() {
+        val paired = devices.toList()
+        val builder = MiuixDialog.Builder(this).setTitle("已配对电脑").setNegativeButton("返回", null)
+        if (paired.isEmpty()) {
+            builder.setMessage("暂无已配对电脑").setPositiveButton("添加电脑") { _, _ -> showPair() }
+        } else {
+            builder.setItems(paired.map { computer ->
+                val status = when (computer.agentId) {
+                    in expiredAgentIds -> " · 配对已失效"
+                    currentAgent() -> " · 当前电脑"
+                    else -> ""
+                }
+                computer.serverName + status
+            }.toTypedArray()) { _, index -> showComputerSettings(paired[index]) }
+                .setItemLongPress("删除电脑") { _, index -> confirmDeleteDevice(paired[index]) }
+        }
+        styledDialog(builder)
+    }
+
+    private fun showComputerSettings(computer: Device) {
+        val current = computer.agentId == currentAgent()
+        val agentVersion = (if (current) info.string("version") else "")
+            .ifBlank { computer.appVersion }.ifBlank { "未知" }
+        val builder = MiuixDialog.Builder(this).setTitle(computer.serverName)
+            .setMessage("${computer.os} · ${computer.agentId}\n电脑 Agent v$agentVersion\n${computer.serverUrl}")
+            .setNegativeButton("返回") { _, _ -> showPairedComputers() }
+            .setNeutralButton("解除配对") { _, _ -> confirmDeleteDevice(computer) }
+        when {
+            computer.agentId in expiredAgentIds -> builder.setPositiveButton("重新配对") { _, _ -> showPair() }
+            current && mainVisible -> builder.setPositiveButton("重新连接") { _, _ -> disconnect(); connect() }
+            current -> builder.setPositiveButton("返回已配对电脑") { _, _ ->
+                settingsPage?.dismiss()
+                showMain()
+            }
+            else -> builder.setPositiveButton("切换到此电脑") { _, _ ->
+                settingsPage?.dismiss()
+                selectDevice(computer, closeSidebarAfter = mainVisible)
+            }
+        }
+        styledDialog(builder)
     }
 
     private fun confirmAgentUpdate() {
         if (!online || !info.optBoolean("remoteUpdate")) { toast("电脑 Agent 离线或不支持远程更新"); return }
-        styledDialog(AlertDialog.Builder(this)
+        styledDialog(MiuixDialog.Builder(this)
             .setTitle("更新电脑 Agent")
             .setMessage("更新包将在电脑端校验，进行中的任务和排队消息结束后自动安装，随后电脑 Agent 会重启。")
             .setPositiveButton("检查并更新") { _, _ -> requestAgentUpdate() }
@@ -3560,14 +3908,14 @@ internal class MainActivity : Activity() {
             current.pendingAgentUpdateFrom = versionBeforeUpdate
             store.save(devices)
         }
-        val spinner = ProgressBar(this).apply { isIndeterminate = true }
+        val spinner = MiuixProgressView(this)
         val column = Ui.column(this).apply {
             setPadding(Ui.dp(context, 24), Ui.dp(context, 4), Ui.dp(context, 24), Ui.dp(context, 8))
             gravity = Gravity.CENTER_HORIZONTAL
             addView(spinner)
             addView(Ui.text(context, "正在检查并校验电脑 Agent 更新…", 13f, Ui.MUTED), matchWidth(top = 12))
         }
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("更新电脑 Agent").setView(column))
+        val dialog = styledDialog(MiuixDialog.Builder(this).setTitle("更新电脑 Agent").setView(column))
         dialog.setCancelable(false)
         connection.request("codexrm/update", timeoutMs = 600_000) { result, error ->
             dialog.dismiss()
@@ -3585,7 +3933,7 @@ internal class MainActivity : Activity() {
             if (generation != requestGeneration || !online) return@request
             when {
                 error is RpcOutcomeUnknown -> toast("更新结果待确认，重连后将检查版本")
-                error != null || result == null -> styledDialog(AlertDialog.Builder(this)
+                error != null || result == null -> styledDialog(MiuixDialog.Builder(this)
                     .setTitle("电脑 Agent 更新")
                     .setMessage(error?.message ?: "更新请求失败")
                     .setPositiveButton("知道了", null))
@@ -3620,7 +3968,7 @@ internal class MainActivity : Activity() {
     private fun checkForUpdates() {
         cancelUpdateOperation()
         val operation = updateOperation
-        val spinner = ProgressBar(this).apply { isIndeterminate = true }
+        val spinner = MiuixProgressView(this)
         val column = Ui.column(this).apply {
             setPadding(Ui.dp(context, 24), Ui.dp(context, 4), Ui.dp(context, 24), Ui.dp(context, 8))
             gravity = Gravity.CENTER_HORIZONTAL
@@ -3628,7 +3976,7 @@ internal class MainActivity : Activity() {
             addView(Ui.text(context, "正在检查新版本…", 13f, Ui.MUTED), matchWidth(top = 12))
         }
         val dialog = styledDialog(
-            AlertDialog.Builder(this)
+            MiuixDialog.Builder(this)
                 .setTitle("检查更新")
                 .setView(column)
                 .setNegativeButton("取消") { _, _ -> cancelUpdateOperation() },
@@ -3644,7 +3992,7 @@ internal class MainActivity : Activity() {
                 error != null -> showUpdateFailure(error.message ?: "网络或发布信息不可用") { checkForUpdates() }
                 latest == null -> showUpdateFailure("更新服务器未返回有效版本") { checkForUpdates() }
                 latest.versionCode <= UpdateChecker.currentVersionCode(this) -> styledDialog(
-                    AlertDialog.Builder(this)
+                    MiuixDialog.Builder(this)
                         .setTitle("已是最新版本")
                         .setMessage("当前版本 ${UpdateChecker.currentVersionName(this)} (${UpdateChecker.currentVersionCode(this)})")
                         .setPositiveButton("知道了", null),
@@ -3667,7 +4015,7 @@ internal class MainActivity : Activity() {
 
     private fun showUpdateFailure(message: String, retry: () -> Unit) {
         styledDialog(
-            AlertDialog.Builder(this)
+            MiuixDialog.Builder(this)
                 .setTitle("检查更新")
                 .setMessage(message)
                 .setPositiveButton("重试") { _, _ -> retry() }
@@ -3679,7 +4027,7 @@ internal class MainActivity : Activity() {
         val notes = info.releaseNotes.ifBlank { "本次发布未提供更新说明。" }
         val size = String.format(Locale.US, "%.1f MiB", info.fileSize / 1048576.0)
         styledDialog(
-            AlertDialog.Builder(this)
+            MiuixDialog.Builder(this)
                 .setTitle("发现新版本 ${info.versionName}")
                 .setMessage("当前版本 ${UpdateChecker.currentVersionName(this)}\n安装包 $size\n\n$notes\n\n下载校验完成后自动安装。")
                 .setPositiveButton("立即更新") { _, _ ->
@@ -3688,7 +4036,7 @@ internal class MainActivity : Activity() {
                     } else {
                         pendingUpdate = info
                         styledDialog(
-                            AlertDialog.Builder(this)
+                            MiuixDialog.Builder(this)
                                 .setTitle("允许安装应用更新")
                                 .setMessage("首次更新需要在系统设置中允许 CodexRM 安装未知应用。授权后返回即可继续下载。")
                                 .setPositiveButton("去授权") { _, _ ->
@@ -3714,14 +4062,14 @@ internal class MainActivity : Activity() {
         cancelUpdateOperation()
         val operation = updateOperation
         val status = Ui.text(this, "正在下载更新…0%", 13f, Ui.MUTED)
-        val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
+        val progress = MiuixProgressView(this, linear = true)
         val column = Ui.column(this).apply {
             setPadding(Ui.dp(context, 24), Ui.dp(context, 8), Ui.dp(context, 24), Ui.dp(context, 8))
             addView(status, matchWidth())
             addView(progress, matchWidth(top = 16))
         }
         val dialog = styledDialog(
-            AlertDialog.Builder(this)
+            MiuixDialog.Builder(this)
                 .setTitle("下载 CodexRM ${info.versionName}")
                 .setView(column)
                 .setNegativeButton("取消下载") { _, _ -> cancelUpdateOperation() },
@@ -3744,7 +4092,7 @@ internal class MainActivity : Activity() {
 
             dialog.setTitle("安装更新")
             dialog.setCancelable(false)
-            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).visibility = View.GONE
+            dialog.getButton(MiuixDialog.NEGATIVE).visible = false
             status.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
             status.text = "即将关闭软件，正在安装更新"
             progress.isIndeterminate = true
@@ -3791,25 +4139,18 @@ internal class MainActivity : Activity() {
         val targetAgent = currentAgent()
         if (targetId.isEmpty() || loading) return
 
-        val input = Ui.boxInput(this, "会话标题").apply {
-            isSingleLine = true
-            setText(currentName)
-            selectAll()
-        }
-        val content = Ui.column(this).apply {
-            setPadding(Ui.dp(context, 22), 0, Ui.dp(context, 22), Ui.dp(context, 12))
-            addView(input, matchWidth())
-        }
-        val dialog = styledDialog(AlertDialog.Builder(this)
+        val input = MiuixFieldView(this, "会话标题", currentName)
+        val dialog = styledDialog(MiuixDialog.Builder(this)
             .setTitle("修改会话标题")
-            .setView(content)
+            .setView(input)
             .setPositiveButton("保存", null)
             .setNegativeButton("取消", null))
-        val save = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        val save = dialog.getButton(MiuixDialog.POSITIVE)
         save.setOnClickListener {
-            val name = input.text.toString().trim()
+            val name = input.text.trim()
             if (name.isEmpty()) {
                 input.error = "请输入会话标题"
+                input.focusInput()
                 return@setOnClickListener
             }
             if (targetAgent != currentAgent()) {
@@ -3838,8 +4179,8 @@ internal class MainActivity : Activity() {
 
     private fun confirmDeleteDevice(target: Device) {
         devicePopup?.dismiss()
-        styledDialog(AlertDialog.Builder(this).setTitle("删除电脑？")
-            .setMessage("将从此手机移除“${target.serverName}”，并尝试撤销配对。网络异常或撤销失败也会继续删除。再次连接需要重新配对。")
+        styledDialog(MiuixDialog.Builder(this).setTitle("删除电脑？")
+            .setMessage("将从此手机移除“${target.serverName}”，有网时会尝试解除授权，离线时等恢复网络再上报。上报失败不影响删除，再次连接需要重新配对。")
             .setPositiveButton("删除设备") { _, _ -> deleteDevice(target) }
             .setNegativeButton("取消", null))
     }
@@ -3859,14 +4200,19 @@ internal class MainActivity : Activity() {
         TaskMonitor.enable(this, target.agentId, false)
         devices.removeAll { it.agentId == target.agentId }
         expiredAgentIds.remove(target.agentId)
-        store.save(devices)
+        store.saveRemoval(devices, target)
         if (selected) {
             device = devices.firstOrNull { it.agentId !in expiredAgentIds }; store.selectedId = device?.agentId.orEmpty(); restoreThreadId = ""
             if (device == null) { resetConversation(); showPair() } else showMain(reset = true)
-        } else renderDevices()
-        toast("设备已删除")
-        // Local deletion is final; the relay request must never block or undo it.
-        runCatching { Network.request(target.serverUrl, "/api/v1/client/revoke", target.token, JSONObject()) { _, _ -> } }
+        } else {
+            if (mainBuilt) renderDevices()
+            settingsPage?.refreshActionSummaries()
+        }
+        toast(if (DeviceRevokeJob.schedule(this)) "设备已删除" else "设备已删除，暂未能安排解除授权上报")
+    }
+
+    private fun showRevocationFailure() {
+        if (store.consumeRevocationFailure()) toast("解除授权上报失败，电脑仍已从此手机删除")
     }
 
     private fun threadDeletionReason(id: String): String? = when {
@@ -3881,7 +4227,7 @@ internal class MainActivity : Activity() {
     private fun confirmArchiveThread(id: String, title: String) {
         threadDeletionReason(id)?.let { toast(it); return }
         val currentGeneration = generation
-        styledDialog(AlertDialog.Builder(this).setTitle("归档对话？")
+        styledDialog(MiuixDialog.Builder(this).setTitle("归档对话？")
             .setMessage("将“$title”移到已归档会话，之后可以恢复。")
             .setPositiveButton("归档") { _, _ ->
                 if (currentGeneration != generation) return@setPositiveButton
@@ -3913,17 +4259,26 @@ internal class MainActivity : Activity() {
         renderWorkspaces(); renderApproval(); renderQueue()
     }
 
-    private fun toggleTheme() {
-        val wasSidebarOpen = sidebarOpen
+    private fun restylePairPage() {
+        val oldCode = codeInput?.text?.toString()
+        val oldServer = serverInput?.text?.toString()
+        renderPairPage()
+        if (oldCode != null) codeInput?.setText(oldCode)
+        if (oldServer != null) serverInput?.setText(oldServer)
+    }
+
+    private fun setDarkTheme(dark: Boolean) {
+        if (store.darkTheme == dark) return
+        store.darkTheme = dark
+        Ui.configure(this, dark)
+        if (!mainVisible) {
+            restylePairPage()
+            return
+        }
         invalidateBackPreview()
         saveDraft(); val savedMessages = if (mainBuilt) adapter.snapshot() else emptyList()
-        store.darkTheme = !store.darkTheme; Ui.configure(this, store.darkTheme)
         mainBuilt = false; buildMain(); adapter.replace(savedMessages); mainVisible = true; setContentView(mainRoot)
-        restoreDraft(); renderDevices(); renderWorkspaces(); renderApproval(); renderQueue(); refreshModelSpinner(); updateControls()
-        if (wasSidebarOpen) {
-            sidebarOpen = true
-            drawSidebar(0f)
-        }
+        restoreDraft(); renderDevices(); renderWorkspaces(); renderApproval(); renderQueue(); refreshModelChoices(); updateControls()
         updateSidebarAccessibility()
         updateBackHandling()
     }
@@ -3976,7 +4331,7 @@ internal class MainActivity : Activity() {
         button.tooltipText = description
     }
 
-    private fun updateConnectionDialog(dialog: AlertDialog, status: DirectStatus) {
+    private fun updateConnectionDialog(dialog: MiuixDialog, status: DirectStatus) {
         if (status !is DirectStatus.Connected) {
             dialogShowsDirect = false
             dialog.setTitle("RM 中继")
@@ -3995,10 +4350,20 @@ internal class MainActivity : Activity() {
         }
     }
 
+    private fun publishRemoteBridge() {
+        RemoteBridge.update(client, device)
+    }
+
+    private fun openRemoteControl() {
+        publishRemoteBridge()
+        startActivity(Intent(this, RemoteControlActivity::class.java))
+    }
+
     private fun showConnectionDetails() {
         val status = activeConnectionStatus() ?: return
         connectionDialog?.dismiss()
-        val dialog = AlertDialog.Builder(this)
+        val dialog = MiuixDialog.Builder(this)
+            .setNegativeButton("诊断") { _, _ -> showNATDiagnostic() }
             .setPositiveButton("关闭", null)
             .create()
         connectionDialog = dialog
@@ -4008,11 +4373,55 @@ internal class MainActivity : Activity() {
         dialog.show()
     }
 
+    private fun showNATDiagnostic() {
+        val connectedClient = client ?: return
+        val progress = "正在同时测试手机和 Agent 的 RFC 3489 / RFC 5780…"
+        val dialog = MiuixDialog.Builder(this)
+            .setTitle("NAT 诊断")
+            .setMessage(progress)
+            .setNegativeButton("重新诊断", null)
+            .setPositiveButton("关闭", null)
+            .create()
+        val retry = dialog.getButton(MiuixDialog.NEGATIVE)
+        var latestReport: String? = null
+        val enableRetry = Runnable {
+            if (dialog.isShowing && !isDestroyed) {
+                latestReport?.let(dialog::setMessage)
+                retry.isEnabled = true
+            }
+        }
+        val runDiagnosis: () -> Unit = {
+            handler.removeCallbacks(enableRetry)
+            if (client !== connectedClient) {
+                retry.isEnabled = false
+                dialog.setMessage("当前连接已变更，请关闭后从连接状态重新打开诊断。")
+            } else {
+                retry.isEnabled = false
+                latestReport = null
+                dialog.setMessage(progress)
+                connectedClient.diagnoseNAT { result ->
+                    if (dialog.isShowing && !isDestroyed) {
+                        val waitMs = (result.retryAtMs - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0)
+                        val hint = if (waitMs > 0) "\n\n冷却结束后可重新诊断。" else ""
+                        val report = result.displayText()
+                        latestReport = report
+                        dialog.setMessage(report + hint)
+                        if (waitMs == 0L) enableRetry.run() else handler.postDelayed(enableRetry, waitMs)
+                    }
+                }
+            }
+        }
+        retry.setOnClickListener(runDiagnosis)
+        dialog.setOnDismissListener { handler.removeCallbacks(enableRetry) }
+        dialog.show()
+        runDiagnosis()
+    }
+
     private fun performHomeAction(action: HomeAction) {
         when (action) {
             HomeAction.START_INPUT -> focusComposer()
             HomeAction.CHOOSE_WORKSPACE -> showWorkspaceChoices()
-            HomeAction.CHOOSE_DEVICE -> showDevices()
+            HomeAction.CHOOSE_DEVICE -> showDevices(welcomeSecondary.takeIf { it.isShown } ?: deviceButton)
             HomeAction.RETRY_CONNECTION -> {
                 disconnect()
                 connect()
@@ -4069,7 +4478,6 @@ internal class MainActivity : Activity() {
         deviceButton.contentDescription = "选择设备，当前设备：$currentDeviceName，${if (online) "已连接" else "离线"}"
         connectionDot.background = Ui.rounded(if (online) Ui.GREEN else Ui.DIM, Ui.dp(this, 3).toFloat())
         val hasOpenThread = currentThreadId.isNotEmpty()
-        conversationMenu.visibility = View.VISIBLE
         deviceButton.visibility = if (hasOpenThread) View.GONE else View.VISIBLE
         demoBadge.visibility = if (!hasOpenThread && info.optBoolean("mock")) View.VISIBLE else View.GONE
         topbarTitle.visibility = if (!hasOpenThread && demoBadge.visibility == View.VISIBLE && resources.configuration.screenWidthDp < 400) View.GONE else View.VISIBLE
@@ -4086,14 +4494,14 @@ internal class MainActivity : Activity() {
         messageList.visibility = if (currentThread == null && adapter.count == 0) View.GONE else View.VISIBLE
         activityRow.visibility = if (running) View.VISIBLE else View.GONE
         activityText.text = if (online) "Codex 正在处理" else "等待同步任务状态"
-        composer.isEnabled = !readOnly || cachedAt > 0
+        composer.isEnabled = !readOnly || cachedAt > 0 || canCloseDesktopForSend()
         val modelBlockReason = InteractionCopy.modelBlockReason(online, readOnly, running, sending, loading)
         modelButton.isEnabled = true
         modelButton.alpha = if (modelBlockReason == null) 1f else .65f
         modelButton.contentDescription = "选择模型，当前为${selectedModelOption?.let { "${it.providerName} ${it.displayName}" } ?: "默认模型"}" +
             modelBlockReason?.let { "，当前不可用：$it" }.orEmpty()
-        effortSpinner.isEnabled = modelBlockReason == null
-        effortSpinner.visibility = if (running) View.GONE else View.VISIBLE
+        effortButton.isEnabled = modelBlockReason == null
+        effortButton.visibility = if (running) View.GONE else View.VISIBLE
         (runningActions.getChildAt(0) as TextView).text = if (info.optBoolean("messageQueue")) {
             "普通发送会排队；优先指令会交由当前任务立即处理。"
         } else {
@@ -4101,6 +4509,7 @@ internal class MainActivity : Activity() {
         }
         runningActions.visibility = if (running) View.VISIBLE else View.GONE
         updateSendState()
+        schedulePendingShare()
         if (pendingOpenThread != null && !loading && !sending && !bootstrapping) {
             handler.removeCallbacks(processPendingOpen)
             handler.post(processPendingOpen)
@@ -4111,16 +4520,17 @@ internal class MainActivity : Activity() {
         if (!mainBuilt || !::sendButton.isInitialized) return
         val hasPayload = composer.text.isNotBlank() || attachmentFiles.isNotEmpty()
         val editingQueuedMessage = editingQueueDraft == composerBinding
-        val blockReason = InteractionCopy.sendBlockReason(SendUiState(
+        val canRecover = readOnly && canCloseDesktopForSend()
+        val blockReason = if (providerUnavailable) providerSwitchHint else InteractionCopy.sendBlockReason(SendUiState(
             hasPayload = hasPayload,
             online = online,
             loaded = loaded,
             sending = sending,
             loading = loading,
             preparingAttachments = preparingAttachments,
-            readOnly = readOnly,
+            readOnly = readOnly && !canRecover,
             editingQueuedMessage = editingQueuedMessage,
-            running = running,
+            running = running && !canRecover,
             messageQueue = info.optBoolean("messageQueue"),
             hasAttachments = attachmentFiles.isNotEmpty(),
             attachmentsSupported = info.has("attachments"),
@@ -4132,14 +4542,18 @@ internal class MainActivity : Activity() {
         sendButton.visibility = View.VISIBLE
         sendButton.isEnabled = blockReason == null
         sendButton.alpha = if (sendButton.isEnabled) 1f else .35f
-        val sendAction = if (running) "排队发送" else "发送消息"
+        val sendAction = when {
+            canRecover -> "恢复会话并发送"
+            running -> "排队发送"
+            else -> "发送消息"
+        }
         sendButton.contentDescription = sendAction + blockReason?.let { "，当前不可用：$it" }.orEmpty()
         sendHint.text = blockReason.orEmpty()
-        sendHint.visibility = if (blockReason != null && (hasPayload || readOnly || preparingAttachments || sending)) View.VISIBLE else View.GONE
+        sendHint.visibility = if (blockReason != null && (hasPayload || readOnly || providerUnavailable || preparingAttachments || sending)) View.VISIBLE else View.GONE
         stopButton.visibility = if (running && !readOnly) View.VISIBLE else View.GONE
         // Keep the button clickable when merely offline or unsupported so a tap explains
         // why (a disabled button gave Android 12 users silent "no response"); dim it instead.
-        attachButton.isEnabled = !sending && !loading && !readOnly && !preparingAttachments && !editingQueuedMessage
+        attachButton.isEnabled = !sending && !loading && (!readOnly || canRecover) && !preparingAttachments && !editingQueuedMessage
         val attachReady = attachButton.isEnabled && online && loaded && info.has("attachments")
         attachButton.alpha = if (attachReady) 1f else .35f
         if (!attachReady) attachmentSheet?.dismiss()
@@ -4201,7 +4615,7 @@ internal class MainActivity : Activity() {
             toast("请求仍在等待设备确认")
             return
         }
-        val dialog = AlertDialog.Builder(this)
+        val dialog = MiuixDialog.Builder(this)
             .setTitle("发送状态未确认")
             .setMessage("内容已保留，但无法确定设备是否已接受。请先核对会话历史；应用不会自动重发。\n\n${value.submittedText.take(500)}")
             .setPositiveButton("核对会话") { _, _ -> verifyPendingSend(value) }
@@ -4264,6 +4678,7 @@ internal class MainActivity : Activity() {
 
     private fun rebindComposer(binding: ComposerBinding): ComposerRestoreToken {
         attachmentSheet?.dismiss()
+        markupDialog?.dismiss()
         composerBinding = binding
         if (mainBuilt) {
             setComposerText("")
@@ -4374,10 +4789,54 @@ internal class MainActivity : Activity() {
         adapter.message(id)?.change(status = status)
     }
 
+    override fun onKeyShortcut(keyCode: Int, event: KeyEvent): Boolean {
+        if (!mainVisible || !mainBuilt || !event.hasModifiers(KeyEvent.META_CTRL_ON)) {
+            return super.onKeyShortcut(keyCode, event)
+        }
+        val action: () -> Unit = when (keyCode) {
+            KeyEvent.KEYCODE_N -> ::openNewChatEntry
+            KeyEvent.KEYCODE_K -> ::openSearchEntry
+            KeyEvent.KEYCODE_F -> if (adapter.count > 0) ::searchConversation else return super.onKeyShortcut(keyCode, event)
+            else -> return super.onKeyShortcut(keyCode, event)
+        }
+        if (event.repeatCount == 0) action()
+        return true
+    }
+
+    override fun onProvideKeyboardShortcuts(groups: MutableList<KeyboardShortcutGroup>, menu: Menu?, deviceId: Int) {
+        super.onProvideKeyboardShortcuts(groups, menu, deviceId)
+        if (!mainVisible || !mainBuilt) return
+        val shortcuts = mutableListOf(
+            KeyboardShortcutInfo("新建会话", KeyEvent.KEYCODE_N, KeyEvent.META_CTRL_ON),
+            KeyboardShortcutInfo("搜索会话", KeyEvent.KEYCODE_K, KeyEvent.META_CTRL_ON),
+        )
+        if (adapter.count > 0) shortcuts += KeyboardShortcutInfo("搜索当前会话", KeyEvent.KEYCODE_F, KeyEvent.META_CTRL_ON)
+        groups.add(KeyboardShortcutGroup("CodexRM", shortcuts))
+    }
+
+    private fun openNewChatEntry() {
+        if (!mainVisible || !mainBuilt) return
+        if (currentCwd.isEmpty()) currentCwd = store.selectedWorkspace(currentAgent())
+        newChat(showKeyboard = true)
+    }
+
+    private fun openSearchEntry() {
+        if (!mainVisible || !mainBuilt) return
+        openSidebar()
+        if (searchInput.requestFocus()) searchInput.post {
+            if (sidebarOpen && searchInput.isFocused) {
+                WindowCompat.getInsetsController(window, searchInput).show(WindowInsetsCompat.Type.ime())
+            }
+        }
+    }
+
     private fun acceptExternalIntent(intent: Intent) {
         when (intent.action) {
+            ChatEntryPoints.NEW_CHAT -> openNewChatEntry()
+            ChatEntryPoints.SEARCH -> openSearchEntry()
             TaskMonitor.OPEN -> {
-                val target = devices.firstOrNull { it.agentId == intent.getStringExtra(TaskMonitor.DEVICE) } ?: return
+                val target = devices.firstOrNull { it.agentId == intent.getStringExtra(TaskMonitor.DEVICE) }
+                    ?: return toast("找不到此会话绑定的电脑")
                 val thread = intent.getStringExtra(TaskMonitor.THREAD).orEmpty()
                 if (target.agentId != currentAgent()) selectDevice(target, closeSidebarAfter = true)
                 if (thread.isNotEmpty()) {
@@ -4387,16 +4846,33 @@ internal class MainActivity : Activity() {
                 }
             }
             Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE, Intent.ACTION_PROCESS_TEXT -> {
-                pendingShare = intent
+                pendingShares.addLast(intent)
                 reviewSharedDraft()
             }
         }
     }
 
+    private fun canReviewShare() = mainVisible && mainBuilt && resumed && !isFinishing && !isDestroyed &&
+        shareDialog == null && !sending && !loading && !preparingAttachments
+
+    private fun schedulePendingShare() {
+        if (pendingShares.isEmpty() || !canReviewShare()) return
+        handler.removeCallbacks(reviewPendingShare)
+        handler.post(reviewPendingShare)
+    }
+
+    private fun showShareDialog(builder: MiuixDialog.Builder): MiuixDialog = styledDialog(builder).also { dialog ->
+        shareDialog = dialog
+        dialog.setOnDismissListener {
+            if (shareDialog === dialog) shareDialog = null
+            schedulePendingShare()
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun reviewSharedDraft() {
-        val share = pendingShare ?: return
-        if (!mainVisible || !mainBuilt || sharedDraftPending || sending || loading || preparingAttachments) return
+        if (!canReviewShare()) return
+        val share = pendingShares.removeFirstOrNull() ?: return
         val text = runCatching {
             share.getCharSequenceExtra(if (share.action == Intent.ACTION_PROCESS_TEXT) Intent.EXTRA_PROCESS_TEXT else Intent.EXTRA_TEXT)
                 ?.toString().orEmpty().take(60_000)
@@ -4415,63 +4891,69 @@ internal class MainActivity : Activity() {
             }
         }
         val attachments = uris.filter { it.scheme == "content" }
-        pendingShare = null
-        if (text.isBlank() && attachments.isEmpty()) { toast("没有可导入的分享内容"); return }
+        if (text.isBlank() && attachments.isEmpty()) {
+            toast("没有可导入的分享内容")
+            schedulePendingShare()
+            return
+        }
         val content = SharedContent(text, attachments)
-        sharedDraftPending = true
-        styledDialog(AlertDialog.Builder(this)
+        if (store.shareToNewDraft && (attachments.isEmpty() || currentCwd.isNotEmpty() || store.selectedWorkspace(currentAgent()).isNotEmpty())) {
+            addToNewSharedDraft(content)
+            schedulePendingShare()
+            return
+        }
+        showShareDialog(MiuixDialog.Builder(this)
             .setTitle("分享至 CodexRM")
-            .setItems(arrayOf("加入对话", "发给电脑")) { _, index ->
-                if (index == 0) showShareConversations(content) else showShareComputers(content)
+            .setItems(arrayOf("加入新会话草稿", "选择已有会话", "发给电脑")) { _, index ->
+                when (index) {
+                    0 -> addToNewSharedDraft(content)
+                    1 -> showShareConversations(content)
+                    2 -> showShareComputers(content)
+                }
             }.setNegativeButton("取消", null))
-            .setOnDismissListener { sharedDraftPending = false }
+    }
+
+    private fun addToNewSharedDraft(content: SharedContent) {
+        if (sending || loading || preparingAttachments) { toast("请等待当前操作完成"); return }
+        restoreThreadId = ""
+        if (currentCwd.isEmpty()) currentCwd = store.selectedWorkspace(currentAgent())
+        if (content.files.isNotEmpty() && currentCwd.isEmpty()) {
+            toast("连接电脑并选择工作目录后即可导入附件")
+            return
+        }
+        newChat(showKeyboard = false)
+        if (sidebarOpen) closeSidebar()
+        addToDraft(content)
     }
 
     private fun showShareConversations(content: SharedContent) {
         val current = currentThread?.takeIf { it.string("id").isNotBlank() }?.let(ProtocolFormatter::thread)
         val targetThreads = (listOfNotNull(current) + threads).distinctBy { it.id }
-        val filter = Ui.input(this, "搜索对话").apply { isSingleLine = true }
-        val list = ListView(this)
-        val panel = Ui.column(this).apply {
-            setPadding(Ui.dp(context, 16), 0, Ui.dp(context, 16), 0)
-            addView(filter, matchWidth())
-            addView(list, LinearLayout.LayoutParams(-1, Ui.dp(context, 300)))
-        }
-        var visible = targetThreads
-        fun update() {
-            val query = filter.text.toString().trim()
-            visible = targetThreads.filter { it.title.contains(query, true) || it.cwd.contains(query, true) }
-            list.adapter = android.widget.ArrayAdapter(this, android.R.layout.simple_list_item_1,
-                listOf("新对话") + visible.map { it.title })
-        }
-        update()
-        filter.addTextChangedListener(object : android.text.TextWatcher {
-            override fun beforeTextChanged(text: CharSequence?, start: Int, count: Int, after: Int) = Unit
-            override fun onTextChanged(text: CharSequence?, start: Int, before: Int, count: Int) = update()
-            override fun afterTextChanged(text: android.text.Editable?) = Unit
-        })
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("加入对话").setView(panel).setNegativeButton("取消", null))
-        list.setOnItemClickListener { _, _, index, _ ->
-            if (sending || loading || preparingAttachments) { toast("请等待当前操作完成"); return@setOnItemClickListener }
-            dialog.dismiss()
-            if (index == 0) {
-                restoreThreadId = ""
-                newChat(showKeyboard = false)
-                addToDraft(content)
-            } else {
-                val thread = visible[index - 1]
-                if (thread.id == currentThreadId) addToDraft(content)
-                else {
-                    if (!online && conversationCache.read(currentAgent(), thread.id) == null) {
-                        toast("电脑离线，暂时无法打开该对话")
-                        showShareConversations(content)
-                        return@setOnItemClickListener
+        lateinit var dialog: MiuixDialog
+        dialog = showShareDialog(
+            MiuixDialog.Builder(this).setTitle("加入对话").setContent {
+                MiuixShareTargets(targetThreads) select@{ thread ->
+                    if (sending || loading || preparingAttachments) {
+                        toast("请等待当前操作完成")
+                        return@select
                     }
-                    shareForThread = ComposerBinding(currentAgent(), thread.id, thread.cwd) to content
-                    openThread(thread.id)
+                    if (thread != null && thread.id != currentThreadId && !online &&
+                        conversationCache.read(currentAgent(), thread.id) == null) {
+                        toast("电脑离线，暂时无法打开该对话")
+                        return@select
+                    }
+                    dialog.dismiss()
+                    when {
+                        thread == null -> addToNewSharedDraft(content)
+                        thread.id == currentThreadId -> addToDraft(content)
+                        else -> {
+                            shareForThread = ComposerBinding(currentAgent(), thread.id, thread.cwd) to content
+                            openThread(thread.id)
+                        }
+                    }
                 }
-            }
-        }
+            }.setNegativeButton("取消", null),
+        )
     }
 
     private fun acceptShareForThread(threadId: String) {
@@ -4494,7 +4976,7 @@ internal class MainActivity : Activity() {
     private fun showShareComputers(content: SharedContent) {
         val targets = devices.filterNot { it.agentId in expiredAgentIds }
         if (targets.isEmpty()) { toast("请先配对电脑"); return }
-        styledDialog(AlertDialog.Builder(this).setTitle("发给电脑")
+        showShareDialog(MiuixDialog.Builder(this).setTitle("发给电脑")
             .setItems(targets.map { it.serverName.ifBlank { "已配对电脑" } }.toTypedArray()) { _, index ->
                 sendSystemShare(targets[index], content)
             }.setNegativeButton("取消", null))
@@ -4505,31 +4987,51 @@ internal class MainActivity : Activity() {
             val padding = Ui.dp(context, 20)
             setPadding(padding, padding, padding, padding)
         }
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("发送到 ${target.serverName}").setView(label)
-            .setCancelable(false))
+        val dialog = showShareDialog(MiuixDialog.Builder(this).setTitle("发送到 ${target.serverName}").setView(label)
+            .setCancelable(false).setNegativeButton("取消", null))
         var finished = false
-        var transmitting = false
-        fun complete(count: Int, error: Exception?) {
+        var checkingDevice = false
+        fun complete(count: Int, error: Exception?, cancelled: Boolean = false) {
             if (finished) return
             finished = true
+            cancelDesktopShareWait?.invoke()
+            cancelDesktopShareWait = null
             val temporary = desktopShareClient
             desktopShareClient = null
             temporary?.stop()
             if (isDestroyed) return
             dialog.dismiss()
+            if (cancelled) return
             if (error == null) toast("已保存到电脑的下载文件夹 · $count 个文件")
             else {
                 val prefix = if (count > 0) "已保存 $count 个文件。其余文件发送失败。 " else ""
                 toast(prefix + error.message.orEmpty().ifBlank { "发送失败" })
             }
         }
+        val cancel = dialog.getButton(MiuixDialog.NEGATIVE)
+        cancel.setOnClickListener { complete(0, null, cancelled = true) }
         fun connected(connection: CodexClient) {
-            if (finished || transmitting) return
-            transmitting = true
+            if (finished || checkingDevice) return
+            checkingDevice = true
             connection.request("codexrm/info", timeoutMs = 12_000) { response, error ->
+                if (finished || isDestroyed) return@request
                 if (error != null) complete(0, error)
                 else if (response?.optBoolean("desktopShare") != true) complete(0, IOException("此电脑需要新版 Windows Agent 才能接收文件"))
-                else DesktopShare(this, connection).send(content, { label.text = it }, ::complete)
+                else {
+                    label.text = "正在等待 P2P 直连…"
+                    cancelDesktopShareWait = connection.withDesktopShareTransport { transport ->
+                        cancelDesktopShareWait = null
+                        if (!finished && !isDestroyed) {
+                            if (transport == null) complete(0, IOException(DESKTOP_SHARE_DIRECT_REQUIRED))
+                            else {
+                                cancel.visible = false
+                                DesktopShare(this, connection).send(content, transport, { label.text = it }) { count, failure ->
+                                    complete(count, failure)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         if (target.agentId == currentAgent()) {
@@ -4541,19 +5043,20 @@ internal class MainActivity : Activity() {
         val temporary = CodexClient(this, target, object : CodexClient.Listener {
             override fun onState(state: ConnectionState, agent: JSONObject?) {
                 if (state == ConnectionState.ONLINE) desktopShareClient?.let(::connected)
-                if (state == ConnectionState.OFFLINE && !transmitting) complete(0, IOException("此电脑的 Agent 未上线"))
+                if (state == ConnectionState.OFFLINE && !checkingDevice) complete(0, IOException("此电脑的 Agent 未上线"))
             }
-            override fun onFailure(message: String) { if (!transmitting) complete(0, IOException(message)) }
+            override fun onFailure(message: String) { if (!checkingDevice) complete(0, IOException(message)) }
             override fun onAuthorizationExpired() { complete(0, IOException("电脑配对已失效")) }
             override fun onDirectFallback() = Unit
             override fun onRpcEvent(message: JSONObject) = Unit
-        }, relayOnly = true)
+        })
         desktopShareClient = temporary
         temporary.start()
-        handler.postDelayed({ if (!transmitting && !finished) complete(0, IOException("连接电脑超时")) }, 12_000)
+        handler.postDelayed({ if (!checkingDevice && !finished) complete(0, IOException("连接电脑超时")) }, 12_000)
     }
 
-    private fun showConversationTools() {
+    private fun showTools() {
+        closeSidebar()
         val actions = linkedMapOf<String, () -> Unit>()
         if (adapter.count > 0) actions["搜索当前会话"] = ::searchConversation
         if (currentThreadId.isNotEmpty()) actions["查看改动"] = ::showConversationDiff
@@ -4566,9 +5069,7 @@ internal class MainActivity : Activity() {
             }
         }
         actions["连接与重试"] = ::showConnectionActions
-        val watching = TaskMonitor.enabled(this, currentAgent())
-        actions[if (watching) "关闭当前设备任务通知" else "开启当前设备任务通知"] = { toggleTaskMonitor(!watching) }
-        styledDialog(AlertDialog.Builder(this).setTitle("会话工具")
+        styledDialog(MiuixDialog.Builder(this).setTitle("工具")
             .setItems(actions.keys.toTypedArray()) { _, which -> actions.values.elementAt(which).invoke() })
     }
 
@@ -4580,7 +5081,7 @@ internal class MainActivity : Activity() {
         } else if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 907)
-        } else toast("任务通知已开启，退到后台后开始监听")
+        } else toast("任务通知已开启，有任务运行时退到后台会继续监听")
     }
 
     private fun searchConversation() {
@@ -4594,7 +5095,7 @@ internal class MainActivity : Activity() {
             addView(controls, matchWidth())
             addView(resultList, LinearLayout.LayoutParams(-1, Ui.dp(context, 300)))
         }
-        val dialog = styledDialog(AlertDialog.Builder(this).setTitle("搜索当前会话").setView(panel)
+        val dialog = styledDialog(MiuixDialog.Builder(this).setTitle("搜索当前会话").setView(panel)
             .setNegativeButton("关闭", null))
         var selected = -1
         fun goTo(hit: ChatMessage) {
@@ -4685,13 +5186,19 @@ internal class MainActivity : Activity() {
             }
             actions["关联分支"] = { showRelatedConversations(thread.id) }
         }
+        if (ChatEntryPoints.canPinThread(this)) {
+            val agent = currentAgent()
+            actions["添加到主屏幕"] = {
+                if (!ChatEntryPoints.pinThread(this, agent, thread.id, thread.title)) toast("桌面暂时无法添加此快捷方式")
+            }
+        }
         actions["归档"] = { confirmArchiveThread(thread.id, thread.title) }
         return actions
     }
 
     private fun showSidebarThreadActions(thread: ThreadSummary) {
         val actions = sidebarThreadActions(thread)
-        styledDialog(AlertDialog.Builder(this).setTitle(thread.title)
+        styledDialog(MiuixDialog.Builder(this).setTitle(thread.title)
             .setItems(actions.keys.toTypedArray()) { _, index -> actions.values.elementAt(index).invoke() })
     }
 
@@ -4904,7 +5411,7 @@ internal class MainActivity : Activity() {
             actions["用原指令重试"] = { forkMessage(message, edit = false) }
             actions["关联分支"] = { showRelatedConversations(currentThreadId) }
         }
-        styledDialog(AlertDialog.Builder(this).setItems(actions.keys.toTypedArray()) { _, index -> actions.values.elementAt(index).invoke() })
+        styledDialog(MiuixDialog.Builder(this).setItems(actions.keys.toTypedArray()) { _, index -> actions.values.elementAt(index).invoke() })
     }
 
     private fun branchDraft(message: ChatMessage): BranchDraft {
@@ -4992,7 +5499,7 @@ internal class MainActivity : Activity() {
 
     private fun showConversationDiff() {
         val choices = arrayOf("最新一轮改动", "工作区未提交改动")
-        styledDialog(AlertDialog.Builder(this).setTitle("查看改动").setItems(choices) { _, which ->
+        styledDialog(MiuixDialog.Builder(this).setTitle("查看改动").setItems(choices) { _, which ->
             if (which == 0) showDiffFiles(choices[0], latestDiff)
             else if (!online || currentCwd.isBlank()) toast("连接电脑并选择工作区后可查看")
             else {
@@ -5015,7 +5522,7 @@ internal class MainActivity : Activity() {
         val files = diffFiles(patch)
         if (files.isEmpty() && untracked.isEmpty()) { toast("没有可显示的改动"); return }
         val labels = files.map { "${it.name}  +${it.added}  −${it.removed}" } + untracked.map { "$it  未跟踪" }
-        styledDialog(AlertDialog.Builder(this).setTitle(title)
+        styledDialog(MiuixDialog.Builder(this).setTitle(title)
             .setItems(labels.toTypedArray()) { _, index ->
                 if (index >= files.size) {
                     val path = untracked[index - files.size]
@@ -5029,7 +5536,7 @@ internal class MainActivity : Activity() {
                     setTextIsSelectable(true)
                     setPadding(Ui.dp(context, 16), Ui.dp(context, 10), Ui.dp(context, 16), Ui.dp(context, 10))
                 }
-                styledDialog(AlertDialog.Builder(this).setTitle(file.name)
+                styledDialog(MiuixDialog.Builder(this).setTitle(file.name)
                     .setView(ScrollView(this).apply { addView(content) })
                     .setNeutralButton("复制差异") { _, _ -> copyMessage(file.patch) }.setPositiveButton("关闭", null))
             }.setNegativeButton("关闭", null))
@@ -5039,12 +5546,10 @@ internal class MainActivity : Activity() {
         val current = device ?: return
         val actions = linkedMapOf<String, () -> Unit>()
         actions["重新连接"] = { disconnect(); connect() }
-        actions["重新配对"] = { showPair() }
-        if (online && info.optBoolean("remoteUpdate")) actions["更新电脑 Agent"] = ::confirmAgentUpdate
         val onlineAt = conversationPrefs.getLong("seen:${current.agentId}", 0)
         val lastSeen = if (onlineAt > 0) "\n上次在线：${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(onlineAt))}" else ""
         val status = connectionNotice.text.toString().ifBlank { "电脑已连接" }
-        styledDialog(AlertDialog.Builder(this).setTitle("${current.serverName}\n$status$lastSeen")
+        styledDialog(MiuixDialog.Builder(this).setTitle("${current.serverName}\n$status$lastSeen")
             .setItems(actions.keys.toTypedArray()) { _, which -> actions.values.elementAt(which).invoke() })
     }
 
@@ -5063,13 +5568,14 @@ internal class MainActivity : Activity() {
         workspaceFiles.openOrDownload(RemoteFile(currentCwd, currentThreadId, file.path), file.name)
     }
 
-    private fun openWorkspaceFiles(path: String, threadId: String): Boolean {
-        if (path.isEmpty()) return false
+    private fun openWorkspaceFiles(path: String, threadId: String, startAtComputer: Boolean = false): Boolean {
+        val computerFiles = info.optBoolean("computerFiles")
+        if (path.isEmpty() && !computerFiles) return false
         if (!directFilesAvailable()) {
             toast(if (client?.usingDirect == true) "当前 Agent 不支持直连文件管理" else "P2P 直连后才能管理文件")
             return true
         }
-        workspaceFiles.open(RemoteFile(path, threadId, ""))
+        workspaceFiles.open(RemoteFile(path, threadId, ""), computerFiles, startAtComputer)
         return true
     }
     private fun requestKey(id: Any?): String = "${id?.javaClass?.simpleName}:${id.toString()}"
@@ -5081,17 +5587,13 @@ internal class MainActivity : Activity() {
     private fun matchWidth(top: Int = 0, bottom: Int = 0): LinearLayout.LayoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = Ui.dp(this@MainActivity, top); bottomMargin = Ui.dp(this@MainActivity, bottom) }
     private fun String?.ifNullOrEmpty(fallback: String): String = if (isNullOrEmpty()) fallback else this
     private fun toast(message: String?) { if (!message.isNullOrEmpty()) Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
-    private fun styledDialog(builder: AlertDialog.Builder): AlertDialog = styledDialog(builder.create())
-    private fun styledDialog(dialog: AlertDialog): AlertDialog = dialog.apply {
-        show()
-        setOnShowListener { window?.setBackgroundDrawable(Ui.rounded(Ui.BACKGROUND, Ui.dp(context, 20).toFloat(), Ui.BORDER)) }
-    }
+    private fun styledDialog(builder: MiuixDialog.Builder): MiuixDialog = builder.show()
 
 
     private fun currentBackTarget(): BackTarget? = when {
         mainVisible && sidebarOpen && devicesExpanded -> BackTarget.DEVICES
         mainVisible && sidebarOpen -> BackTarget.SIDEBAR
-        !mainVisible && devices.isNotEmpty() -> BackTarget.PAIR
+        !mainVisible && devices.any { it.agentId !in expiredAgentIds } -> BackTarget.PAIR
         else -> null
     }
 

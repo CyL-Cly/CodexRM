@@ -16,19 +16,25 @@ type discoveryQuery struct {
 	verifier bool
 	mapped   netip.AddrPort
 	proof    string
+	sent     time.Time
+	rtt      time.Duration
 }
 
 // All requests share one reader and the socket that will do the punching.
 // Put verifiers first so the first candidate can carry a legacy receipt.
 func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal) []discoveryQuery {
 	var queries []discoveryQuery
-	if req := verifyRequest(start.Ticket); req != nil {
+	if start.Ticket != "" {
 		endpoints := append([]string{start.VerifyUDP}, start.VerifyMore...)
 		seen := make(map[netip.AddrPort]bool)
 		for _, endpoint := range endpoints {
 			dst, err := netip.ParseAddrPort(endpoint)
-			if err != nil || !dst.Addr().Is4() || dst.Port() == 0 || seen[dst] {
+			if err != nil || dst.Addr().Zone() != "" || (dst.Addr().Is6() && !start.IPv6) || !supportsFamily(socket, dst.Addr().Is6()) || dst.Port() == 0 || seen[dst] {
 				continue
+			}
+			req := verifyRequestFor(start.Ticket, dst.Addr().Is6())
+			if req == nil {
+				break
 			}
 			queries = append(queries, discoveryQuery{dst: dst, request: req, verifier: true})
 			seen[dst] = true
@@ -37,11 +43,11 @@ func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal
 			}
 		}
 	}
-	ipv6 := start.IPv6 && socket.LocalAddr().(*net.UDPAddr).AddrPort().Addr().Is6()
+
 	seen := make(map[netip.AddrPort]bool)
 	for _, server := range start.STUN {
 		dst, err := netip.ParseAddrPort(server)
-		if err != nil || (!dst.Addr().Is4() && !ipv6) || dst.Addr().Zone() != "" || dst.Port() == 0 || seen[dst] {
+		if err != nil || (!dst.Addr().Is4() && !start.IPv6) || !supportsFamily(socket, dst.Addr().Is6()) || dst.Addr().Zone() != "" || dst.Port() == 0 || seen[dst] {
 			continue
 		}
 		if req := bindingRequest(); req != nil {
@@ -74,8 +80,12 @@ func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal
 		if ctx.Err() != nil {
 			break
 		}
-		for _, q := range queries {
+		for i := range queries {
+			q := &queries[i]
 			if !q.mapped.IsValid() {
+				if q.sent.IsZero() {
+					q.sent = time.Now()
+				}
 				_, _ = socket.WriteToUDPAddrPort(q.request, q.dst)
 			}
 		}
@@ -99,6 +109,7 @@ func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal
 					}
 				}
 				if q.mapped.IsValid() {
+					q.rtt = time.Since(q.sent)
 					pending--
 					break
 				}
@@ -109,6 +120,30 @@ func discover(ctx context.Context, socket *net.UDPConn, start protocol.P2PSignal
 		}
 	}
 	return queries
+}
+
+// Advertise a hint only when all usable sockets agree. Different source ports
+// are distinct mappings and must never be pooled into a single prediction.
+func classifyPathMappings(paths [][]discoveryQuery) (string, int) {
+	var hint string
+	var step int
+	found := false
+	for _, path := range paths {
+		ipv4 := false
+		for _, q := range path {
+			ipv4 = ipv4 || (q.mapped.Addr().Is4() && !q.verifier)
+		}
+		if !ipv4 {
+			continue
+		}
+		h, d := classifyMapping(path)
+		if found && (h != hint || d != step) {
+			return "", 0
+		}
+		hint, step, found = h, d, true
+	}
+
+	return hint, step
 }
 
 func mappingHint(queries []discoveryQuery) string {

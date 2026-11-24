@@ -22,6 +22,7 @@ type ProviderDetails struct {
 	Notes        string `json:"notes"`
 	BaseURL      string `json:"baseUrl"`
 	Official     bool   `json:"official"`
+	GPTOfficial  bool   `json:"gptOfficial"`
 	Local        bool   `json:"local"`
 	DefaultModel string `json:"defaultModel"`
 }
@@ -32,6 +33,7 @@ type ProviderPatch struct {
 	Notes        *string `json:"notes"`
 	BaseURL      *string `json:"baseUrl"`
 	APIKey       string  `json:"apiKey"`
+	GPTOfficial  *bool   `json:"gptOfficial"`
 	DefaultModel *string `json:"defaultModel"`
 }
 
@@ -93,7 +95,7 @@ func detailsForRow(row providerRow, local bool) (ProviderDetails, error) {
 	if !validProviderURL(base) {
 		base = ""
 	}
-	return ProviderDetails{Name: row.name, Notes: row.notes, BaseURL: base, Official: p.Official(), Local: local, DefaultModel: p.DefaultModel}, nil
+	return ProviderDetails{Name: row.name, Notes: row.notes, BaseURL: base, Official: p.Official(), Local: local, DefaultModel: p.DefaultModel, GPTOfficial: p.Official() || GPTOfficial(p.config)}, nil
 }
 
 func validProviderURL(base string) bool {
@@ -176,7 +178,7 @@ func SaveProvider(ctx context.Context, path string, patch ProviderPatch) (string
 	if patch.Notes != nil {
 		updated.notes = *patch.Notes
 	}
-	if patch.BaseURL != nil || patch.APIKey != "" || patch.DefaultModel != nil {
+	if patch.changesConfig() {
 		updated.settings, err = patchProviderConfig(row.settings, patch)
 		if err != nil {
 			return "", err
@@ -203,6 +205,10 @@ func newProviderID() (string, error) {
 	return hex.EncodeToString(random[:]), nil
 }
 
+func (p ProviderPatch) changesConfig() bool {
+	return p.BaseURL != nil || p.APIKey != "" || p.DefaultModel != nil || p.GPTOfficial != nil
+}
+
 func patchProviderConfig(raw string, patch ProviderPatch) (string, error) {
 	invalid := errors.New("配置无法读取，请在电脑端 CC Switch 中检查")
 	var settings map[string]json.RawMessage
@@ -219,9 +225,12 @@ func patchProviderConfig(raw string, patch ProviderPatch) (string, error) {
 		}
 	}
 	var connection map[string]any
-	if patch.BaseURL != nil || patch.APIKey != "" {
+	if patch.BaseURL != nil || patch.APIKey != "" || patch.GPTOfficial != nil {
 		id, _ := config["model_provider"].(string)
 		if id == "" || id == "openai" {
+			if patch.GPTOfficial != nil {
+				return "", errors.New("Codex 内置官方供应商无需修改此开关")
+			}
 			return "", errors.New("官方供应商的登录凭据请在 Codex 中管理")
 		}
 		tables, _ := config["model_providers"].(map[string]any)
@@ -229,6 +238,18 @@ func patchProviderConfig(raw string, patch ProviderPatch) (string, error) {
 		if connection == nil {
 			return "", invalid
 		}
+	}
+	if patch.GPTOfficial != nil {
+		capabilities, ok := connection["capabilities"].(map[string]any)
+		if !ok {
+			if _, exists := connection["capabilities"]; exists {
+				return "", invalid
+			}
+			capabilities = make(map[string]any)
+			connection["capabilities"] = capabilities
+		}
+		connection["supports_websockets"] = *patch.GPTOfficial
+		capabilities["remote_compaction"] = RemoteCompactionValue(*patch.GPTOfficial)
 	}
 	if patch.BaseURL != nil {
 		connection["base_url"] = *patch.BaseURL

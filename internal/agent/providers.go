@@ -98,8 +98,14 @@ func (a *Agent) modelCatalogWithSettings(ctx context.Context, app *appserver.Cli
 			}
 		}
 	}
-	return map[string]any{"providers": groups, "warnings": warnings}, nil
+	result := map[string]any{"providers": groups, "warnings": warnings}
+	if management {
+		result["gptProviderSettings"] = true
+	}
+	return result, nil
 }
+
+var errProviderUnavailable = errors.New("请切换到可用的供应商后继续对话")
 
 // Recover the provider credentials and restore any model saved by CodexRM.
 func (a *Agent) prepareProvider(ctx context.Context, app *appserver.Client, method string, params map[string]any) error {
@@ -179,5 +185,5 @@ func (a *Agent) prepareProvider(ctx context.Context, app *appserver.Client, meth
 		}
 		return nil
 	}
-	return fmt.Errorf("找不到此会话的供应商，请恢复该配置后重试")
+	return errProviderUnavailable
 }

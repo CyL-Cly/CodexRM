@@ -54,11 +54,11 @@ internal data class ArtifactCard(val path: String, val name: String, val type: S
             return files.values.toList()
         }
 
-        private fun linkPath(destination: String): String? {
+        internal fun linkPath(destination: String): String? {
             val raw = destination.replace(lineAnchor, "")
             val decoded = runCatching {
                 if (raw.startsWith("file:", ignoreCase = true)) {
-                    val uri = URI(raw)
+                    val uri = URI(raw.replace(" ", "%20"))
                     if (uri.rawAuthority != null || uri.rawQuery != null || uri.rawFragment != null) return null
                     uri.path ?: return null
                 } else {

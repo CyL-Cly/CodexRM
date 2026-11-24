@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"time"
 
@@ -54,6 +55,14 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 	if method == switchProviderMethod {
 		return a.switchThreadProvider(ctx, app, id, q, params)
 	}
+	if q != nil && (method == "turn/start" || method == "turn/steer") {
+		a.queueMu.Lock()
+		unavailable := q.ProviderUnavailable
+		a.queueMu.Unlock()
+		if unavailable {
+			return nil, errProviderUnavailable
+		}
+	}
 	// Keep caller-supplied runtime settings, before provider preparation adds
 	// credentials. Every automatic resume reloads current provider credentials.
 	settings := resumeSettings(params)
@@ -68,12 +77,28 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 			params["model"] = route.Model
 		}
 		if err := a.resumeDetachedThread(ctx, app, id, q); err != nil {
-			return nil, err
+			return nil, requestNotSent(err)
 		}
 	}
+	_, explicitProvider := params["codexrmProvider"]
 	prepareUserInput(method, params)
 	if err := a.prepareProvider(ctx, app, method, params); err != nil {
-		return nil, err
+		if method == "thread/resume" && q != nil && !explicitProvider && errors.Is(err, errProviderUnavailable) {
+			// Opening history is safe, but must not load the thread with the
+			// current/default provider or enable sending through stale credentials.
+			a.queueMu.Lock()
+			q.ProviderUnavailable = true
+			if q.ResumeParams == nil {
+				q.ResumeParams = settings
+			} else {
+				for key, value := range settings {
+					q.ResumeParams[key] = value
+				}
+			}
+			a.queueMu.Unlock()
+			return a.openWithoutProvider(ctx, app, id, params["excludeTurns"] == true)
+		}
+		return nil, requestNotSent(err)
 	}
 	if method == "turn/start" && id != "" {
 		a.mu.Lock()
@@ -121,6 +146,7 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 				a.queueMu.Lock()
 				loaded := a.queueLocked(id)
 				loaded.Loaded, loaded.Detached = true, false
+				loaded.ProviderUnavailable = false
 				loaded.Ephemeral = out.Thread.Ephemeral
 				if loaded.ResumeParams == nil {
 					loaded.ResumeParams = map[string]any{}
@@ -159,6 +185,46 @@ func (a *Agent) callThread(ctx context.Context, app *appserver.Client, owner, me
 		return a.withProviderRoute(id, raw)
 	}
 	return raw, err
+}
+
+func (a *Agent) openWithoutProvider(ctx context.Context, app *appserver.Client, id string, excludeTurns bool) (json.RawMessage, error) {
+	params := map[string]any{"threadId": id, "includeTurns": false}
+	var raw json.RawMessage
+	var err error
+	if excludeTurns {
+		raw, err = app.Call(ctx, "thread/read", params)
+		if err == nil {
+			raw, err = a.withProviderRoute(id, raw)
+		}
+	} else {
+		raw, err = a.threadSnapshot(ctx, app, params)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]json.RawMessage
+	var thread map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(result["thread"], &thread); err != nil {
+		return nil, err
+	}
+	if thread == nil {
+		return nil, errors.New("thread/read returned no thread")
+	}
+	thread["codexrmProviderUnavailable"] = mustJSON(true)
+	result["thread"] = mustJSON(thread)
+	return mustJSON(result), nil
+}
+
+// Uncertainty about a prerequisite RPC does not imply we submitted the requested operation.
+func requestNotSent(err error) error {
+	var unknown *appserver.OutcomeUnknown
+	if errors.As(err, &unknown) {
+		return &appserver.RPCError{Code: -32000, Message: err.Error()}
+	}
+	return err
 }
 
 func resumeSettings(params map[string]any) map[string]any {
@@ -215,7 +281,9 @@ func (a *Agent) releaseIdleThread(ctx context.Context, app *appserver.Client, id
 	q.RPCMu.Lock()
 	defer q.RPCMu.Unlock()
 	a.queueMu.Lock()
-	busy := !q.Loaded || q.Detached || q.Ephemeral || q.ActiveTurn != "" || q.Starting || (!q.Paused && len(q.Entries) > 0)
+	// Codex keeps session approvals in the loaded thread. Its rollout does
+	// not restore them after unsubscribe/resume.
+	busy := !q.Loaded || q.Detached || q.Ephemeral || q.SessionApproval || q.ActiveTurn != "" || q.Starting || (!q.Paused && len(q.Entries) > 0)
 	a.queueMu.Unlock()
 	if busy || ctx.Err() != nil {
 		return
@@ -279,6 +347,7 @@ func (a *Agent) unloadThread(ctx context.Context, app *appserver.Client, id stri
 	}
 	a.queueMu.Lock()
 	q.Detached, q.Loaded, q.Known = true, false, false
+	q.SessionApproval = false
 	a.queueMu.Unlock()
 	a.mu.Lock()
 	delete(a.owners, id)

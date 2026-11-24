@@ -11,6 +11,15 @@ internal data class TurnProgress(val id: String, val status: String) {
 }
 
 internal object TurnRenderer {
+    fun errorId(turnId: String) = "error-$turnId"
+    fun retryErrorId(turnId: String) = "retry-error-$turnId"
+
+    fun errorMessage(turnId: String, error: JSONObject?, id: String = errorId(turnId)): ChatMessage = ChatMessage(
+        id,
+        MessageKind.ERROR,
+        "Codex 错误",
+        error?.string("message").orEmpty().ifEmpty { "Codex 发生错误" },
+    ).apply { this.turnId = turnId }
     fun messages(turn: JSONObject, readOnly: Boolean): List<ChatMessage> {
         val result = ArrayList<ChatMessage>()
         val items = turn.arrayAt("items")
@@ -34,7 +43,7 @@ internal object TurnRenderer {
             result += ChatMessage("omitted-$turnId", MessageKind.STATUS, "", "这一轮内容过大，请在 Codex 桌面端查看完整内容。")
         }
         turn.optJSONObject("error")?.let {
-            result += ChatMessage("error-$turnId", MessageKind.ERROR, "错误", it.string("message"))
+            result += errorMessage(turnId, it)
         }
         if (turn.string("status") == "interrupted") {
             val text = if (readOnly) "原客户端状态：等待同步或任务已停止" else "任务已停止"
@@ -67,8 +76,16 @@ internal object TranscriptState {
     ): TranscriptMerge {
         val latestIds = latest.mapTo(HashSet()) { it.id }
         val prefix = if (keepHistory) existing.filter { it.id in historyIds && it.id !in latestIds } else emptyList()
+        val previousById = existing.associateBy { it.id }
         val seen = HashSet<String>()
-        val tail = latest.filter { seen.add(it.id) }
+        val tail = latest.filter { seen.add(it.id) }.map { incoming ->
+            val previous = previousById[incoming.id]
+            // Keep the rendering cache and the bound row when the snapshot only reparses this message.
+            // The data class equality does not include the inputs used by message actions.
+            if (previous != null && previous == incoming && previous.turnId == incoming.turnId &&
+                previous.userInput?.toString() == incoming.userInput?.toString()
+            ) previous else incoming
+        }
         return TranscriptMerge(prefix + tail, prefix.mapTo(HashSet()) { it.id })
     }
 }

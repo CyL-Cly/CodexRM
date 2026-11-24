@@ -1,7 +1,5 @@
 package com.codexrm.mobile
 
-import android.app.AlertDialog
-import android.app.Dialog
 import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
@@ -27,19 +25,24 @@ import android.widget.Toast
 import java.io.File
 import java.io.IOException
 
-internal fun showImagePreview(context: Context, loader: MessageImageLoader, image: MessageImage, thumbnail: Bitmap) {
-    val dialog = Dialog(context, android.R.style.Theme_Material_NoActionBar)
+internal fun showImagePreview(context: Context, loader: MessageImageLoader, image: MessageImage, thumbnail: Bitmap? = null) {
+    val dialog = PredictiveBackDialog(context, android.R.style.Theme_Material_NoActionBar)
     val key = loader.originalKey(image)
     val picture = ZoomImageView(context).apply {
         contentDescription = image.name
-        setImageBitmap(thumbnail)
         setOnClickListener { dialog.dismiss() }
     }
+    val status = TextView(context).apply {
+        gravity = Gravity.CENTER
+        setPadding(Ui.dp(context, 24), Ui.dp(context, 12), Ui.dp(context, 24), Ui.dp(context, 12))
+        setTextColor(Color.WHITE)
+        visibility = View.GONE
+    }
     var saving = false
-    var actions: AlertDialog? = null
+    var actions: MiuixDialog? = null
     picture.setOnLongClickListener {
-        if (!saving && actions?.isShowing != true) {
-            actions = AlertDialog.Builder(context).setItems(arrayOf("保存图片")) { _, _ ->
+        if (picture.drawable != null && !saving && actions?.isShowing != true) {
+            actions = MiuixDialog.Builder(context).setItems(arrayOf("保存图片")) { _, _ ->
                 val save = {
                     saving = true
                     loader.saveOriginal(context.contentResolver, key, image.name) { result ->
@@ -56,6 +59,7 @@ internal fun showImagePreview(context: Context, loader: MessageImageLoader, imag
     val root = FrameLayout(context).apply {
         setBackgroundColor(Color.BLACK)
         addView(picture, FrameLayout.LayoutParams(-1, -1))
+        addView(status, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
         addView(TextView(context).apply {
             text = "×"
             textSize = 30f
@@ -69,11 +73,11 @@ internal fun showImagePreview(context: Context, loader: MessageImageLoader, imag
             marginEnd = Ui.dp(context, 12)
         })
     }
-    dialog.setContentView(root)
+    dialog.setBackContent(root)
     dialog.setOnDismissListener { actions?.dismiss() }
     dialog.show()
     dialog.window?.apply {
-        setBackgroundDrawable(ColorDrawable(Color.BLACK))
+        setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         setLayout(-1, -1)
         if (Build.VERSION.SDK_INT >= 30) {
             insetsController?.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -83,7 +87,25 @@ internal fun showImagePreview(context: Context, loader: MessageImageLoader, imag
             decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         }
     }
-    loader.loadPreview(key) { bitmap -> if (dialog.isShowing) picture.replaceBitmap(bitmap) }
+    fun display(bitmap: Bitmap) {
+        status.visibility = View.GONE
+        picture.replaceBitmap(bitmap)
+        loader.loadPreview(key) { original -> if (dialog.isShowing) picture.replaceBitmap(original) }
+    }
+    fun load() {
+        status.visibility = View.VISIBLE
+        status.text = "正在加载图片…"
+        status.setOnClickListener(null)
+        status.isClickable = false
+        loader.load(image) { result ->
+            if (!dialog.isShowing) return@load
+            result.fold(::display) { error ->
+                status.text = "${error.message ?: "图片加载失败"}\n点击重试"
+                status.setOnClickListener { load() }
+            }
+        }
+    }
+    if (thumbnail == null) load() else display(thumbnail)
 }
 
 private class ZoomImageView(context: Context) : ImageView(context) {

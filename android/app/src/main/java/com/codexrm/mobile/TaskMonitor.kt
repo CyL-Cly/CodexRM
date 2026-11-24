@@ -7,11 +7,18 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import org.json.JSONObject
 
 internal class TaskMonitor : Service() {
+    private class ActiveTurn(val id: String = "")
+
     private var client: CodexClient? = null
+    private val activeTurns = mutableMapOf<String, ActiveTurn>()
+    private val handler = Handler(Looper.getMainLooper())
+    private val verifyTasks = Runnable { verifyActiveTasks() }
     private val notified = LinkedHashSet<String>()
     private val notifications get() = getSystemService(NotificationManager::class.java)
 
@@ -20,8 +27,13 @@ internal class TaskMonitor : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val id = intent?.getStringExtra(DEVICE).orEmpty()
         val device = DeviceStore(this).load().firstOrNull { it.agentId == id && enabled(this, id) }
-        if (device == null) { stopSelf(); return START_NOT_STICKY }
-        if (client != null) return START_REDELIVER_INTENT
+        val threads = intent?.getStringArrayExtra(ACTIVE_THREADS).orEmpty().filter { it.isNotEmpty() }
+        if (device == null || threads.isEmpty()) {
+            stopMonitoring()
+            return START_NOT_STICKY
+        }
+        if (client != null) return START_NOT_STICKY
+        threads.forEach { activeTurns[it] = ActiveTurn() }
         runningMonitor = this
         notifications.createNotificationChannel(NotificationChannel(STATUS, "后台任务监听", NotificationManager.IMPORTANCE_LOW))
         notifications.createNotificationChannel(NotificationChannel(EVENTS, "任务提醒", NotificationManager.IMPORTANCE_DEFAULT))
@@ -34,14 +46,19 @@ internal class TaskMonitor : Service() {
             .setOngoing(true).build())
         client = CodexClient(this, device, object : CodexClient.Listener {
             override fun onState(state: ConnectionState, agent: JSONObject?) {
-                if (state == ConnectionState.ONLINE) client?.request("codexrm/info", JSONObject()) { _, _ -> }
+                handler.removeCallbacks(verifyTasks)
+                if (state == ConnectionState.ONLINE) {
+                    client?.request("codexrm/info", JSONObject()) { _, _ -> }
+                    verifyActiveTasks()
+                }
             }
             override fun onFailure(message: String) = Unit
-            override fun onAuthorizationExpired() { stopSelf() }
+            override fun onAuthorizationExpired() { stopMonitoring() }
             override fun onDirectFallback() = Unit
             override fun onRpcEvent(message: JSONObject) {
                 val params = message.objectAt("params")
-                val thread = params.string("threadId")
+                val turn = params.objectAt("turn")
+                val thread = params.string("threadId").ifEmpty { turn.string("threadId") }
                 if (thread.isEmpty()) return
                 val method = message.string("method")
                 val id = message.string("id")
@@ -50,27 +67,62 @@ internal class TaskMonitor : Service() {
                     if (resolved.isNotEmpty()) notifications.cancel("request:$resolved", 2)
                     return
                 }
-                val turn = params.objectAt("turn")
-                val event = when {
-                    id.isNotEmpty() && method == "item/tool/requestUserInput" -> "request:$id" to "Codex 需要回答"
-                    id.isNotEmpty() && (method.endsWith("/requestApproval") ||
-                        method == "execCommandApproval" || method == "applyPatchApproval") -> "request:$id" to "Codex 需要审批"
-                    method == "turn/completed" && turn.string("status") == "completed" ->
-                        "done:$thread:${turn.string("id")}" to "Codex 任务已完成"
-                    else -> return
+                notifyTaskEvent(device, method, thread, id, turn)
+                when (method) {
+                    "turn/started" -> activeTurns[thread] = ActiveTurn(turn.string("id"))
+                    "turn/completed" -> activeTurns[thread]?.let { active ->
+                        if (active.id.isEmpty() || active.id == turn.string("id")) finishTask(thread)
+                    }
+                    "thread/archived" -> finishTask(thread)
                 }
-                if (!notified.add(event.first)) return
-                if (notified.size > 256) notified.remove(notified.first())
-                notifications.notify(event.first, 2, Notification.Builder(this@TaskMonitor, EVENTS)
-                    .setSmallIcon(android.R.drawable.stat_notify_more)
-                    .setContentTitle(event.second)
-                    .setContentText(device.serverName)
-                    .setContentIntent(open(device, thread))
-                    .setVisibility(Notification.VISIBILITY_PRIVATE)
-                    .setAutoCancel(true).build())
             }
         }, relayOnly = true).also { it.start() }
-        return START_REDELIVER_INTENT
+        return START_NOT_STICKY
+    }
+
+    private fun notifyTaskEvent(device: Device, method: String, thread: String, id: String, turn: JSONObject) {
+        val event = when {
+            id.isNotEmpty() && method == "item/tool/requestUserInput" -> "request:$id" to "Codex 需要回答"
+            id.isNotEmpty() && (method.endsWith("/requestApproval") ||
+                method == "execCommandApproval" || method == "applyPatchApproval") -> "request:$id" to "Codex 需要审批"
+            method == "turn/completed" && turn.string("status") == "completed" ->
+                "done:$thread:${turn.string("id")}" to "Codex 任务已完成"
+            else -> return
+        }
+        if (!notified.add(event.first)) return
+        if (notified.size > 256) notified.remove(notified.first())
+        notifications.notify(event.first, 2, Notification.Builder(this, EVENTS)
+            .setSmallIcon(android.R.drawable.stat_notify_more)
+            .setContentTitle(event.second)
+            .setContentText(device.serverName)
+            .setContentIntent(open(device, thread))
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setAutoCancel(true).build())
+    }
+
+    private fun verifyActiveTasks() {
+        val connection = client ?: return
+        // A task may finish during the handoff to the service or while disconnected.
+        for ((thread, active) in activeTurns.toMap()) {
+            connection.request("thread/read", JSONObject().put("threadId", thread).put("includeTurns", false), 10_000L) { result, error ->
+                if (client !== connection || activeTurns[thread] !== active) return@request
+                val status = result?.objectAt("thread")?.objectAt("status")?.string("type")
+                if (status == "idle" || status == "notLoaded" || status == "systemError" || threadNeedsResume(error, thread)) {
+                    finishTask(thread)
+                }
+            }
+        }
+        if (client === connection) handler.postDelayed(verifyTasks, 15_000L)
+    }
+
+    private fun finishTask(thread: String) {
+        activeTurns.remove(thread)
+        if (activeTurns.isEmpty()) stopMonitoring()
+    }
+
+    private fun stopMonitoring() {
+        closeClient()
+        stopSelf()
     }
 
     private fun open(device: Device, thread: String): PendingIntent = PendingIntent.getActivity(
@@ -89,14 +141,19 @@ internal class TaskMonitor : Service() {
 
     private fun closeClient() {
         if (runningMonitor === this) runningMonitor = null
-        client?.stop()
+        handler.removeCallbacks(verifyTasks)
+        activeTurns.clear()
+        val connection = client
         client = null
+        connection?.stop()
+        stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     companion object {
         const val OPEN = "com.codexrm.mobile.OPEN_TASK"
         const val DEVICE = "device"
         const val THREAD = "thread"
+        const val ACTIVE_THREADS = "activeThreads"
         private const val STATUS = "task-monitor"
         private const val EVENTS = "task-events"
         private var runningMonitor: TaskMonitor? = null

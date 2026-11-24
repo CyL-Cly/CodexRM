@@ -25,6 +25,7 @@ internal class MessageAdapter(
     private val isDownloaded: (ArtifactCard) -> Boolean = { false },
     private val answerQuestions: (ChatMessage) -> Unit = {},
     private val answerState: (ChatMessage) -> String? = { null },
+    private val speak: ((ChatMessage) -> Unit)? = null,
 ) : BaseAdapter() {
     private val messages = ArrayList<ChatMessage>()
     private val displayRows = ArrayList<MessageDisplayRow>()
@@ -130,11 +131,22 @@ internal class MessageAdapter(
     }
 
     fun replace(values: List<ChatMessage>) {
+        values.forEach { it.dirty = true; it.rendered = null }
+        setMessages(values)
+    }
+
+    fun replaceSnapshot(values: List<ChatMessage>, list: ChatListView) {
+        if (messages.size == values.size && messages.indices.all { messages[it] === values[it] }) return
+        val readingPosition = list.readingPosition()
+        setMessages(values)
+        list.restoreReadingPosition(readingPosition)
+    }
+
+    private fun setMessages(values: List<ChatMessage>) {
         val retained = values.associateBy { it.id }
         streamRows.values.removeAll { retained[it.message.id] !== it.message }
         messages.clear()
         messages.addAll(values)
-        values.forEach { it.dirty = true; it.rendered = null }
         changed()
     }
     fun add(message: ChatMessage) { messages += message; changed() }
@@ -196,19 +208,29 @@ internal class MessageAdapter(
 
     private class Holder(
         val root: LinearLayout,
+        val content: LinearLayout,
         val header: LinearLayout,
         val iconFrame: FrameLayout,
         val title: TextView,
         val status: TextView,
         val body: TextView,
         val copy: TextView,
-        val answer: TextView,
+        val read: TextView,
+        val answer: MiuixButtonView,
         val images: LinearLayout,
+        val files: LinearLayout,
         val diagram: InlineMermaid,
         var answerStatus: String? = null,
         var boundMessage: ChatMessage? = null,
         var boundRow: MessageDisplayRow? = null,
     )
+
+    var bubbleOpacity: Int = 100
+        set(value) {
+            if (field == value) return
+            field = value
+            notifyDataSetChanged()
+        }
 
     override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
         val holder = convertView?.tag as? Holder ?: createHolder()
@@ -248,48 +270,56 @@ internal class MessageAdapter(
             holder.status.visibility = View.VISIBLE
         }
         holder.body.visibility = if (groupHeader || (collapsible && !open) || (prepared ?: message.body).isEmpty()) View.GONE else View.VISIBLE
+        val user = message.kind == MessageKind.USER
         holder.images.removeAllViews()
-        val fileCards = if (groupHeader) emptyList() else message.files.mapNotNull { file ->
-            val saved = isDownloaded(file)
-            if (showFileCards || saved) file to saved else null
-        }
-        holder.images.visibility = if (groupHeader || (message.images.isEmpty() && fileCards.isEmpty())) View.GONE else View.VISIBLE
+        holder.images.visibility = if (groupHeader || message.images.isEmpty()) View.GONE else View.VISIBLE
+        val mediaInset = Ui.dp(context, if (collapsible) 14 else 0)
+        holder.images.setPadding(mediaInset, 0, mediaInset, 0)
         if (holder.images.visibility == View.VISIBLE) for (source in message.images) {
             val image = source.copy(messageId = message.id)
-            val card = Ui.column(context).apply {
-                background = Ui.rounded(Ui.SURFACE_ALT, Ui.dp(context, 12).toFloat(), Ui.BORDER)
-                setPadding(Ui.dp(context, 6), Ui.dp(context, 6), Ui.dp(context, 6), Ui.dp(context, 6))
-            }
+            val alignment = if (user) Gravity.RIGHT else Gravity.LEFT
+            val media = Ui.column(context).apply { gravity = alignment }
             val preview = ImageView(context).apply {
                 scaleType = ImageView.ScaleType.FIT_CENTER
                 adjustViewBounds = true
+                maxWidth = Ui.dp(context, 320)
                 maxHeight = Ui.dp(context, 320)
                 contentDescription = image.name
                 visibility = View.GONE
             }
-            val caption = Ui.text(context, "${image.name} · 正在加载…", 12f, Ui.MUTED).apply { setPadding(4, 6, 4, 6) }
-            card.addView(preview, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-            card.addView(caption)
-            holder.images.addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = Ui.dp(context, 6) })
-            val token = Any()
-            card.tag = token
+            val status = Ui.text(context, size = 12f, color = Ui.MUTED).apply {
+                setPadding(0, Ui.dp(context, 6), 0, Ui.dp(context, 6))
+            }
+            media.addView(preview, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            media.addView(status, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            holder.images.addView(media, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = alignment
+                topMargin = Ui.dp(context, 6)
+            })
             fun load() {
-                caption.text = "${image.name} · 正在加载…"
+                status.text = "${image.name} · 正在加载…"
+                media.setOnClickListener(null)
                 images.load(image) { result ->
-                    if (holder.boundMessage !== message || card.parent !== holder.images || card.tag !== token) return@load
+                    if (holder.boundMessage !== message || media.parent !== holder.images) return@load
                     result.fold(onSuccess = { bitmap ->
                         preview.setImageBitmap(bitmap)
                         preview.visibility = View.VISIBLE
-                        caption.text = "${image.name} · 点击查看"
-                        card.setOnClickListener { showImagePreview(context, images, image, bitmap) }
+                        status.visibility = View.GONE
+                        preview.setOnClickListener { showImagePreview(context, images, image, bitmap) }
                     }, onFailure = { error ->
-                        caption.text = "${image.name} · ${error.message.orEmpty()} · 点击重试"
-                        card.setOnClickListener { load() }
+                        status.text = "${image.name} · ${error.message.orEmpty()} · 点击重试"
+                        media.setOnClickListener { load() }
                     })
                 }
             }
             load()
         }
+        holder.files.removeAllViews()
+        val fileCards = if (groupHeader) emptyList() else message.files.mapNotNull { file ->
+            val saved = isDownloaded(file)
+            if (showFileCards || saved) file to saved else null
+        }
+        holder.files.visibility = if (fileCards.isEmpty()) View.GONE else View.VISIBLE
         for ((file, saved) in fileCards) {
             val card = Ui.column(context, false).apply {
                 if (file.linked && !saved) visibility = View.GONE
@@ -309,19 +339,22 @@ internal class MessageAdapter(
             labels.addView(name); labels.addView(detail)
             card.addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             card.addView(IconView(context, if (saved) "arrow" else "update", Ui.MUTED), LinearLayout.LayoutParams(Ui.dp(context, 20), Ui.dp(context, 20)))
-            holder.images.addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            holder.files.addView(card, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 setMargins(Ui.dp(context, 8), Ui.dp(context, 2), Ui.dp(context, 8), Ui.dp(context, 7))
             })
             if (!saved) fileSize(file) { size ->
-                if (size != null && card.parent === holder.images) {
+                if (size != null && card.parent === holder.files) {
                     detail.text = "${file.type} · ${AttachmentStore.sizeLabel(size)} · ${file.change}"
                     card.visibility = View.VISIBLE
                 }
             }
         }
         holder.body.setTextColor(if (message.kind == MessageKind.ERROR) Ui.DANGER else if (message.kind == MessageKind.TOOL) Ui.MUTED else Ui.TEXT)
-        holder.root.gravity = if (message.kind == MessageKind.USER) Gravity.END else Gravity.START
-        holder.root.background = if (collapsible && fileCards.isEmpty()) Ui.rounded(Ui.SURFACE, Ui.dp(context, 10).toFloat(), Ui.BORDER) else null
+        holder.root.gravity = if (user) Gravity.END else Gravity.START
+        holder.content.gravity = holder.root.gravity
+        holder.content.background = if (collapsible && fileCards.isEmpty()) Ui.rounded(
+            appearanceOpacity(Ui.SURFACE, bubbleOpacity), Ui.dp(context, 10).toFloat(), appearanceOpacity(Ui.BORDER, bubbleOpacity),
+        ) else null
         holder.root.setPadding(
             Ui.dp(context, if (collapsible) 0 else 14),
             Ui.dp(context, if (collapsible) 0 else 10),
@@ -330,18 +363,29 @@ internal class MessageAdapter(
         )
         val padding = Ui.dp(context, if (message.kind == MessageKind.USER) 14 else if (collapsible) 14 else 2)
         holder.body.setPadding(padding, Ui.dp(context, if (message.kind == MessageKind.ASSISTANT) 2 else 10), padding, padding)
-        holder.body.background = when (message.kind) {
-            MessageKind.USER -> Ui.rounded(Ui.SURFACE_ALT, Ui.dp(context, 19).toFloat())
-            MessageKind.ERROR -> Ui.rounded(0x08ed9c96, Ui.dp(context, 9).toFloat(), 0x30ed9c96)
-            else -> null
-        }
         holder.body.textSize = if (collapsible) 12f else 14f
         holder.body.setLineSpacing(0f, if (collapsible) 1.35f else 1.55f)
         holder.body.typeface = if (collapsible) android.graphics.Typeface.MONOSPACE else android.graphics.Typeface.create("sans", android.graphics.Typeface.NORMAL)
-        if (!groupHeader && (!collapsible || open)) markdown.bind(holder.body, message, prepared, preserveMathScroll = sameMessage)
-        else markdown.clear(holder.body)
-        (holder.body.layoutParams as LinearLayout.LayoutParams).gravity = if (message.kind == MessageKind.USER) Gravity.END else Gravity.START
+        val hasUserMarkdownImage = if (!groupHeader && (!collapsible || open)) {
+            markdown.bind(holder.body, message, prepared, preserveMathScroll = sameMessage)
+        } else {
+            markdown.clear(holder.body)
+            false
+        }
+        if (hasUserMarkdownImage) holder.body.setPadding(0, holder.body.paddingTop, 0, holder.body.paddingBottom)
+        holder.body.background = when (message.kind) {
+            MessageKind.USER -> if (hasUserMarkdownImage) null else Ui.rounded(
+                appearanceOpacity(Ui.SURFACE_ALT, bubbleOpacity), Ui.dp(context, 19).toFloat(),
+            )
+            MessageKind.ERROR -> Ui.rounded(
+                appearanceOpacity(0x08ed9c96, bubbleOpacity), Ui.dp(context, 9).toFloat(), appearanceOpacity(0x30ed9c96, bubbleOpacity),
+            )
+            else -> null
+        }
+        (holder.body.layoutParams as LinearLayout.LayoutParams).gravity = holder.root.gravity
         holder.copy.visibility = if (message.kind == MessageKind.ASSISTANT && message.body.isNotEmpty()) View.VISIBLE else View.GONE
+        holder.read.visibility = if (speak != null && holder.copy.visibility == View.VISIBLE) View.VISIBLE else View.GONE
+        holder.read.setOnClickListener { speak?.invoke(message) }
         holder.copy.setOnClickListener {
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
             clipboard.setPrimaryClip(android.content.ClipData.newPlainText("CodexRM", message.body))
@@ -370,6 +414,7 @@ internal class MessageAdapter(
 
     private fun createHolder(): Holder {
         val root = Ui.column(context)
+        val content = Ui.column(context)
         val header = Ui.column(context, false).apply {
             gravity = Gravity.CENTER_VERTICAL
             minimumHeight = Ui.dp(context, 48)
@@ -390,16 +435,20 @@ internal class MessageAdapter(
             setTextIsSelectable(true); movementMethod = MessageMovement.instance; highlightColor = 0x4465d6ad
             setLinkTextColor(Ui.GREEN); breakStrategy = android.graphics.text.LineBreaker.BREAK_STRATEGY_SIMPLE
         }
-        val copy = Ui.text(context, "复制回复", 12f, Ui.DIM).apply {
+        fun replyAction(label: String, description: String) = Ui.text(context, label, 12f, Ui.DIM).apply {
             minimumWidth = Ui.dp(context, 48)
             minimumHeight = Ui.dp(context, 48)
             gravity = Gravity.CENTER
-            contentDescription = "复制回复到剪贴板"
+            contentDescription = description
             isFocusable = true
             background = Ui.ripple(Color.TRANSPARENT, Ui.dp(context, 8).toFloat())
             setPadding(Ui.dp(context, 12), 0, Ui.dp(context, 12), 0)
         }
+        val copy = replyAction("复制回复", "复制回复到剪贴板")
+        val read = replyAction("朗读", "朗读或停止朗读回复")
+        val actions = Ui.column(context, false).apply { addView(copy); addView(read) }
         val images = Ui.column(context)
+        val files = Ui.column(context)
         val diagramPanel = Ui.column(context).apply { visibility = View.GONE }
         val diagram = InlineMermaid(diagramPanel)
         body.tag = diagram
@@ -408,12 +457,14 @@ internal class MessageAdapter(
             override fun onViewDetachedFromWindow(view: View) = diagram.clear()
         })
         val answer = Ui.button(context, "回答问题", primary = true) {}
-        root.addView(header)
-        root.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(diagramPanel, LinearLayout.LayoutParams(-1, -2))
-        root.addView(images, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        content.addView(header)
+        content.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        content.addView(diagramPanel, LinearLayout.LayoutParams(-1, -2))
+        root.addView(content, LinearLayout.LayoutParams(-1, -2))
+        root.addView(images, LinearLayout.LayoutParams(-1, -2))
+        root.addView(files, LinearLayout.LayoutParams(-1, -2))
         root.addView(answer)
-        root.addView(copy)
-        return Holder(root, header, iconFrame, title, status, body, copy, answer, images, diagram).also { root.tag = it }
+        root.addView(actions)
+        return Holder(root, content, header, iconFrame, title, status, body, copy, read, answer, images, files, diagram).also { root.tag = it }
     }
 }

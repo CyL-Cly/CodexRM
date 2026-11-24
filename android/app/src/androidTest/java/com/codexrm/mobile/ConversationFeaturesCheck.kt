@@ -165,8 +165,7 @@ internal object ConversationFeaturesCheck {
                     clickable.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
                 }
             }
-            clickShareOption("加入对话")
-            clickShareOption("新对话")
+            clickShareOption("加入新会话草稿")
             await("external share filled draft") {
                 (field("composer").get(activity) as EditText).text.toString().contains("shared-fixture")
             }

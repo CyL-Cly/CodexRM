@@ -115,16 +115,26 @@ func (a *Agent) switchThreadProvider(ctx context.Context, app *appserver.Client,
 		return nil, errors.New("所选接入点不是可用的第三方供应商")
 	}
 	resume["threadId"], resume["excludeTurns"] = id, true
-	if err := a.prepareProvider(ctx, app, "thread/resume", resume); err != nil {
-		return nil, err
+	prepareErr := a.prepareProvider(ctx, app, "thread/resume", resume)
+	missingProvider := errors.Is(prepareErr, errProviderUnavailable)
+	var raw json.RawMessage
+	if missingProvider {
+		// Validate the existing thread without reattaching the unavailable
+		// provider. Not-loaded threads still have a durable provider identity.
+		raw, err = app.Call(ctx, "thread/read", map[string]any{"threadId": id, "includeTurns": false})
+	} else if prepareErr != nil {
+		return nil, prepareErr
+	} else {
+		raw, err = app.Call(ctx, "thread/resume", resume)
+		if err == nil {
+			a.queueMu.Lock()
+			q.Loaded, q.Detached = true, false
+			a.queueMu.Unlock()
+		}
 	}
-	raw, err := app.Call(ctx, "thread/resume", resume)
 	if err != nil {
 		return nil, err
 	}
-	a.queueMu.Lock()
-	q.Loaded, q.Detached = true, false
-	a.queueMu.Unlock()
 	var current struct {
 		Thread struct {
 			ID            string
@@ -136,17 +146,20 @@ func (a *Agent) switchThreadProvider(ctx context.Context, app *appserver.Client,
 	if err := json.Unmarshal(raw, &current); err != nil {
 		return nil, err
 	}
-	if current.Thread.ID != id || current.Thread.Ephemeral || current.Thread.Status.Type != "idle" {
+	status := current.Thread.Status.Type
+	if current.Thread.ID != id || current.Thread.Ephemeral || (status != "idle" && !(missingProvider && status == "notLoaded")) {
 		return nil, errors.New("当前会话暂时无法切换接入点")
 	}
 	_, nativeRuntimeID := providers.CurrentProvider(items, a.cfg.CCSwitchDB)
-	if current.Thread.ModelProvider == "" || (resume["modelProvider"] == nil && current.Thread.ModelProvider != nativeRuntimeID) {
+	if current.Thread.ModelProvider == "" || (!missingProvider && resume["modelProvider"] == nil && current.Thread.ModelProvider != nativeRuntimeID) {
 		return nil, errors.New("仅支持在第三方供应商会话中切换接入点")
 	}
 	unloadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	if err := a.unloadThread(unloadCtx, app, id, q); err != nil {
-		return nil, err
+	if status != "notLoaded" {
+		if err := a.unloadThread(unloadCtx, app, id, q); err != nil {
+			return nil, err
+		}
 	}
 	// Persist both settings: Codex can restore the original model when it
 	// reopens a thread whose provider identifier has not changed.
@@ -154,6 +167,9 @@ func (a *Agent) switchThreadProvider(ctx context.Context, app *appserver.Client,
 	if err := a.saveProviderRoute(id, route); err != nil {
 		return nil, fmt.Errorf("无法保存会话接入点: %w", err)
 	}
+	a.queueMu.Lock()
+	q.Loaded, q.Detached, q.Known, q.ProviderUnavailable = false, true, false, false
+	a.queueMu.Unlock()
 	result := map[string]string{"threadId": id, "providerId": target.ID, "model": model}
 	a.publishEvent(protocol.Envelope{Type: protocol.TypeServerMessage, Message: mustJSON(map[string]any{
 		"method": "codexrm/thread/providerChanged", "params": result,

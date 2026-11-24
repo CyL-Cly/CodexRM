@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/codexrm/codexrm/internal/protocol"
 )
 
 func attachmentCall(t *testing.T, a *Agent, owner, action string, params map[string]any) any {
@@ -15,7 +17,7 @@ func attachmentCall(t *testing.T, a *Agent, owner, action string, params map[str
 	// Match decoded JSON RPC numbers.
 	var decoded map[string]any
 	_ = json.Unmarshal(mustJSON(params), &decoded)
-	result, err := a.attachmentRPC(owner, "codexrm/attachment/"+action, decoded)
+	result, err := a.attachmentRPC(owner, "codexrm/attachment/"+action, decoded, nil)
 	if err != nil {
 		t.Fatalf("%s: %v", action, err)
 	}
@@ -65,7 +67,7 @@ func TestAttachmentValidationOwnershipAndAbort(t *testing.T) {
 	for _, size := range []any{-1, 1.5, attachmentMaxSize + 1, "20"} {
 		var params map[string]any
 		_ = json.Unmarshal(mustJSON(map[string]any{"size": size}), &params)
-		if _, err := a.attachmentRPC("owner", "codexrm/attachment/begin", params); err == nil {
+		if _, err := a.attachmentRPC("owner", "codexrm/attachment/begin", params, nil); err == nil {
 			t.Fatalf("accepted invalid size %v", size)
 		}
 	}
@@ -84,7 +86,7 @@ func TestAttachmentValidationOwnershipAndAbort(t *testing.T) {
 		{"owner", "read", map[string]any{"id": id, "offset": float64(0)}},
 		{"owner", "read", map[string]any{"id": "../agent.json", "offset": float64(0)}},
 	} {
-		if _, err := a.attachmentRPC(test.owner, "codexrm/attachment/"+test.method, test.params); err == nil {
+		if _, err := a.attachmentRPC(test.owner, "codexrm/attachment/"+test.method, test.params, nil); err == nil {
 			t.Fatalf("accepted invalid %s from %s", test.method, test.owner)
 		}
 	}
@@ -92,6 +94,49 @@ func TestAttachmentValidationOwnershipAndAbort(t *testing.T) {
 	attachmentCall(t, a, "owner", "abort", map[string]any{"id": id})
 	if _, err := os.Stat(path); !os.IsNotExist(err) || len(a.uploads) != 0 {
 		t.Fatal("abort did not remove the partial upload")
+	}
+}
+
+func TestRelayChatImagesRejectNonImagesAndDirectUploads(t *testing.T) {
+	a := &Agent{cfg: Config{DataDir: t.TempDir()}}
+	call := func(owner, action string, params map[string]any) (any, error) {
+		return a.attachmentRPC(owner, protocol.ChatImagePrefix+action, params, nil)
+	}
+	for _, params := range []map[string]any{
+		{"size": float64(3), "destination": protocol.DesktopShareDestination},
+		{"size": float64(3), "uploadStream": true},
+		{"size": float64(0)},
+		{"size": float64(attachmentMaxSize + 1)},
+	} {
+		if _, err := call("owner", "begin", params); err == nil {
+			t.Fatalf("accepted invalid chat image upload: %v", params)
+		}
+	}
+	begun, err := call("owner", "begin", map[string]any{"size": float64(3), "name": "fake.png", "mimeType": "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := begun.(map[string]any)["id"].(string)
+	path := a.uploads[id].File.Path
+	chunk := map[string]any{"id": id, "offset": float64(0), "data": "YWJj"}
+	if _, err := call("other", "chunk", chunk); err == nil {
+		t.Fatal("accepted a chunk from a different owner")
+	}
+	if _, err := call("owner", "chunk", chunk); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.attachmentRPC("owner", "codexrm/attachment/finish", map[string]any{"id": id}, nil); err == nil {
+		t.Fatal("accepted finalizing an image-only upload through the ordinary attachment RPC")
+	}
+	if _, err := call("owner", "finish", map[string]any{"id": id}); err == nil {
+		t.Fatal("accepted a non-image with a .png suffix and a claimed image MIME type")
+	}
+	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) || a.uploads[id] != nil {
+		t.Fatalf("rejected upload was not removed: %v", err)
+	}
+	text := uploadTestAttachment(t, a, "notes.txt", []byte("plain text"))
+	if _, err := call("owner", "read", map[string]any{"id": text.ID, "offset": float64(0)}); err == nil {
+		t.Fatal("read an ordinary attachment through the chat image RPC")
 	}
 }
 
@@ -111,7 +156,7 @@ func TestAttachmentDetectsImageAndPreservesEmptyFiles(t *testing.T) {
 	if result["offset"] != int64(0) || result["data"] != "" {
 		t.Fatal("empty file did not round trip")
 	}
-	if _, err := a.attachmentRPC("owner", "codexrm/attachment/read", map[string]any{"id": text.ID, "offset": float64(text.Size + 1)}); err == nil {
+	if _, err := a.attachmentRPC("owner", "codexrm/attachment/read", map[string]any{"id": text.ID, "offset": float64(text.Size + 1)}, nil); err == nil {
 		t.Fatal("accepted offset past the file")
 	}
 }

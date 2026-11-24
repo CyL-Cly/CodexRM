@@ -3,6 +3,8 @@
 package main
 
 /*
+#cgo LDFLAGS: -landroid
+#include <android/multinetwork.h>
 #include <stdint.h>
 #include <stdlib.h>
 */
@@ -14,7 +16,9 @@ import (
 	"errors"
 	"log"
 	"net/netip"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/codexrm/codexrm/internal/p2p"
@@ -28,6 +32,10 @@ type mobileSession struct {
 	offer         chan protocol.P2PSignal
 	ready, active chan struct{}
 	out, incoming chan []byte
+	link          atomic.Pointer[p2p.Link]
+	shareProgress atomic.Int32
+	desktopMu     sync.Mutex
+	desktop       *desktopClient
 }
 
 var registry = struct {
@@ -56,7 +64,7 @@ func (s *mobileSession) emitBytes(ctx context.Context, b []byte) bool {
 	}
 }
 
-func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
+func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 	defer s.cancel()
 	defer close(s.incoming)
 	failure := "transport_closed"
@@ -71,7 +79,7 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 	}()
 	attempt, cancel := context.WithTimeout(s.ctx, protocol.P2PAttempt)
 	defer cancel()
-	prepared, offer, err := p2p.PrepareWithLocalPrefixes(attempt, false, start, local)
+	prepared, offer, err := p2p.PrepareWithSources(attempt, false, start, local)
 	if err != nil {
 		failure = "prepare"
 		log.Printf("CodexRM P2P prepare: %v", err)
@@ -109,10 +117,11 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 		return
 	}
 	defer link.Close()
-	log.Printf("CodexRM P2P: QUIC established (lan=%t ipv6=%t)", link.IsLAN(), link.IsIPv6())
+	log.Printf("CodexRM P2P: QUIC established (lan=%t ipv6=%t bound=%t)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource())
 	if link.IsLAN() && !s.emitBytes(attempt, []byte(`{"type":"native_direct_lan"}`)) {
 		return
 	}
+	s.link.Store(link)
 	if !s.emit(attempt, protocol.P2P("activate", s.id)) {
 		return
 	}
@@ -123,6 +132,7 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []netip.Prefix) {
 	case <-s.active:
 	}
 	cancel()
+	go link.WatchQuality(s.ctx)
 	go func() { <-s.ctx.Done(); link.Close() }()
 	go func() {
 		defer s.cancel()
@@ -153,19 +163,41 @@ func CRMOpen(ptr unsafe.Pointer, n C.int) C.int64_t {
 	var start struct {
 		protocol.P2PSignal
 		LocalPrefixes []string `json:"localPrefixes"`
+		LocalSources  []struct {
+			Network string `json:"network"`
+			Prefix  string `json:"prefix"`
+			LAN     bool   `json:"lan"`
+		} `json:"localSources"`
 	}
-	if json.Unmarshal(C.GoBytes(ptr, n), &start) != nil || start.Kind != "start" || start.Version != protocol.P2PVersion || len(start.LocalPrefixes) > protocol.P2PMaxCandidates {
+	if json.Unmarshal(C.GoBytes(ptr, n), &start) != nil || start.Kind != "start" || start.Version != protocol.P2PVersion || len(start.LocalPrefixes) > protocol.P2PMaxCandidates || len(start.LocalSources) > 12 {
 		return 0
 	}
-	var local []netip.Prefix
+	var local []p2p.Source
 	for _, raw := range start.LocalPrefixes {
 		if p, err := netip.ParsePrefix(raw); err == nil {
-			local = append(local, p)
+			local = append(local, p2p.Source{Prefix: p, LAN: true})
 		}
+	}
+	for _, source := range start.LocalSources {
+		prefix, perr := netip.ParsePrefix(source.Prefix)
+		handle, herr := strconv.ParseInt(source.Network, 10, 64)
+		if perr != nil || herr != nil || handle == 0 {
+			continue
+		}
+		local = append(local, p2p.Source{Prefix: prefix, Network: source.Network, LAN: source.LAN, Bind: func(fd uintptr) error {
+			if result, err := C.android_setsocknetwork(C.net_handle_t(uint64(handle)), C.int(fd)); result != 0 {
+				if err == nil {
+					err = errors.New("android_setsocknetwork failed")
+				}
+				return err
+			}
+			return nil
+		}})
 	}
 	registry.Lock()
 	defer registry.Unlock()
-	if len(registry.m) != 0 {
+	// Keep one additional connection for sharing to a non-selected desktop.
+	if len(registry.m) >= 2 {
 		return 0
 	}
 	ctx, cancel := context.WithCancel(context.Background())

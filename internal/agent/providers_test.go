@@ -90,3 +90,38 @@ func TestThreadProviderIsolationAndResume(t *testing.T) {
 		t.Fatal("missing provider silently fell back to another supplier")
 	}
 }
+
+func TestOpenThreadWithRemovedProviderDoesNotResumeIt(t *testing.T) {
+	a, app, events := queueTestAgent(t)
+	a.cfg = Config{DataDir: t.TempDir(), CCSwitchDB: filepath.Join(t.TempDir(), "absent.db")}
+	started := lifecycleCall(t, a, app, "thread/start", map[string]any{"modelProvider": "ccswitch_removed"})
+	id := started["thread"].(map[string]any)["id"].(string)
+	turn := lifecycleCall(t, a, app, "turn/start", queueInput(id, "approval wait"))["turn"].(map[string]any)
+	queueEvent(t, events, "item/commandExecution/requestApproval")
+	lifecycleCall(t, a, app, "turn/interrupt", map[string]any{"threadId": id, "turnId": turn["id"]})
+	waitQueue(t, a, id, func(q *messageQueue) bool { return q.Detached && !q.Loaded })
+
+	result := lifecycleCall(t, a, app, "thread/resume", map[string]any{"threadId": id})
+	thread := result["thread"].(map[string]any)
+	if thread["id"] != id || thread["modelProvider"] != "ccswitch_removed" || thread["codexrmProviderUnavailable"] != true {
+		t.Fatalf("unexpected history-only thread: %v", thread)
+	}
+	if turns := thread["turns"].([]any); len(turns) != 1 || turns[0].(map[string]any)["id"] != turn["id"] {
+		t.Fatalf("original turn missing: %v", turns)
+	}
+	metadata := lifecycleCall(t, a, app, "thread/resume", map[string]any{"threadId": id, "excludeTurns": true})["thread"].(map[string]any)
+	if metadata["codexrmProviderUnavailable"] != true || metadata["turns"] != nil {
+		t.Fatalf("metadata-only resume did not honor excludeTurns: %v", metadata)
+	}
+	if data := queueCall(t, app, "thread/loaded/list", nil)["data"].([]any); len(data) != 0 {
+		t.Fatalf("opening without a provider loaded a thread: %v", data)
+	}
+	for _, method := range []string{"turn/start", "turn/steer"} {
+		if _, err := a.callThread(a.queueCtx, app, "owner", method, queueInput(id, "must not send")); err != errProviderUnavailable {
+			t.Errorf("%s was not blocked: %v", method, err)
+		}
+	}
+	if _, err := a.queueRPC(a.queueCtx, app, "owner", "codexrm/queue/add", queueInput(id, "must not queue")); err != errProviderUnavailable {
+		t.Fatalf("queue add was not blocked: %v", err)
+	}
+}

@@ -106,19 +106,23 @@ type ClientInfo struct {
 	LastIP          string `json:"lastIP,omitempty"`
 }
 
+// RPCOutcomeUnknownCode marks an Agent error after possible delivery without a definitive reply.
+const RPCOutcomeUnknownCode = -32098
+
 // Envelope wraps a JSON-RPC payload between client and agent.
 type Envelope struct {
-	Type       string          `json:"type"`
-	ClientID   string          `json:"clientId,omitempty"`
-	StreamID   string          `json:"streamId,omitempty"`
-	SeqID      uint64          `json:"seqId,omitempty"`
-	Message    json.RawMessage `json:"message,omitempty"`
-	Status     string          `json:"status,omitempty"`
-	Error      string          `json:"error,omitempty"`
-	Agent      *AgentInfo      `json:"agent,omitempty"`
-	PingID     string          `json:"pingId,omitempty"`
-	P2P        *P2PSignal      `json:"p2p,omitempty"`
-	SkipDirect []string        `json:"skipDirect,omitempty"`
+	Type                   string          `json:"type"`
+	ClientID               string          `json:"clientId,omitempty"`
+	StreamID               string          `json:"streamId,omitempty"`
+	SeqID                  uint64          `json:"seqId,omitempty"`
+	Message                json.RawMessage `json:"message,omitempty"`
+	Status                 string          `json:"status,omitempty"`
+	Error                  string          `json:"error,omitempty"`
+	Agent                  *AgentInfo      `json:"agent,omitempty"`
+	PingID                 string          `json:"pingId,omitempty"`
+	P2P                    *P2PSignal      `json:"p2p,omitempty"`
+	FileTransferDirectOnly bool            `json:"fileTransferDirectOnly,omitempty"`
+	SkipDirect             []string        `json:"skipDirect,omitempty"`
 	// ClientKind is assigned by the relay. Clients cannot choose it.
 	ClientKind string `json:"clientKind,omitempty"`
 }

@@ -185,27 +185,30 @@ test("active reasoning shimmers and completed reasoning collapses unless the use
   assert.doesNotMatch(app.itemHTML(item, undefined, true), /^<details[^>]*\sopen[\s>]/);
 });
 
-test("operation groups auto-expand only while active and preserve manual disclosure", () => {
+test("operation groups stay collapsed by default and preserve manual disclosure", () => {
   const { app } = loadApp();
   const items = [
     { id: "think", type: "reasoning", reasoningText: "分析输入" },
     { id: "command", type: "commandExecution", command: "node test.mjs", status: "inProgress" },
   ];
   const active = app.operationGroupHTML(items, true);
-  assert.match(active, /data-active="true" open/);
-  assert.match(active, /aria-expanded="true" aria-controls="operations:think-body"/);
+  assert.match(active, /data-active="true"/);
+  assert.doesNotMatch(active, /^<details[^>]*\sopen[\s>]/);
+  assert.match(active, /aria-expanded="false" aria-controls="operations:think-body"/);
+  assert.match(active, /aria-label="展开：node test.mjs"/);
   assert.match(active, /operation-group-title thinking-shimmer/);
   assert.match(active, /2 条操作 · 执行中/);
   const completed = app.operationGroupHTML(items, false);
   assert.doesNotMatch(completed, /^<details[^>]*\sopen[\s>]/);
   assert.match(completed, /aria-expanded="false"/);
   app.rememberDisclosure("operations:think", true);
+  assert.match(app.operationGroupHTML(items, true), /^<details[^>]*\sopen[\s>]/);
   assert.match(app.operationGroupHTML(items, false), /^<details[^>]*\sopen[\s>]/);
   app.rememberDisclosure("operations:think", false);
   assert.doesNotMatch(app.operationGroupHTML(items, true), /^<details[^>]*\sopen[\s>]/);
 });
 
-test("streaming completion collapses auto-opened groups but never overrides a manual choice", () => {
+test("streaming keeps operation groups collapsed unless the user opened them", () => {
   const { app, elements } = loadApp();
   app.state.current = { id: "thread" };
   app.state.turns = [{ id: "turn", status: "inProgress", items: [
@@ -213,7 +216,8 @@ test("streaming completion collapses auto-opened groups but never overrides a ma
     { id: "command", type: "commandExecution", command: "node test.mjs", status: "inProgress" },
   ] }];
   app.renderMessages();
-  assert.match(elements.get("messages").innerHTML, /data-detail="operations:think" data-active="true" open/);
+  assert.match(elements.get("messages").innerHTML, /data-detail="operations:think" data-active="true">/);
+  assert.doesNotMatch(elements.get("messages").innerHTML, /data-detail="operations:think"[^>]*\sopen/);
   app.rememberDisclosure("operations:think", false);
   app.renderMessages();
   assert.match(elements.get("messages").innerHTML, /data-detail="operations:think" data-active="true">/);
@@ -523,6 +527,43 @@ test("a missing supplier remains distinct from the current Codex configuration",
   elements.get("model").onchange();
   assert.equal(app.state.current.id, "thread-a");
   assert.equal(app.selectedModel().providerId, "ccswitch_a");
+});
+
+test("opening a conversation with a missing supplier shows history and blocks only sending until switch", async () => {
+  const { app, context, elements, providers } = providerApp();
+  providers.splice(1, 1);
+  await app.loadModels();
+  app.state.info.threadModelProviderSwitch = true;
+  const calls = [];
+  context.rpc = async (method) => {
+    calls.push(method);
+    if (method === "thread/resume") return { nextCursor: "older", thread: {
+      id: "thread-a", modelProvider: "ccswitch_a", model: "shared", historyMode: "paginated",
+      codexrmProviderUnavailable: true, turns: [{ id: "previous", status: "interrupted", items: [] }],
+    } };
+    if (method === "codexrm/thread/switchProvider") return { providerId: "ccswitch_b", model: "other" };
+    if (method === "turn/start") return { turn: { id: "next", status: "inProgress", items: [] } };
+    throw new Error(`unexpected ${method}`);
+  };
+  await app.openThread("thread-a");
+  assert.equal(app.state.turns[0].id, "previous");
+  assert.equal(app.state.historyCursor, "older");
+  assert.equal(elements.get("model").disabled, false);
+  elements.get("prompt").value = "draft";
+  app.resizePrompt();
+  assert.equal(elements.get("send").disabled, true);
+  assert.equal(elements.get("continue-turn").hidden, true);
+  assert.match(elements.get("composer-hint").textContent, /切换到可用的供应商/);
+  await app.submit();
+  assert.deepEqual(calls, ["thread/resume"]);
+  elements.get("model").value = app.modelKey("ccswitch_b", "other");
+  await elements.get("model").onchange();
+  assert.equal(app.state.current.id, "thread-a");
+  assert.equal(app.state.turns[0].id, "previous");
+  assert.equal(elements.get("prompt").value, "draft");
+  assert.equal(elements.get("send").disabled, false);
+  await app.submit();
+  assert.deepEqual(calls, ["thread/resume", "codexrm/thread/switchProvider", "turn/start"]);
 });
 
 test("new chats select an available default instead of leaving the model empty", async () => {
@@ -1404,6 +1445,22 @@ test("parallel approvals retain answers, await acknowledgements and permit retri
   assert.equal(question.querySelectorAll("textarea")[0].value, "keep this answer");
 });
 
+test("command approvals expose only decisions offered by Codex", () => {
+  const { app, elements } = loadApp();
+  const sent = [];
+  app.state.online = true;
+  app.state.socket = { readyState: 1, send: (raw) => sent.push(JSON.parse(raw)) };
+  app.state.current = { id: "thread" };
+  const method = "item/commandExecution/requestApproval";
+  app.onEvent({ id: "one-off", method, params: { threadId: "thread", availableDecisions: ["accept", "cancel"] } });
+  app.onEvent({ id: "session", method, params: { threadId: "thread", availableDecisions: ["accept", "acceptForSession", "decline"] } });
+  const buttons = app.state.approvalCards.get("one-off").querySelectorAll("button");
+  assert.deepEqual(buttons.map((button) => button.textContent), ["允许一次", "取消当前任务"]);
+  assert.equal(elements.get("approval-area").querySelectorAll("button").some((b) => b.textContent === "全部拒绝"), false);
+  buttons[1].onclick();
+  assert.deepEqual(sent.map(({ message }) => message.result), [{ decision: "cancel" }]);
+});
+
 test("Codex questions submit selected or custom answers, multiline text and secrets with retry", () => {
   for (const customAnswer of [false, true]) {
     const { app } = loadApp();
@@ -1656,6 +1713,26 @@ test("an uncertain send keeps the outbox record and never restores an ambiguous 
   assert.match(elements.get("connection-notice-text").textContent, /发送状态未确认/);
 });
 
+test("the Agent's unknown-outcome response preserves the outbox while a rejection restores the draft", async () => {
+  for (const code of [-32098, -32602]) {
+    const { app, elements, sockets } = connectionApp();
+    const socket = sockets[0];
+    socket.open();
+    socket.receive({ type: "welcome", status: "connected" });
+    app.state.current = { id: "thread", cwd: "/project" };
+    const prompt = elements.get("prompt");
+    prompt.value = "original message";
+    app.resizePrompt();
+    const submitted = app.submit();
+    const request = socket.sent.findLast((envelope) => envelope.message?.method === "turn/start");
+    assert.ok(request);
+    socket.receive({ type: "server_message", message: { id: request.message.id, error: { code, message: "upstream error" } } });
+    await submitted;
+    assert.equal(app.state.outbox.length, code === -32098 ? 1 : 0);
+    assert.equal(prompt.value, code === -32098 ? "" : "original message");
+  }
+});
+
 test("outbox persists complete send context until explicit RPC success and preserves newer edits", async () => {
   const storage = new Map();
   const { app, context, elements } = runningApp(storage);
@@ -1884,6 +1961,42 @@ test("attachment-only messages work for new turns, queues and steering", async (
     assert.equal(calls[0].params.input[1].path, file.path);
     assert.equal(app.currentAttachments().length, 0);
   }
+});
+
+test("a direct-only relay allows chat image upload and preview without enabling other files", async () => {
+  const { app, context, elements } = runningApp();
+  app.state.fileTransferDirectOnly = true;
+  app.state.info.attachments = { maxSize: 20 * 1024 * 1024, relayImages: true };
+  const file = readyAttachment({ name: "image.PNG", mimeType: "image/png", path: "/agent/photo.png" });
+  const methods = [];
+  context.rpc = async (method, params) => {
+    methods.push(method);
+    switch (method) {
+      case "codexrm/chatImage/begin": return { id: file.id, chunkSize: 2 };
+      case "codexrm/chatImage/chunk": return { offset: params.offset + Buffer.from(params.data, "base64").length };
+      case "codexrm/chatImage/finish": return file;
+      default: assert.fail(`Unexpected upload method: ${method}`);
+    }
+  };
+  await app.addAttachments([new File(["abc"], "notes.txt", { type: "text/plain" }), new File(["abc"], file.name)]);
+  assert.deepEqual(methods, ["codexrm/chatImage/begin", "codexrm/chatImage/chunk", "codexrm/chatImage/chunk", "codexrm/chatImage/finish"]);
+  assert.equal(elements.get("attach-files").disabled, false);
+  assert.match(elements.get("file-input").accept, /\.png/);
+  assert.equal(app.currentAttachments().length, 1);
+  const input = app.messageInput("look", app.currentAttachments());
+  assert.equal(input[2].type, "localImage");
+  assert.equal(input[2].path, file.path);
+
+  app.state.attachmentCache.clear();
+  context.rpc = async (method, params) => {
+    assert.equal(method, "codexrm/chatImage/read");
+    assert.equal(params.id, file.id);
+    return { file, offset: 3, data: "YWJj" };
+  };
+  assert.equal(await (await app.readAttachment(file.id, true)).blob.text(), "abc");
+  await assert.rejects(app.readAttachment("ordinary-file"), /P2P/);
+  const readHistoryImage = vm.runInContext("readHistoryImage", context);
+  await assert.rejects(readHistoryImage("/workspace/output.png", "item", "/workspace"), /P2P/);
 });
 
 test("failed attachment sends retain files alongside text typed during the request", async () => {

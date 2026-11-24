@@ -1,5 +1,8 @@
 package com.codexrm.mobile
 
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -28,6 +31,30 @@ class ApprovalStateTest {
         assertTrue(ApprovalFilter.visible(scope.copy(turnId = ""), "agent-a", "thread-a", "turn-a"))
         assertTrue(ApprovalFilter.visible(scope.copy(turnId = ""), "agent-a", "thread-a", ""))
         assertTrue(ApprovalFilter.visible(scope, "agent-a", "thread-a", ""))
+    }
+
+    @Test fun `command approval respects the server decision list`() {
+        val request = JSONObject().put("method", "item/commandExecution/requestApproval")
+        val params = JSONObject().put("availableDecisions", JSONArray()
+            .put("accept").put(JSONObject().put("acceptWithExecpolicyAmendment", JSONObject())).put("cancel"))
+        request.put("params", params)
+        assertEquals(listOf("accept", "cancel"), ProtocolFormatter.permissionDecisions(request))
+        params.put("availableDecisions", JSONArray().put("acceptForSession"))
+        assertEquals(listOf("acceptForSession"), ProtocolFormatter.permissionDecisions(request))
+        params.put("availableDecisions", JSONArray())
+        assertTrue(ProtocolFormatter.permissionDecisions(request).isEmpty())
+        params.remove("availableDecisions")
+        assertEquals(listOf("accept", "acceptForSession", "decline"), ProtocolFormatter.permissionDecisions(request))
+    }
+
+    @Test fun `session permission reply grants only the requested permissions`() {
+        val permissions = JSONObject().put("network", JSONObject().put("enabled", true))
+        val request = JSONObject().put("method", "item/permissions/requestApproval")
+            .put("params", JSONObject().put("permissions", permissions))
+        assertTrue("acceptForSession" in ProtocolFormatter.permissionDecisions(request))
+        val result = ProtocolFormatter.permissionResult(request, "acceptForSession") as JSONObject
+        assertEquals("session", result.getString("scope"))
+        assertEquals(permissions.toString(), result.getJSONObject("permissions").toString())
     }
 
     @Test fun `batch cannot cross agents or threads`() {

@@ -7,6 +7,7 @@ import org.gradle.process.ExecOperations
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 abstract class BuildDirectLibraries @Inject constructor(private val exec: ExecOperations) : DefaultTask() {
@@ -44,7 +45,7 @@ val p2pQa = project.hasProperty("codexrm.p2pQa")
 
 android {
     namespace = "com.codexrm.mobile"
-    compileSdk = 36
+    compileSdk = 37
     ndkVersion = "28.2.13676358"
     val releaseQa = project.hasProperty("codexrm.releaseQa")
     testBuildType = if (releaseQa) "release" else "debug"
@@ -58,8 +59,8 @@ android {
         minSdk = 28
         targetSdk = 35
         ndk { abiFilters.add("arm64-v8a") }
-        versionCode = 43
-        versionName = "1.0.42"
+        versionCode = 54
+        versionName = "1.6.3"
         testInstrumentationRunner = if (p2pQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {
@@ -91,6 +92,8 @@ android {
             if (p2pQa) applicationIdSuffix = ".p2pqa"
         }
     }
+
+    buildFeatures { compose = true }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -137,6 +140,10 @@ androidComponents {
 }
 
 dependencies {
+    implementation("androidx.activity:activity:1.12.4")
+    val miuixVersion = "0.9.1"
+    implementation("top.yukonga.miuix.kmp:miuix-ui-android:$miuixVersion")
+    implementation("top.yukonga.miuix.kmp:miuix-preference-android:$miuixVersion")
     implementation("androidx.core:core:1.17.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.zxing:core:3.5.4")

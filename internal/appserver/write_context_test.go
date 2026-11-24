@@ -25,8 +25,9 @@ func TestCanceledActiveWriteClosesClient(t *testing.T) {
 	// A canceled call waiting behind the writer must leave the active call alone.
 	waiting, stop := context.WithCancel(context.Background())
 	stop()
-	if _, err := c.Call(waiting, "ping", nil); !errors.Is(err, context.Canceled) {
-		t.Fatalf("queued write: %v", err)
+	var unknown *OutcomeUnknown
+	if _, err := c.Call(waiting, "ping", nil); !errors.Is(err, context.Canceled) || errors.As(err, &unknown) {
+		t.Fatalf("queued write should be a definite failure: %v", err)
 	}
 	select {
 	case <-c.Done():
@@ -36,8 +37,8 @@ func TestCanceledActiveWriteClosesClient(t *testing.T) {
 	cancel()
 	select {
 	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("active write: %v", err)
+		if !errors.Is(err, context.Canceled) || !errors.As(err, &unknown) {
+			t.Fatalf("active write should have an unknown outcome: %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("blocked write ignored call cancellation")

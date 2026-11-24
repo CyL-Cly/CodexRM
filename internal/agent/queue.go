@@ -24,22 +24,24 @@ type queuedMessage struct {
 
 type messageQueue struct {
 	// Serialize resume/start/unsubscribe without blocking notification delivery.
-	RPCMu         sync.Mutex
-	Loaded        bool
-	Detached      bool
-	Ephemeral     bool
-	ResumeParams  map[string]any
-	Unloaded      chan struct{}
-	Polling       bool
-	Known         bool
-	Entries       []*queuedMessage
-	ActiveTurn    string
-	LastCompleted string
-	Starting      bool
-	ObservedStart string
-	Paused        bool
-	Error         string
-	Version       uint64
+	RPCMu               sync.Mutex
+	Loaded              bool
+	Detached            bool
+	ProviderUnavailable bool
+	Ephemeral           bool
+	SessionApproval     bool
+	ResumeParams        map[string]any
+	Unloaded            chan struct{}
+	Polling             bool
+	Known               bool
+	Entries             []*queuedMessage
+	ActiveTurn          string
+	LastCompleted       string
+	Starting            bool
+	ObservedStart       string
+	Paused              bool
+	Error               string
+	Version             uint64
 }
 
 func (a *Agent) queueLocked(threadID string) *messageQueue {
@@ -142,11 +144,15 @@ func (a *Agent) queueRPC(ctx context.Context, app *appserver.Client, owner, meth
 	}
 	if method == "codexrm/queue/add" || method == "codexrm/queue/resume" {
 		if err := a.ensureQueue(ctx, app, threadID); err != nil {
-			return nil, err
+			return nil, requestNotSent(err)
 		}
 	}
 	a.queueMu.Lock()
 	q := a.queueLocked(threadID)
+	if q.ProviderUnavailable && (method == "codexrm/queue/add" || method == "codexrm/queue/resume") {
+		a.queueMu.Unlock()
+		return nil, errProviderUnavailable
+	}
 	switch method {
 	case "codexrm/queue/add":
 		input, _ := params["input"].([]any)
@@ -217,9 +223,12 @@ func (a *Agent) queueNotification(ctx context.Context, app *appserver.Client, ra
 	}
 	if event.Method == "thread/closed" {
 		a.queueMu.Lock()
-		if q := a.queues[event.Params.ThreadID]; q != nil && q.Unloaded != nil {
-			close(q.Unloaded)
-			q.Unloaded = nil
+		if q := a.queues[event.Params.ThreadID]; q != nil {
+			q.SessionApproval = false
+			if q.Unloaded != nil {
+				close(q.Unloaded)
+				q.Unloaded = nil
+			}
 		}
 		a.queueMu.Unlock()
 		return
@@ -248,6 +257,7 @@ func (a *Agent) queueNotification(ctx context.Context, app *appserver.Client, ra
 			q.Error = "当前任务已停止或失败，排队已暂停"
 		}
 	case "thread/archived":
+		q.SessionApproval = false
 		q.Paused = true
 		q.Error = "会话已归档，排队已暂停"
 	}

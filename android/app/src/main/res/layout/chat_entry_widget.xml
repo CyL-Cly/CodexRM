@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@android:id/background"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:background="@drawable/chat_widget_background"
+    android:padding="4dp">
+    <Button android:id="@+id/widget_new_chat"
+        android:layout_width="match_parent" android:layout_height="48dp"
+        android:text="@string/chat_entry_new" android:textSize="14sp"
+        android:textColor="#10261E" android:backgroundTint="#65D6AD" />
+    <Button android:id="@+id/widget_search_chats"
+        android:layout_width="match_parent" android:layout_height="48dp"
+        android:text="@string/chat_entry_search" android:textSize="14sp"
+        android:textColor="#F3F7F5" android:backgroundTint="#30443D" />
+</LinearLayout>

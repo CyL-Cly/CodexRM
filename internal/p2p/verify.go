@@ -17,7 +17,10 @@ import (
 	"github.com/codexrm/codexrm/internal/protocol"
 )
 
-const verifySize = 4 + 32 + 6 + 16
+const (
+	verifySize  = 4 + 32 + 6 + 16
+	verifySize6 = 4 + 32 + 18 + 16
+)
 
 // UDPVerifier issues source receipts only for attempts with a valid RM ticket.
 // Requests and replies have the same fixed size; packets create no server state.
@@ -46,7 +49,11 @@ func ListenVerifier(addr netip.AddrPort, keyFile string) (*UDPVerifier, error) {
 		}
 	}
 	var err error
-	v.conn, err = net.ListenUDP("udp4", net.UDPAddrFromAddrPort(addr))
+	family := "udp4"
+	if addr.Addr().Is6() {
+		family = "udp6"
+	}
+	v.conn, err = net.ListenUDP(family, net.UDPAddrFromAddrPort(addr))
 	if err != nil {
 		return nil, err
 	}
@@ -81,15 +88,14 @@ func (v *UDPVerifier) validTicket(ticket []byte, now time.Time) bool {
 		hmac.Equal(ticket[16:], v.mac("ticket", ticket[:16]))
 }
 
-func addrBytes(a netip.AddrPort) [6]byte {
-	ip := a.Addr().As4()
-	b := [6]byte{ip[0], ip[1], ip[2], ip[3]}
-	binary.BigEndian.PutUint16(b[4:], a.Port())
+func addrBytes(a netip.AddrPort) []byte {
+	b := append(a.Addr().AsSlice(), 0, 0)
+	binary.BigEndian.PutUint16(b[len(b)-2:], a.Port())
 	return b
 }
 
 func (v *UDPVerifier) Check(ticket, proof string, a netip.AddrPort, now time.Time) bool {
-	if len(ticket) != 64 || len(proof) != 32 || !a.Addr().Is4() || a.Port() == 0 {
+	if len(ticket) != 64 || len(proof) != 32 || (!a.Addr().Is4() && !IsPublicIPv6(a.Addr()) && a.Addr() != netip.IPv6Loopback()) || a.Port() == 0 {
 		return false
 	}
 	t, err := hex.DecodeString(ticket)
@@ -98,45 +104,72 @@ func (v *UDPVerifier) Check(ticket, proof string, a netip.AddrPort, now time.Tim
 	}
 	p, err := hex.DecodeString(proof)
 	b := addrBytes(a)
-	return err == nil && hmac.Equal(p, v.mac("address", t, b[:]))
+	return err == nil && hmac.Equal(p, v.mac("address", t, b))
 }
 
 func (v *UDPVerifier) serve() {
-	var b [verifySize + 1]byte
+	var b [verifySize6 + 1]byte
 	for {
 		n, from, err := v.conn.ReadFromUDPAddrPort(b[:])
 		if err != nil {
 			return
 		}
-		if n != verifySize || !from.Addr().Is4() || from.Port() == 0 || string(b[:4]) != "CRV1" || !v.validTicket(b[4:36], time.Now()) {
+		if from.Port() == 0 {
+			continue
+		}
+		var reply string
+		switch {
+		case n == verifySize && from.Addr().Is4() && string(b[:4]) == "CRV1":
+			reply = "CRV2"
+		case n == verifySize6 && from.Addr().Is6() && string(b[:4]) == "CRV3":
+			reply = "CRV4"
+		default:
+			continue
+		}
+		if !v.validTicket(b[4:36], time.Now()) {
 			continue
 		}
 		a := addrBytes(from)
-		copy(b[:4], "CRV2")
-		copy(b[36:42], a[:])
-		copy(b[42:58], v.mac("address", b[4:36], a[:]))
-		_, _ = v.conn.WriteToUDPAddrPort(b[:verifySize], from)
+		copy(b[:4], reply)
+		copy(b[36:], a)
+		copy(b[36+len(a):], v.mac("address", b[4:36], a))
+		_, _ = v.conn.WriteToUDPAddrPort(b[:n], from)
 	}
 }
 
-func verifyRequest(ticket string) []byte {
-	var req [verifySize]byte
-	copy(req[:4], "CRV1")
+func verifyRequestFor(ticket string, ipv6 bool) []byte {
 	if len(ticket) != 64 {
 		return nil
 	}
+	size, magic := verifySize, "CRV1"
+	if ipv6 {
+		size, magic = verifySize6, "CRV3"
+	}
+	req := make([]byte, size)
+	copy(req[:4], magic)
 	if _, err := hex.Decode(req[4:36], []byte(ticket)); err != nil {
 		return nil
 	}
-	return req[:]
+	return req
 }
 
 func verifyReply(req, buf []byte) (netip.AddrPort, string) {
-	if len(buf) == verifySize && string(buf[:4]) == "CRV2" && bytes.Equal(req[4:36], buf[4:36]) {
-		addr := netip.AddrFrom4([4]byte(buf[36:40]))
-		if port := binary.BigEndian.Uint16(buf[40:42]); port != 0 {
-			return netip.AddrPortFrom(addr, port), hex.EncodeToString(buf[42:58])
-		}
+	if len(buf) != len(req) {
+		return netip.AddrPort{}, ""
 	}
-	return netip.AddrPort{}, ""
+	var addr netip.Addr
+	var ipEnd int
+	switch {
+	case len(buf) == verifySize && string(buf[:4]) == "CRV2":
+		addr, ipEnd = netip.AddrFrom4([4]byte(buf[36:40])), 40
+	case len(buf) == verifySize6 && string(buf[:4]) == "CRV4":
+		addr, ipEnd = netip.AddrFrom16([16]byte(buf[36:52])), 52
+	default:
+		return netip.AddrPort{}, ""
+	}
+	port := binary.BigEndian.Uint16(buf[ipEnd : ipEnd+2])
+	if port == 0 || !bytes.Equal(req[4:36], buf[4:36]) {
+		return netip.AddrPort{}, ""
+	}
+	return netip.AddrPortFrom(addr, port), hex.EncodeToString(buf[ipEnd+2:])
 }

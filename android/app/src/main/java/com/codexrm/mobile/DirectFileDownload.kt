@@ -11,8 +11,10 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
-internal data class RemoteFile(val workspace: String, val threadId: String, val path: String) {
-    fun params(): JSONObject = JSONObject().put("workspace", workspace).put("threadId", threadId).put("path", path)
+internal data class RemoteFile(val workspace: String, val threadId: String, val path: String, val computer: Boolean = false) {
+    fun params(): JSONObject = JSONObject().put("workspace", workspace).put("threadId", threadId).put("path", path).apply {
+        if (computer) put("scope", "computer")
+    }
 }
 
 internal data class StagedDownload(val name: String, val file: File)

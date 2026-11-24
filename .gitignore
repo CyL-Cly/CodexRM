@@ -39,3 +39,16 @@ Thumbs.db
 # Keep only the top-level README under version control
 *.[mM][dD]
 !/README.md
+
+# Local HiUI skills, generated runtime and frontend build output
+/.agents/skills/
+/.local-context/
+/src/components/hiui-design-runtime/
+/node_modules/
+/web/hiui/
+
+# Local tool caches and task artifacts
+/artifacts/
+/.qoder-input-images/
+.web-reverse-tool-dir
+.web-reverse-workspace-root

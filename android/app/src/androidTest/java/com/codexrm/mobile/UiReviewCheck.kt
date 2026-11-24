@@ -23,7 +23,7 @@ internal object UiReviewCheck {
     private lateinit var output: File
     private val checks = JSONArray()
 
-    fun run(instrumentation: ImageRenderingInstrumentation) {
+    fun run(instrumentation: ImageRenderingInstrumentation, settingsOnly: Boolean = false, workspaceOnly: Boolean = false) {
         test = instrumentation
         var activity: Activity? = null
         try {
@@ -44,10 +44,26 @@ internal object UiReviewCheck {
             )
             screen = activity
             onMain { invoke("cancelUpdateOperation") }
+            // The startup update dialog may already be opening when instrumentation gets control.
+            val startupDeadline = SystemClock.uptimeMillis() + 5_000
+            while (SystemClock.uptimeMillis() < startupDeadline) {
+                test.waitForIdleSync()
+                val activeWindow = test.uiAutomation.rootInActiveWindow
+                if (activeWindow?.matchingTextNodes("稍后")?.isNotEmpty() == true) {
+                    clickText("稍后")
+                    break
+                }
+                SystemClock.sleep(100)
+            }
             capture("01-pair")
             expectText("连接你的电脑")
 
             onMain { seedMain(online = true) }
+            if (workspaceOnly) {
+                verifyWorkspacePicker()
+                test.finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "PASS: workspace directory picker\n") })
+                return
+            }
             capture("02-home-online")
             expectText("工作目录")
             expectText("默认模型")
@@ -60,9 +76,76 @@ internal object UiReviewCheck {
             capture("03-sidebar")
             expectText("新建会话")
             expectText("最近")
-            onMain { invoke("toggleSidebar") }
+            clickText("工具")
+            capture("03a-tools")
+            expectText("连接与重试")
+            expectText("已归档会话")
+            goBack()
+            onMain { invoke("openSidebar") }
+            clickText("设置")
+            capture("03b-settings-dark")
+            expectText("深色模式")
+            clickText("背景与透明度")
+            expectText("聊天背景")
+            expectText("遮罩不透明度")
+            clickText("更换聊天背景")
+            expectText("选择本地图片")
+            expectText("随机图片 · 每 3 天更新")
+            expectText("AI 拟人图库")
+            clickText("取消")
+            clickText("返回")
+            expectText("通知")
+            expectText("后台任务通知")
+            val originalShareMode = DeviceStore(screen).shareToNewDraft
+            clickText("系统分享")
+            capture("03e-share-dropdown")
+            clickText(if (originalShareMode) "每次选择去向" else "直接加入新会话草稿")
+            check(DeviceStore(screen).shareToNewDraft != originalShareMode) { "Share mode was not saved" }
+            clickText("系统分享")
+            clickText(if (originalShareMode) "直接加入新会话草稿" else "每次选择去向")
+            check(DeviceStore(screen).shareToNewDraft == originalShareMode) { "Share mode was not restored" }
+            clickText("深色模式")
+            capture("03c-settings-light")
+            check(!DeviceStore(screen).darkTheme) { "Light theme was not saved" }
+            clickText("深色模式")
+            check(DeviceStore(screen).darkTheme) { "Dark theme was not saved" }
+            clickText("电脑 Agent 设置")
+            capture("03d-agent-settings")
+            expectAbsent("后台任务通知")
+            clickText("工作区设置")
+            expectText("审批策略")
+            val originalSandbox = DeviceStore(screen).sandbox
+            clickText("文件访问")
+            capture("03f-workspace-dropdown")
+            clickText(if (originalSandbox == "read-only") "允许修改工作目录" else "只读")
+            clickText("取消")
+            check(DeviceStore(screen).sandbox == originalSandbox) { "Canceled workspace setting was saved" }
+            expectText("模型供应商")
+            goBack()
+            expectText("深色模式")
+            goBack()
+            if (settingsOnly) {
+                test.finish(Activity.RESULT_OK, Bundle().apply {
+                    putString("stream", "PASS: sidebar tools, theme switch, Agent settings and back navigation. Screenshots: ${output.absolutePath}\n")
+                })
+                return
+            }
 
-            onMain { invoke("showModelPicker") }
+            clickText("选择设备")
+            expectText("添加新设备")
+            capture("03g-device-menu")
+            goBack()
+            verifyWorkspacePicker()
+            clickText("添加文件或图片")
+            expectText("拍照")
+            expectText("相册")
+            expectText("文件")
+            capture("03h-attachment-sheet")
+            goBack()
+            clickText("选择思考强度")
+            expectText("选择思考强度")
+            clickText("取消")
+            clickText("默认模型")
             capture("04-model-picker")
             expectText("选择模型")
             expectText("默认模型")
@@ -71,10 +154,9 @@ internal object UiReviewCheck {
             capture("05-model-search-empty")
             expectText("清除搜索")
             clickText("清除搜索")
+            capture("05a-model-after-clear")
             expectText("GPT-5")
-            test.uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-            test.waitForIdleSync()
-            SystemClock.sleep(200)
+            goBack()
             onMain {
                 val options = field("models").get(screen) as List<ModelOption>
                 screen.javaClass.getDeclaredMethod("chooseModel", ModelOption::class.java).apply { isAccessible = true }
@@ -93,7 +175,7 @@ internal object UiReviewCheck {
                 set("currentThread", JSONObject().put("id", "thread-1").put("name", "旧会话").put("model", "gpt-5"))
                 set("currentThreadId", "thread-1")
                 invoke("useDefaultModel")
-                invoke("refreshModelSpinner")
+                invoke("refreshModelChoices")
                 val restored = field("selectedModelOption").get(screen) as? ModelOption
                 check(restored?.model == "gpt-5") { "Thread refresh did not restore its own model for this check" }
                 screen.javaClass.getDeclaredMethod("newChat", java.lang.Boolean.TYPE).apply { isAccessible = true }
@@ -103,7 +185,7 @@ internal object UiReviewCheck {
                 set("running", true)
                 (field("composer").get(screen) as EditText).setText("补充当前任务")
                 invoke("updateControls")
-                check((field("effortSpinner").get(screen) as View).visibility == View.GONE) { "Running toolbar did not release effort width" }
+                check((field("effortButton").get(screen) as View).visibility == View.GONE) { "Running toolbar did not release effort width" }
             }
             SystemClock.sleep(7200)
             capture("05c-running-composer")
@@ -111,24 +193,23 @@ internal object UiReviewCheck {
                 set("running", false)
                 (field("composer").get(screen) as EditText).setText("")
                 invoke("updateControls")
-                check((field("effortSpinner").get(screen) as View).visibility == View.VISIBLE)
+                check((field("effortButton").get(screen) as View).visibility == View.VISIBLE)
             }
 
             onMain { invoke("showAppSettings") }
             capture("06-settings")
-            expectText("模型与连接")
+            expectText("电脑与连接")
+            expectText("文件与系统分享")
+            clickText("电脑 Agent 设置")
             expectText("模型供应商")
-            expectText("应用与数据")
-            onMain {
-                (field("settingsPage").get(screen) as? SettingsPage)?.dismiss()
-                invoke("showSettings")
-            }
+            clickText("工作区设置")
             capture("07-workspace-settings")
             expectText("文件访问")
             expectText("审批策略")
             test.uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             test.waitForIdleSync()
             SystemClock.sleep(200)
+            onMain { (field("settingsPage").get(screen) as? SettingsPage)?.dismiss() }
             verifyEditorSaveGuard()
             SystemClock.sleep(3600)
 
@@ -139,6 +220,10 @@ internal object UiReviewCheck {
             capture("08-files-compact")
             expectText("电脑")
             expectText("手机")
+            clickText("文件管理菜单")
+            expectText("刷新两侧目录")
+            expectText("选择手机目录")
+            goBack()
             onMain {
                 val files = field("workspaceFiles").get(screen) as WorkspaceFileUi
                 val manager = field(files, "manager").get(files)!!
@@ -158,9 +243,9 @@ internal object UiReviewCheck {
                 files.closeManager()
             }
 
-            onMain { invoke("toggleTheme") }
+            onMain { setDarkTheme(false) }
             capture("09-home-light")
-            onMain { invoke("toggleTheme") }
+            onMain { setDarkTheme(true) }
 
             onMain { screen.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
             waitForOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
@@ -207,6 +292,17 @@ internal object UiReviewCheck {
         }
     }
 
+    private fun verifyWorkspacePicker() {
+        clickText("选择工作目录，当前目录：/workspace/demo")
+        expectText("/workspace/docs")
+        clickText("浏览其他目录")
+        expectText("添加工作区")
+        expectText("显示隐藏目录")
+        expectText("添加此文件夹")
+        expectText("设备未连接")
+        goBack()
+    }
+
     private fun seedMain(online: Boolean) {
         if (!(field("mainBuilt").get(screen) as Boolean)) invoke("buildMain")
         val demo = Device("ui-client", "ui-token", "http://127.0.0.1:9", "ui-agent", "演示电脑", "Windows", "1.0.0", online)
@@ -226,7 +322,7 @@ internal object UiReviewCheck {
         set("info", JSONObject()
             .put("mock", true).put("name", "演示电脑").put("cwd", "/workspace/demo")
             .put("attachments", true).put("providerManagement", true).put("providerModels", true)
-            .put("messageQueue", true).put("workspaces", true))
+            .put("messageQueue", true).put("workspaces", true).put("conversationTools", true))
         set("workspaces", listOf(Workspace("Demo Project", "/workspace/demo"), Workspace("Documents", "/workspace/docs")))
         val nativeModels = JSONArray()
             .put(JSONObject().put("model", "gpt-5").put("displayName", "GPT-5")
@@ -247,7 +343,7 @@ internal object UiReviewCheck {
             ThreadSummary("thread-1", "检查项目构建", "/workspace/demo", true, 200L, 100L),
             ThreadSummary("thread-2", "整理发布说明", "/workspace/docs", false, 150L, 90L),
         )))
-        invoke("refreshModelSpinner")
+        invoke("refreshModelChoices")
         screen.setContentView(field("mainRoot").get(screen) as View)
         invoke("renderDevices")
         invoke("renderWorkspaces")
@@ -259,20 +355,20 @@ internal object UiReviewCheck {
         lateinit var page: SettingsPage
         onMain {
             page = SettingsPage(screen as MainActivity, "演示电脑", { null }, { true },
-                { _, _, _, callback -> pending = callback }, {}, emptyList())
+                { _, _, _, callback -> pending = callback }, {}, { emptyList() })
             page.show()
             SettingsPage::class.java.getDeclaredMethod("showEditor", String::class.java, JSONObject::class.java)
                 .apply { isAccessible = true }.invoke(page, "", JSONObject())
             val content = field(page, "content").get(page) as android.view.ViewGroup
-            val edits = arrayListOf<EditText>()
+            val edits = arrayListOf<MiuixFieldView>()
             fun visit(view: View) {
-                if (view is EditText) edits += view
+                if (view is MiuixFieldView) edits += view
                 if (view is android.view.ViewGroup) for (index in 0 until view.childCount) visit(view.getChildAt(index))
             }
             visit(content)
             check(edits.size >= 3) { "Provider editor fields are missing" }
-            edits[0].setText("QA Provider")
-            edits[2].setText("https://example.invalid")
+            edits[0].text = "QA Provider"
+            edits[2].text = "https://example.invalid"
         }
         capture("07b-provider-editor")
         clickText("保存")
@@ -317,6 +413,17 @@ internal object UiReviewCheck {
         failure?.let { throw it }
     }
 
+    private fun setDarkTheme(dark: Boolean) {
+        screen.javaClass.getDeclaredMethod("setDarkTheme", Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(screen, dark)
+    }
+
+    private fun goBack() {
+        check(test.uiAutomation.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK))
+        test.waitForIdleSync()
+        SystemClock.sleep(250)
+    }
+
     private fun capture(name: String) {
         test.waitForIdleSync()
         SystemClock.sleep(300)
@@ -327,9 +434,7 @@ internal object UiReviewCheck {
     }
 
     private fun expectText(text: String) {
-        test.waitForIdleSync()
-        val root = test.uiAutomation.rootInActiveWindow ?: error("No active window while checking $text")
-        val found = root.findAccessibilityNodeInfosByText(text).isNotEmpty()
+        val found = awaitTextNodes(text).isNotEmpty()
         checks.put(JSONObject().put("text", text).put("passed", found))
         check(found) { "Missing visible text: $text" }
     }
@@ -337,7 +442,7 @@ internal object UiReviewCheck {
     private fun expectAbsent(text: String) {
         test.waitForIdleSync()
         val root = test.uiAutomation.rootInActiveWindow ?: error("No active window while checking absence of $text")
-        val found = root.findAccessibilityNodeInfosByText(text).any { it.text?.toString() == text }
+        val found = root.matchingTextNodes(text).any { it.text?.toString() == text }
         checks.put(JSONObject().put("absent", text).put("passed", !found))
         check(!found) { "Unexpected visible action: $text" }
     }
@@ -358,15 +463,33 @@ internal object UiReviewCheck {
         test.waitForIdleSync()
     }
 
+    private fun awaitTextNodes(text: String): List<AccessibilityNodeInfo> {
+        val deadline = SystemClock.uptimeMillis() + 5_000
+        do {
+            test.waitForIdleSync()
+            val matches = test.uiAutomation.rootInActiveWindow?.matchingTextNodes(text).orEmpty()
+            if (matches.isNotEmpty()) return matches
+            SystemClock.sleep(80)
+        } while (SystemClock.uptimeMillis() < deadline)
+        return emptyList()
+    }
+
     private fun clickText(text: String) {
-        test.waitForIdleSync()
-        val root = test.uiAutomation.rootInActiveWindow ?: error("No active window while clicking $text")
-        val candidates = root.findAccessibilityNodeInfosByText(text)
-        val node = candidates.firstOrNull { it.text?.toString() == text } ?: candidates.firstOrNull() ?: error("Cannot click $text")
-        var target: AccessibilityNodeInfo? = node
-        while (target != null && !target.isClickable) target = target.parent
-        check(target?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true) { "Text is not clickable: $text" }
-        test.waitForIdleSync()
+        val deadline = SystemClock.uptimeMillis() + 5_000
+        do {
+            val candidates = test.uiAutomation.rootInActiveWindow?.matchingTextNodes(text).orEmpty()
+                .sortedByDescending { it.text?.toString() == text || it.contentDescription?.toString() == text }
+            for (node in candidates) {
+                var target: AccessibilityNodeInfo? = node
+                while (target != null && !target.isClickable) target = target.parent
+                if (target?.isEnabled == true && target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    test.waitForIdleSync()
+                    return
+                }
+            }
+            SystemClock.sleep(100)
+        } while (SystemClock.uptimeMillis() < deadline)
+        error("Cannot click $text")
     }
 
     private fun waitForOrientation(orientation: Int) {
@@ -383,5 +506,20 @@ internal object UiReviewCheck {
             SystemClock.sleep(50)
         }
         error("Orientation did not change to $expected")
+    }
+}
+
+// Compose exposes virtual nodes through traversal, even on devices where text search misses them.
+internal fun AccessibilityNodeInfo.matchingTextNodes(query: String): List<AccessibilityNodeInfo> {
+    val nativeMatches = findAccessibilityNodeInfosByText(query)
+    return buildList {
+        fun visit(node: AccessibilityNodeInfo) {
+            if (node.isVisibleToUser && (node.text?.contains(query) == true || node.contentDescription?.contains(query) == true)) {
+                add(node)
+            }
+            for (index in 0 until node.childCount) node.getChild(index)?.let(::visit)
+        }
+        visit(this@matchingTextNodes)
+        nativeMatches.filter { it.isVisibleToUser }.forEach { if (it !in this) add(it) }
     }
 }

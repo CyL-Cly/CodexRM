@@ -156,15 +156,24 @@ internal class WorkspaceDownloads(context: Context) {
 
         fun key(device: Device, source: RemoteFile): String {
             // The Agent resolves both absolute artifact links and workspace-relative list paths.
-            val windows = source.workspace.getOrNull(1) == ':'
+            val windows = (if (source.computer) source.path else source.workspace).getOrNull(1) == ':'
             fun normalized(value: String): String {
                 val path = if (windows) value.replace('\\', '/') else value
                 val components = path.split('/').filter { it.isNotEmpty() && it != "." }
                 return (if (path.startsWith('/')) "/" else "") + components.joinToString("/")
             }
             val workspace = normalized(source.workspace)
-            val path = normalized(source.path).removePrefix(workspace.trimEnd('/') + "/")
-            return JSONArray(listOf(device.serverUrl, device.agentId, workspace, path)).toString()
+            val path = normalized(source.path)
+            val prefix = workspace.trimEnd('/') + "/"
+            // Reuse existing download records for files inside the current workspace.
+            val outsideWorkspace = source.computer && (workspace.isEmpty() || !path.startsWith(prefix, ignoreCase = windows))
+            val keyWorkspace = if (outsideWorkspace) "" else workspace
+            val keyPath = when {
+                outsideWorkspace -> path
+                source.computer -> path.substring(prefix.length)
+                else -> path.removePrefix(prefix)
+            }
+            return JSONArray(listOf(device.serverUrl, device.agentId, keyWorkspace, keyPath)).toString()
         }
 
         fun mime(name: String): String {

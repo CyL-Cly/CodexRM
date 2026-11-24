@@ -35,6 +35,12 @@ internal class ModelCatalog(result: JSONObject = JSONObject()) {
         return options.firstOrNull { it.providerId == aliasId && it.model == model }?.copy(providerId = providerId)
     }
 
+    fun sameProvider(left: String, right: String): Boolean {
+        if (left == right) return true
+        val alias = providers.firstOrNull { it.id.isEmpty() }?.aliasOf?.takeIf(String::isNotEmpty) ?: return false
+        return (left.isEmpty() && right == alias) || (right.isEmpty() && left == alias)
+    }
+
     fun switchEndpoint(thread: JSONObject, model: ModelOption): String? {
         val runtimeId = thread.string("modelProvider")
         val native = providers.firstOrNull { it.id.isEmpty() }

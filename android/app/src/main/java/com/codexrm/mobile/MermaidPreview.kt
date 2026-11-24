@@ -1,6 +1,5 @@
 package com.codexrm.mobile
 
-import android.app.Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -52,7 +51,7 @@ internal object MermaidPreview {
     }
 
     fun show(context: Context, source: String, dark: Boolean) {
-        val dialog = Dialog(context, android.R.style.Theme_Material_NoActionBar)
+        val dialog = PredictiveBackDialog(context, android.R.style.Theme_Material_NoActionBar)
         val content = Ui.column(context).apply { setBackgroundColor(Ui.BACKGROUND) }
         val controls = Ui.column(context, false)
         val holder = FrameLayout(context)
@@ -81,7 +80,8 @@ internal object MermaidPreview {
         holder.addView(code, FrameLayout.LayoutParams(-1, -1))
         content.addView(controls, LinearLayout.LayoutParams(-1, -2))
         content.addView(holder, LinearLayout.LayoutParams(-1, 0, 1f))
-        dialog.setContentView(content)
+        dialog.setBackContent(content)
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
         dialog.setOnDismissListener {
             holder.removeAllViews()
             web?.destroy()

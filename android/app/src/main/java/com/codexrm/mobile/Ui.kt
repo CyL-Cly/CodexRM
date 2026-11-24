@@ -14,7 +14,6 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
-import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -130,14 +129,8 @@ internal object Ui {
             gravity = Gravity.CENTER_VERTICAL
         }
 
-    fun button(context: Context, value: String, primary: Boolean = false, onClick: (View) -> Unit): Button = Button(context).apply {
-        text = value; textSize = 12f; isAllCaps = false
-        setTextColor(if (primary) ACCENT_TEXT else TEXT)
-        minHeight = dp(context, 48); minimumHeight = dp(context, 48); minWidth = 0; minimumWidth = 0
-        setPadding(dp(context, 14), 0, dp(context, 14), 0)
-        background = ripple(if (primary) ACCENT else SURFACE_ALT, dp(context, 8).toFloat())
-        setOnClickListener(onClick)
-    }
+    fun button(context: Context, value: String, primary: Boolean = false, onClick: (View) -> Unit): MiuixButtonView =
+        MiuixButtonView(context, value, primary).apply { setOnClickListener(onClick) }
 
     fun iconButton(context: Context, icon: String, description: String, size: Int = 48, onClick: (View) -> Unit): FrameLayout =
         FrameLayout(context).apply {

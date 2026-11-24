@@ -29,6 +29,51 @@ func TestPairingInstructionsIncludeScannableLink(t *testing.T) {
 	}
 }
 
+func TestTurnStartSentWithoutReplyReportsUnknown(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		name, want := "lost reply", protocol.RPCOutcomeUnknownCode
+		if reject {
+			name, want = "explicit rejection", -32602
+		}
+		t.Run(name, func(t *testing.T) {
+			upgrader := websocket.Upgrader{}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				var req struct {
+					ID     json.RawMessage
+					Method string
+				}
+				if conn.ReadJSON(&req) == nil && req.Method == "turn/start" && reject {
+					_ = conn.WriteJSON(map[string]any{"id": req.ID, "error": &appserver.RPCError{Code: want, Message: "invalid model"}})
+				}
+			}))
+			defer upstream.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			app, err := appserver.Dial(ctx, "ws"+strings.TrimPrefix(upstream.URL, "http"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer app.Close()
+			a := &Agent{owners: map[string]string{}}
+			var result struct {
+				ID    int
+				Error *appserver.RPCError
+			}
+			a.handle(ctx, app, func(reply protocol.Envelope) error {
+				return json.Unmarshal(reply.Message, &result)
+			}, protocol.Envelope{ClientID: "client", Message: json.RawMessage(`{"id":7,"method":"turn/start","params":{"threadId":"thread"}}`)}, nil)
+			if result.ID != 7 || result.Error == nil || result.Error.Code != want {
+				t.Fatalf("response = %+v, want error code %d", result, want)
+			}
+		})
+	}
+}
+
 func TestResolvedRequestsAreNotReplayed(t *testing.T) {
 	a := &Agent{owners: map[string]string{"thread": "client"}, approvals: map[string]approval{}}
 	a.forward(mustJSON(map[string]any{"id": 11, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread", "turnId": "turn"}}))

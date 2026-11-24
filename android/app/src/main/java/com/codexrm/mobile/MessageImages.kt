@@ -26,6 +26,22 @@ internal data class MessageImage(
     companion object {
         private val WINDOWS_PATH = Regex("^[A-Za-z]:[/\\\\]")
 
+        private val previewExtensions = setOf("png", "jpg", "jpeg", "gif", "webp", "bmp", "ico")
+
+        fun fromMarkdown(raw: String, link: Boolean = false): MessageImage? {
+            val remote = raw.startsWith("https://", true) || raw.startsWith("http://", true)
+            val data = raw.startsWith("data:image/", true)
+            val source = if (remote || data) raw else ArtifactCard.linkPath(raw) ?: return null
+            val path = when {
+                data -> ""
+                remote -> runCatching { URI(source).path }.getOrNull().orEmpty()
+                else -> source
+            }
+            val name = path.substringAfterLast('/').substringAfterLast('\\')
+            if (link && !data && name.substringAfterLast('.', "").lowercase() !in previewExtensions) return null
+            return fromSource(source, name)
+        }
+
         fun fromSource(raw: String, name: String = "图片", attachmentId: String = ""): MessageImage? {
             var source = raw.trim()
             if (source.startsWith("sandbox:")) source = source.removePrefix("sandbox:")

@@ -505,6 +505,9 @@ func (a *Agent) write(conn *websocket.Conn, env protocol.Envelope) error {
 	if conn == nil {
 		return errors.New("relay offline")
 	}
+	if env.Type == protocol.TypeServerMessage {
+		env.Message, _ = protocol.WithoutInlineFiles(env.Message)
+	}
 	frame, err := json.Marshal(env)
 	if err != nil {
 		return err
@@ -646,7 +649,9 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	hello := protocol.P2P("hello", "")
 	hello.LAN = true
 	hello.DualNATPunch = true
+	hello.ClientInitiated = true
 	hello.IPv6 = true
+	hello.NATDiagnostic = true
 	if e = a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, P2P: hello}); e != nil {
 		return e
 	}
@@ -754,7 +759,22 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 			} else {
 				return
 			}
+			var q *messageQueue
+			if p.ThreadID != "" && retainsSessionApproval(p.Raw, raw["result"]) {
+				q = a.threadQueue(p.ThreadID)
+				// Serialize the grant with idle release, even if Codex resolves
+				// the request and completes the turn before WriteRaw returns.
+				q.RPCMu.Lock()
+			}
 			err := app.WriteRaw(mustJSON(raw))
+			if q != nil {
+				if err == nil {
+					a.queueMu.Lock()
+					q.SessionApproval = true
+					a.queueMu.Unlock()
+				}
+				q.RPCMu.Unlock()
+			}
 			a.mu.Lock()
 			if current, exists := a.approvals[key]; exists {
 				if err == nil {
@@ -784,7 +804,7 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		return
 	}
 	if req.Method == "codexrm/info" {
-		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "conversationTools": true, "providerModels": true, "providerManagement": a.supportsProviderManagement(), "sameModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "", "threadModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "" && a.cfg.DataDir != "", "messageQueue": true, "images": true, "directFiles": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize}, "desktopShare": desktop.ReceivesFiles, "desktopControl": runtime.GOOS == "windows", "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
+		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "conversationTools": true, "providerModels": true, "providerManagement": a.supportsProviderManagement(), "sameModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "", "threadModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "" && a.cfg.DataDir != "", "messageQueue": true, "images": true, "directFiles": a.supportsDirectFiles(), "computerFiles": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize, "relayImages": true}, "desktopShare": desktop.ReceivesFiles, "desktopControl": runtime.GOOS == "windows", "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
 		a.mu.Lock()
 		pending := []approval{}
 		for _, p := range a.approvals {
@@ -810,6 +830,10 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 	}
 	if env.ClientKind == protocol.ClientKindRobot {
 		a.handleRobot(ctx, app, send, env, req.Method, params)
+		return
+	}
+	if direct == nil && protocol.RequiresDirectFileTransfer(req.Method, env.Message) {
+		a.respond(send, env, nil, errors.New(protocol.FileTransferDirectRequired))
 		return
 	}
 	if strings.HasPrefix(req.Method, protocol.DirectFilePrefix) {
@@ -860,8 +884,8 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		a.respond(send, env, mustJSON(result), err)
 		return
 	}
-	if strings.HasPrefix(req.Method, "codexrm/attachment/") {
-		result, err := a.attachmentRPC(env.ClientID, req.Method, params)
+	if strings.HasPrefix(req.Method, "codexrm/attachment/") || strings.HasPrefix(req.Method, protocol.ChatImagePrefix) {
+		result, err := a.attachmentRPC(env.ClientID, req.Method, params, direct)
 		a.respond(send, env, mustJSON(result), err)
 		return
 	}
@@ -901,24 +925,34 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 }
 func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.RawMessage, err error) {
 	var req struct {
-		ID json.RawMessage `json:"id"`
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
 	}
 	_ = json.Unmarshal(env.Message, &req)
 	if len(req.ID) == 0 {
 		return
 	}
 	tooLarge := &appserver.RPCError{Code: -32000, Message: "响应内容过大，无法通过当前连接传输。"}
+	switch req.Method {
+	case "thread/start", "turn/start", "turn/steer", "codexrm/queue/add":
+		// The request already ran if only the successful reply exceeded the relay limit.
+		tooLarge.Code = protocol.RPCOutcomeUnknownCode
+	}
 	if err == nil && len(result) > maxRPCPayloadBytes {
 		err = tooLarge
 	}
 	resp := map[string]any{"id": req.ID}
+	var rpcError *appserver.RPCError
 	if err != nil {
-		rpc := &appserver.RPCError{Code: -32000, Message: err.Error()}
+		rpcError = &appserver.RPCError{Code: -32000, Message: err.Error()}
+		var unknown *appserver.OutcomeUnknown
 		var original *appserver.RPCError
-		if errors.As(err, &original) {
-			rpc = original
+		if errors.As(err, &unknown) {
+			rpcError.Code = protocol.RPCOutcomeUnknownCode
+		} else if errors.As(err, &original) {
+			rpcError = original
 		}
-		resp["error"] = rpc
+		resp["error"] = rpcError
 	} else {
 		if len(result) == 0 {
 			result = json.RawMessage("null")
@@ -927,6 +961,9 @@ func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.Ra
 	}
 	message := mustJSON(resp)
 	if len(message) > maxRPCPayloadBytes {
+		if rpcError != nil {
+			tooLarge.Code = rpcError.Code
+		}
 		message = mustJSON(map[string]any{"id": req.ID, "error": tooLarge})
 	}
 	_ = send.write(protocol.Envelope{Type: protocol.TypeServerMessage, ClientID: env.ClientID, StreamID: env.StreamID, Message: message})

@@ -1,0 +1,16 @@
+{
+  "configurations": [
+    {
+      "mode": "full",
+      "primaryinterface": "203.0.113.10",
+      "altinterface": "198.51.100.10",
+      "primaryport": "3478",
+      "altport": "3479",
+      "family": "4",
+      "protocol": "udp",
+      "primaryadvertised": "",
+      "altadvertised": "",
+      "ddp": "1"
+    }
+  ]
+}

@@ -3,11 +3,12 @@ package com.codexrm.mobile
 import android.content.Context
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.app.AlertDialog
+import android.text.Layout
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.SpannedString
 import android.text.method.LinkMovementMethod
+import android.text.style.AlignmentSpan
 import android.text.style.URLSpan
 import android.text.style.ClickableSpan
 import android.text.style.ForegroundColorSpan
@@ -143,14 +144,14 @@ internal class Markdown(
         })
         .build()
 
-    fun bind(view: TextView, message: ChatMessage, prepared: Spanned? = null, preserveMathScroll: Boolean = false) {
+    fun bind(view: TextView, message: ChatMessage, prepared: Spanned? = null, preserveMathScroll: Boolean = false): Boolean {
         val rendered = prepared ?: message.rendered as? Spanned ?: when (message.kind) {
             MessageKind.TOOL, MessageKind.ERROR, MessageKind.STATUS -> SpannedString(message.body)
             else -> render(message.body, message.id)
         }.also { message.rendered = it }
-        val wide = message.kind != MessageKind.USER ||
-            rendered.getSpans(0, rendered.length, TableSpan::class.java).isNotEmpty() ||
-            rendered.getSpans(0, rendered.length, AsyncDrawableSpan::class.java).isNotEmpty()
+        val user = message.kind == MessageKind.USER
+        val imageSpans = if (user) rendered.getSpans(0, rendered.length, AsyncDrawableSpan::class.java) else emptyArray()
+        val wide = !user || imageSpans.isNotEmpty() || rendered.getSpans(0, rendered.length, TableSpan::class.java).isNotEmpty()
         view.layoutParams.width = if (wide) ViewGroup.LayoutParams.MATCH_PARENT else ViewGroup.LayoutParams.WRAP_CONTENT
         if (preserveMathScroll) {
             val previous = view.text as? Spanned
@@ -160,8 +161,22 @@ internal class Markdown(
                 if (before.drawable.destination == after.drawable.destination) after.restoreOffset(before.offset)
             }
         }
+        // Keep inline Markdown images in their prose. A standalone image takes the sender's side.
+        var aligned: SpannableString? = null
+        for (image in imageSpans) {
+            val start = rendered.getSpanStart(image)
+            val end = rendered.getSpanEnd(image)
+            val lineStart = rendered.lastIndexOf('\n', start - 1) + 1
+            val lineEnd = rendered.indexOf('\n', end).let { if (it < 0) rendered.length else it }
+            if (!(lineStart until start).all { rendered[it].isWhitespace() } ||
+                !(end until lineEnd).all { rendered[it].isWhitespace() }) continue
+            val text = aligned ?: SpannableString(rendered).also { aligned = it }
+            val paragraphEnd = if (lineEnd < rendered.length) lineEnd + 1 else lineEnd
+            text.setSpan(AlignmentSpan.Standard(Layout.Alignment.ALIGN_OPPOSITE), lineStart, paragraphEnd, Spanned.SPAN_PARAGRAPH)
+        }
         // Bind table and image hooks and detach image callbacks from the old content.
-        markwon.setParsedMarkdown(view, rendered)
+        markwon.setParsedMarkdown(view, aligned ?: rendered)
+        return imageSpans.isNotEmpty()
     }
 
     fun clear(view: TextView) = markwon.setParsedMarkdown(view, SpannedString(""))
@@ -209,7 +224,7 @@ internal class Markdown(
                 return view
             }
         }
-        AlertDialog.Builder(context).setTitle(language).setView(list)
+        MiuixDialog.Builder(context).setTitle(language).setView(list)
             .setNeutralButton("复制代码") { _, _ ->
                 context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(language, code))
             }.setPositiveButton("关闭", null).show()

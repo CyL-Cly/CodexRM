@@ -1,8 +1,6 @@
 package com.codexrm.mobile
 
 import android.app.Activity
-import android.app.AlertDialog
-import android.app.Dialog
 import android.content.ClipData
 import android.content.Intent
 import android.graphics.Color
@@ -21,10 +19,17 @@ import android.widget.BaseAdapter
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
-import android.widget.PopupMenu
-import android.widget.ProgressBar
-import android.widget.ScrollView
 import android.widget.Toast
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import top.yukonga.miuix.kmp.basic.BasicComponent
+import top.yukonga.miuix.kmp.basic.TextButton
 import java.io.IOException
 import kotlin.concurrent.thread
 
@@ -36,6 +41,8 @@ internal data class PhoneFolder(val tree: Uri, val id: String) {
 internal class WorkspaceFilesDialog(
     private val activity: Activity,
     private val source: RemoteFile,
+    private val computerFiles: Boolean,
+    startAtComputer: Boolean,
     private val client: () -> CodexClient?,
     private val downloads: WorkspaceDownloads,
     private val chooseFolder: () -> Unit,
@@ -50,10 +57,11 @@ internal class WorkspaceFilesDialog(
     private var tree = rootFolder()?.tree
     private var selectionMode = false
     private val selected = linkedSetOf<String>()
-    private var actionDialog: Dialog? = null
+    private var actionDialog: MiuixDialogHost? = null
     private var localWrite = false
-    private val dialog = Dialog(activity)
-    private val remote = Pane("电脑", "monitor")
+    private val dialog = PredictiveBackDialog(activity)
+    private val initialWorkspacePath = if (computerFiles && !startAtComputer) workspacePath() else emptyList()
+    private val remote = Pane("电脑", "monitor", initialWorkspacePath)
     private val phone = Pane("手机", "phone")
     private var active = remote
     private val pathLabel = Ui.text(activity, size = 16f, bold = true).apply {
@@ -89,7 +97,7 @@ internal class WorkspaceFilesDialog(
         root.addView(panes, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)))
         root.addView(bottom)
-        dialog.setContentView(root)
+        dialog.setBackContent(root)
         dialog.setOnDismissListener {
             actionDialog?.dismiss()
             remote.epoch++
@@ -123,9 +131,36 @@ internal class WorkspaceFilesDialog(
         phone.path.lastOrNull()?.let { PhoneFolder(root.tree, it.key) } ?: root
     }
 
-    private fun remoteFile(entry: Entry) = source.copy(path = (remote.path.map { it.key } + entry.key).joinToString("/"))
+    private fun workspacePath(): List<Entry> {
+        val path = source.workspace
+        val windows = path.length >= 3 && path[1] == ':' && path[2] in "/\\"
+        if (!windows && !path.startsWith('/')) return emptyList()
+        val root = if (windows) path.take(2) + "\\" else "/"
+        val relative = if (windows) path.drop(3).replace('\\', '/') else path.drop(1)
+        return listOf(Entry(root, root, true, 0)) + relative.split('/').filter { it.isNotEmpty() && it != "." }
+            .map { Entry(it, it, true, 0) }
+    }
+
+    private fun computerPath(entries: List<Entry>): String {
+        val root = entries.firstOrNull()?.key ?: return ""
+        val separator = if (root.endsWith('\\')) "\\" else "/"
+        return root + entries.drop(1).joinToString(separator) { it.key }
+    }
+
+    private fun remoteSource(entries: List<Entry>): RemoteFile {
+        if (!computerFiles) return source.copy(path = entries.joinToString("/") { it.key })
+        val workspaceDepth = initialWorkspacePath.size
+        // Keep the workspace shortcut usable when the registered workspace is a directory alias.
+        if (workspaceDepth > 0 && entries.take(workspaceDepth).map { it.key } == initialWorkspacePath.map { it.key }) {
+            return source.copy(path = entries.drop(workspaceDepth).joinToString("/") { it.key })
+        }
+        return source.copy(path = computerPath(entries), computer = true)
+    }
+
+    private fun remoteFile(entry: Entry) = remoteSource(remote.path + entry)
 
     private fun pathOf(pane: Pane): String {
+        if (pane === remote && computerFiles) return computerPath(pane.path).ifEmpty { "此电脑" }
         val base = if (pane === remote) source.workspace.ifBlank { "工作区" } else rootFolder()?.label ?: downloads.locationLabel
         return if (pane.path.isEmpty()) base else base.trimEnd('\\', '/') + "/" + pane.path.joinToString("/") { it.name }
     }
@@ -138,11 +173,19 @@ internal class WorkspaceFilesDialog(
             return
         }
         remote.loading("加载中…")
-        val path = remote.path.joinToString("/") { it.key }
-        connection.requestDirectFile("list", source.copy(path = path).params()) { result, error ->
+        val showRoots = computerFiles && remote.path.isEmpty()
+        val method = if (showRoots) "roots" else "list"
+        connection.requestDirectFile(method, remoteSource(remote.path).params()) { result, error ->
             if (id != remote.epoch || !dialog.isShowing) return@requestDirectFile
             if (error != null || result == null) {
                 remote.fail("读取失败", error?.message ?: "无法读取电脑目录")
+                return@requestDirectFile
+            }
+            if (showRoots) {
+                val roots = result.arrayAt("roots")
+                remote.bind((0 until roots.length()).mapNotNull { i ->
+                    roots.optString(i).takeIf { it.isNotEmpty() }?.let { Entry(it, it, true, 0) }
+                }, "")
                 return@requestDirectFile
             }
             val rows = result.arrayAt("entries")
@@ -285,11 +328,17 @@ internal class WorkspaceFilesDialog(
     }
 
     private fun showOverflow(anchor: View) {
-        PopupMenu(activity, anchor).apply {
-            menu.add("刷新两侧目录").setOnMenuItemClickListener { loadRemote(); loadPhone(); true }
-            menu.add("选择手机目录").setOnMenuItemClickListener { chooseFolder(); true }
-            show()
+        val options = linkedMapOf<String, () -> Unit>()
+        if (computerFiles) options["此电脑"] = {
+            activate(remote)
+            if (remote.path.isNotEmpty()) remote.goTo(emptyList()) else loadRemote()
         }
+        options["刷新两侧目录"] = { loadRemote(); loadPhone() }
+        options["选择手机目录"] = chooseFolder
+        val menu = showMiuixMenu(anchor, options)
+        actionDialog?.dismiss()
+        actionDialog = menu
+        menu.setOnDismissListener { if (actionDialog === menu) actionDialog = null }
     }
 
     private data class Action(
@@ -370,64 +419,35 @@ internal class WorkspaceFilesDialog(
                 selectionChanged()
             }) else null, if (selectionMode) "已在多选模式" else "一次只能选择一项"),
         )
-        val menu = Dialog(activity)
+        val menu = MiuixDialogHost(activity)
+        val title = single?.name ?: "已选 ${entries.size} 项"
+        val location = folder?.label ?: downloads.locationLabel
+        val subtitle = if (fromComputer) "共 ${entries.size} 项 · 电脑 → 手机（$location）"
+        else "共 ${entries.size} 项 · 来源：手机（$location）"
         actionDialog = menu
-        val panel = Ui.column(activity).apply { background = Ui.rounded(Ui.SURFACE_ALT, dp(16).toFloat(), Ui.BORDER) }
-        val header = Ui.column(activity, false).apply { gravity = Gravity.CENTER_VERTICAL }
-        val labels = Ui.column(activity).apply {
-            setPadding(dp(16), dp(9), 0, dp(9))
-            addView(Ui.text(activity, single?.name ?: "已选 ${entries.size} 项", 16f, bold = true).apply {
-                maxLines = 1; ellipsize = TextUtils.TruncateAt.MIDDLE
-            })
-            val subtitle = if (fromComputer) "共 ${entries.size} 项 · 电脑 → 手机（${folder?.label ?: downloads.locationLabel}）"
-            else "共 ${entries.size} 项 · 来源：手机（${folder?.label ?: downloads.locationLabel}）"
-            addView(Ui.text(activity, subtitle, 12f, Ui.MUTED).apply { maxLines = 2 })
-        }
-        header.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
-        header.addView(Ui.iconButton(activity, "close", "关闭操作菜单") { menu.dismiss() })
-        panel.addView(header)
-        panel.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)))
-        val grid = Ui.column(activity).apply { setPadding(dp(8), dp(6), dp(8), dp(6)) }
-        actions.chunked(2).forEach { pair ->
-            val row = Ui.column(activity, false)
-            pair.forEach { action -> row.addView(actionCell(menu, action), LinearLayout.LayoutParams(0, -2, 1f)) }
-            if (pair.size == 1) row.addView(View(activity), LinearLayout.LayoutParams(0, -2, 1f))
-            grid.addView(row)
-        }
-        panel.addView(grid)
-        menu.setContentView(ScrollView(activity).apply { addView(panel) })
-        menu.setOnDismissListener { if (actionDialog === menu) actionDialog = null }
-        menu.show()
-        val availableWidth = dialog.window?.decorView?.width?.takeIf { it > 0 } ?: activity.resources.displayMetrics.widthPixels
-        menu.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            setDimAmount(0.32f)
-            setLayout(minOf(availableWidth - dp(40), dp(420)), -2)
-            setGravity(Gravity.CENTER)
-        }
-    }
-
-    private fun actionCell(menu: Dialog, action: Action): View = Ui.column(activity, false).apply {
-        gravity = Gravity.CENTER_VERTICAL
-        minimumHeight = dp(60)
-        setPadding(dp(10), dp(6), dp(6), dp(6))
-        val enabled = action.run != null
-        val color = if (!enabled) Ui.DIM else if (action.icon == "copy") Ui.GREEN else Ui.TEXT
-        addView(IconView(activity, action.icon, color), LinearLayout.LayoutParams(dp(22), dp(22)))
-        val labels = Ui.column(activity).apply {
-            addView(Ui.text(activity, action.label, 15f, color))
-            if (!enabled && action.disabledReason.isNotEmpty()) {
-                addView(Ui.text(activity, action.disabledReason, 12f, Ui.MUTED).apply { maxLines = 3 })
+        menu.setContent(title = { title }, summary = subtitle) { close ->
+            Column {
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                    actions.forEach { action ->
+                        BasicComponent(
+                            title = action.label,
+                            summary = action.disabledReason.takeIf(String::isNotBlank),
+                            enabled = action.run != null,
+                            startAction = {
+                                AndroidView(
+                                    factory = { ctx -> IconView(ctx, action.icon, if (action.run != null) Ui.TEXT else Ui.DIM) },
+                                    modifier = Modifier.size(22.dp),
+                                )
+                            },
+                            onClick = action.run?.let { run -> { close(); run() } },
+                        )
+                    }
+                }
+                TextButton("关闭", close, Modifier.fillMaxWidth())
             }
         }
-        addView(labels, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(10) })
-        contentDescription = if (enabled) action.label else "${action.label}，不可用：${action.disabledReason}"
-        isEnabled = enabled
-        isFocusable = true
-        if (enabled) {
-            background = Ui.ripple(Color.TRANSPARENT, dp(8).toFloat())
-            setOnClickListener { menu.dismiss(); action.run.invoke() }
-        }
+        menu.setOnDismissListener { if (actionDialog === menu) actionDialog = null }
+        menu.show()
     }
 
     private fun documentUri(folder: PhoneFolder, entry: Entry) = DocumentsContract.buildDocumentUriUsingTree(folder.tree, entry.key)
@@ -437,7 +457,7 @@ internal class WorkspaceFilesDialog(
         val directories = entries.count { it.dir }
         val files = entries.filterNot { it.dir }
         val size = if (files.isNotEmpty() && files.all { it.size >= 0 }) "\n文件大小 ${AttachmentStore.sizeLabel(files.sumOf { it.size })}" else ""
-        AlertDialog.Builder(activity).setTitle(single?.name ?: "已选 ${entries.size} 项")
+        MiuixDialog.Builder(activity).setTitle(single?.name ?: "已选 ${entries.size} 项")
             .setMessage("${pane.title} · ${pathOf(pane)}\n文件夹 $directories  ·  文件 ${files.size}$size")
             .setPositiveButton("关闭", null).show()
     }
@@ -445,7 +465,7 @@ internal class WorkspaceFilesDialog(
     private fun confirmDelete(folder: PhoneFolder, entries: List<Entry>) {
         val target = entries.singleOrNull()?.name ?: "所选的 ${entries.size} 项"
         val description = if (entries.any { it.dir }) "文件夹内的内容也会删除。" else "此操作无法撤销。"
-        AlertDialog.Builder(activity).setTitle("删除 $target？").setMessage(description)
+        MiuixDialog.Builder(activity).setTitle("删除 $target？").setMessage(description)
             .setNegativeButton("取消", null).setPositiveButton("删除") { _, _ ->
                 modifyPhone(entries.size) {
                     entries.count { entry -> runCatching { DocumentsContract.deleteDocument(activity.contentResolver, documentUri(folder, entry)) }.getOrDefault(false) }
@@ -454,15 +474,15 @@ internal class WorkspaceFilesDialog(
     }
 
     private fun rename(folder: PhoneFolder, entry: Entry) {
-        val input = Ui.input(activity, "名称").apply { setText(entry.name); setSelectAllOnFocus(true) }
-        val container = Ui.column(activity).apply { setPadding(dp(24), 0, dp(24), 0); addView(input) }
-        val prompt = AlertDialog.Builder(activity).setTitle("重命名").setView(container)
+        val input = MiuixFieldView(activity, "名称", entry.name)
+        val prompt = MiuixDialog.Builder(activity).setTitle("重命名").setView(input)
             .setNegativeButton("取消", null).setPositiveButton("保存", null).create()
         prompt.show()
-        prompt.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-            val name = input.text.toString()
+        prompt.getButton(MiuixDialog.POSITIVE).setOnClickListener {
+            val name = input.text
             if (name.isBlank() || name == "." || name == ".." || '/' in name || '\\' in name) {
                 input.error = "请输入有效的名称"
+                input.focusInput()
             } else {
                 prompt.dismiss()
                 if (name != entry.name) modifyPhone(1) {
@@ -505,9 +525,9 @@ internal class WorkspaceFilesDialog(
     private fun dp(value: Int) = Ui.dp(activity, value)
     private fun divider() = View(activity).apply { setBackgroundColor(Ui.BORDER) }
 
-    private inner class Pane(val title: String, icon: String) {
+    private inner class Pane(val title: String, icon: String, initialPath: List<Entry> = emptyList()) {
         var epoch = 0
-        private val history = mutableListOf<List<Entry>>(emptyList())
+        private val history = mutableListOf(initialPath)
         private var cursor = 0
         val path: List<Entry> get() = history[cursor]
         val canBack: Boolean get() = cursor > 0
@@ -531,8 +551,7 @@ internal class WorkspaceFilesDialog(
             setPadding(dp(10), dp(10), dp(8), dp(8))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
-        private val progress = ProgressBar(activity).apply {
-            isIndeterminate = true
+        private val progress = MiuixProgressView(activity).apply {
             contentDescription = "正在加载${title}目录"
         }
         private val statusTitle = Ui.text(activity, size = 14f, bold = true)

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,18 +26,32 @@ func main() {
 	enrollKey := flag.String("enroll-key", os.Getenv("CODEXRM_ENROLL_KEY"), "key required to register remote agents")
 	publicEnrollment := flag.Bool("public-enrollment", false, "allow agent registration without a shared key")
 	stun := flag.String("p2p-stun", os.Getenv("CODEXRM_P2P_STUN"), "comma-separated IPv4:port or [IPv6]:port STUN endpoints; empty disables public P2P")
+	natSTUN := flag.String("p2p-nat-stun", os.Getenv("CODEXRM_P2P_NAT_STUN"), "optional comma-separated IPv4:port STUN endpoints for NAT diagnosis; defaults to IPv4 endpoints in --p2p-stun")
+	natCheck := flag.Bool("check-nat-stun", false, "validate endpoints set by --p2p-nat-stun without starting the RM; exits nonzero if any fail")
 	lan := flag.Bool("p2p-lan", true, "allow paired peers to try on-link IPv4 direct connections")
-	verifyListen := flag.String("p2p-verify-listen", os.Getenv("CODEXRM_P2P_VERIFY_LISTEN"), "local IPv4:UDP port for candidate verification")
-	verifyPublic := flag.String("p2p-verify-public", os.Getenv("CODEXRM_P2P_VERIFY_PUBLIC"), "public IPv4:UDP port for candidate verification")
-	verifyMore := flag.String("p2p-verify-more", os.Getenv("CODEXRM_P2P_VERIFY_MORE"), "up to three additional public IPv4:UDP verification endpoints")
+	verifyListen := flag.String("p2p-verify-listen", os.Getenv("CODEXRM_P2P_VERIFY_LISTEN"), "local UDP endpoint for candidate verification")
+	verifyPublic := flag.String("p2p-verify-public", os.Getenv("CODEXRM_P2P_VERIFY_PUBLIC"), "public UDP endpoint for candidate verification")
+	verifyMore := flag.String("p2p-verify-more", os.Getenv("CODEXRM_P2P_VERIFY_MORE"), "up to three additional public UDP verification endpoints")
 	verifyKeyFile := flag.String("p2p-verify-key-file", os.Getenv("CODEXRM_P2P_VERIFY_KEY_FILE"), "file with the 32-byte hex key shared by trusted UDP verifiers")
 	verifyOnly := flag.Bool("p2p-verify-only", false, "serve only the UDP verifier using the shared key file")
 	trustProxy := flag.Bool("p2p-trust-loopback-proxy", false, "trust X-Real-IP and X-Forwarded-Proto from a local TLS reverse proxy")
 	flag.Parse()
+	if *natCheck {
+		if *verifyOnly {
+			log.Fatal("--check-nat-stun and --p2p-verify-only are mutually exclusive")
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		if err := checkNATSTUN(ctx, *natSTUN); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *verifyOnly {
 		listen, err := netip.ParseAddrPort(*verifyListen)
-		if err != nil || !listen.Addr().Is4() || listen.Port() == 0 || *verifyKeyFile == "" {
-			log.Fatal("UDP verifier mode requires a local IPv4:UDP listen address and a shared key file")
+		if err != nil || listen.Addr().Zone() != "" || listen.Addr().Is4In6() || listen.Port() == 0 || *verifyKeyFile == "" {
+			log.Fatal("UDP verifier mode requires a local UDP listen address and a shared key file")
 		}
 		v, err := p2p.ListenVerifier(listen, *verifyKeyFile)
 		if err != nil {
@@ -62,6 +77,7 @@ func main() {
 		PublicEnrollment: *publicEnrollment,
 		UpdateDir:        *updateDir,
 		P2PSTUN:          *stun,
+		P2PNATSTUN:       *natSTUN,
 		P2PLAN:           *lan,
 		P2PVerifyListen:  *verifyListen,
 		P2PVerifyPublic:  *verifyPublic,
@@ -87,6 +103,40 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+func checkNATSTUN(ctx context.Context, raw string) error {
+	fields := strings.Split(raw, ",")
+	if len(fields) > 4 {
+		return fmt.Errorf("--check-nat-stun requires one to four --p2p-nat-stun IPv4:UDP-port endpoints")
+	}
+	endpoints := make([]netip.AddrPort, 0, len(fields))
+	for _, value := range fields {
+		addr, err := netip.ParseAddrPort(strings.TrimSpace(value))
+		if err != nil || !addr.Addr().Is4() || addr.Port() == 0 {
+			return fmt.Errorf("--check-nat-stun requires one to four --p2p-nat-stun IPv4:UDP-port endpoints")
+		}
+		endpoints = append(endpoints, addr)
+	}
+	ok := true
+	for _, dst := range endpoints {
+		classic, modern := p2p.CheckNATSTUN(ctx, dst)
+		for _, test := range []struct {
+			protocol string
+			err      error
+		}{{"RFC 3489", classic}, {"RFC 5780", modern}} {
+			if test.err != nil {
+				log.Printf("%s %s not validated: %v", dst, test.protocol, test.err)
+				ok = false
+			} else {
+				log.Printf("%s %s passed (Binding and changed source)", dst, test.protocol)
+			}
+		}
+	}
+	if !ok {
+		return fmt.Errorf("not all endpoints passed; verify the STUN server and the checker's IPv4 UDP path")
+	}
+	return nil
 }
 
 func resolveWebDir(path string) (string, error) {

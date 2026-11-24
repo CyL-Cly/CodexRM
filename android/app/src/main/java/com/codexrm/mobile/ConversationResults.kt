@@ -1,6 +1,5 @@
 ﻿package com.codexrm.mobile
 
-import android.app.AlertDialog
 import android.content.Context
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -9,7 +8,7 @@ import org.json.JSONObject
 internal class ConversationResults(
     context: Context,
     title: String,
-    show: (AlertDialog.Builder) -> AlertDialog,
+    show: (MiuixDialog.Builder) -> MiuixDialog,
 ) {
     val content = Ui.column(context).apply {
         setPadding(Ui.dp(context, 20), Ui.dp(context, 8), Ui.dp(context, 20), Ui.dp(context, 12))
@@ -17,7 +16,7 @@ internal class ConversationResults(
     val results = Ui.column(context)
     val status = Ui.text(context, "", 13f, Ui.MUTED)
     val more = Ui.button(context, "继续加载") {}
-    val dialog: AlertDialog = show(AlertDialog.Builder(context).setTitle(title).setView(content)
+    val dialog: MiuixDialog = show(MiuixDialog.Builder(context).setTitle(title).setView(content)
         .setPositiveButton("关闭", null))
 
     init {

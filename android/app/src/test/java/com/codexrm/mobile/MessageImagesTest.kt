@@ -83,6 +83,20 @@ class MessageImagesTest {
         assertNull(MessageImage.fromSource("content://other.app/private"))
     }
 
+    @Test fun markdownImagesResolveEncodedWorkspaceAndWindowsPaths() {
+        val relative = MessageImage.fromMarkdown("reports/%E5%9B%BE%20A%2BB.png", link = true)
+        assertEquals("reports/图 A+B.png", relative?.source)
+        assertEquals("图 A+B.png", relative?.name)
+        assertEquals("E:/报告 图.PNG", MessageImage.fromMarkdown("file:///E:/报告 图.PNG", link = true)?.source)
+        assertEquals("/mnt/data/test#1.png", MessageImage.fromMarkdown("sandbox:/mnt/data/test%231.png")?.source)
+        assertEquals("https://example.test/pic.png?signature=123", MessageImage.fromMarkdown(
+            "https://example.test/pic.png?signature=123", link = true,
+        )?.source)
+        assertNull(MessageImage.fromMarkdown("file://host/remote.png", link = true))
+        assertNull(MessageImage.fromMarkdown("report.pdf", link = true))
+        assertNull(MessageImage.fromMarkdown("https://example.test/guide", link = true))
+    }
+
     @Test fun cachesSeparateDevicesAndRelativePathsButUploadsSurviveWorkspaceChanges() {
         val image = MessageImage("preview.png")
         assertNotEquals(image.cacheKey("agent-a", "/one"), image.cacheKey("agent-b", "/one"))

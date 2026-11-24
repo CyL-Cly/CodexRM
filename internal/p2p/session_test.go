@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codexrm/codexrm/internal/protocol"
 )
@@ -40,5 +41,87 @@ func TestConnectWithUnpredictableMappings(t *testing.T) {
 				t.Fatalf("Connect returned %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestPrepareWithoutLocalUDPCandidates(t *testing.T) {
+	start := protocol.P2P("start", "test-session-without-peer-candidates")
+	start.LAN = true // LAN-only, and the client has no usable local prefix.
+	start.Secret = strings.Repeat("ab", 32)
+	if session, _, err := PrepareWithLocalPrefixes(t.Context(), false, *start, nil); err == nil {
+		session.Close()
+		t.Fatal("accepted a pin-only offer without negotiation")
+	}
+	start.ClientInitiated = true
+	session, offer, err := PrepareWithLocalPrefixes(t.Context(), false, *start, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if len(offer.Pin) != 64 || len(offer.Candidates) != 0 || len(offer.Local) != 0 {
+		t.Fatalf("expected a pin-only offer, got %+v", offer)
+	}
+	if agent, _, err := PrepareWithLocalPrefixes(t.Context(), true, *start, nil); err == nil {
+		agent.Close()
+		t.Fatal("allowed the Agent to offer no candidates")
+	}
+}
+
+func TestDirectRacesCandidatesAndUsesAlternateSocketForQUIC(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	defer cancel()
+	start := protocol.P2P("start", "test-session-without-peer-candidates")
+	start.Secret, start.ClientInitiated = strings.Repeat("ab", 32), true
+	agent, offerAgent, err := PrepareWithLocalPrefixes(ctx, true, *start, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	client, offerClient, err := PrepareWithLocalPrefixes(ctx, false, *start, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	alt, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2)})
+	if err != nil {
+		t.Skipf("alternate loopback unavailable: %v", err)
+	}
+	agent.sockets, agent.pathSockets = append(agent.sockets, alt), 2
+	_, dead := loopbackUDP(t) // No reply; the second address must be tried anyway.
+	offerAgent.Candidates = []string{dead.String(), alt.LocalAddr().String()}
+	// The client initiates because its advertised mapping is unreachable.
+	offerClient.Candidates = nil
+	ready := make(chan struct{})
+	clientReady := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		link, err := agent.Connect(ctx, *offerClient, clientReady, func() error { close(ready); return nil })
+		if err == nil {
+			defer link.Close()
+			if !link.UsesBoundSource() {
+				err = errors.New("QUIC did not use the alternate bound socket")
+			} else {
+				err = link.Write([]byte("alternate path"))
+			}
+			if err == nil {
+				_, err = link.Read()
+			}
+		}
+		done <- err
+	}()
+	link, err := client.Connect(ctx, *offerAgent, ready, func() error { close(clientReady); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer link.Close()
+	message, err := link.Read()
+	if err != nil || string(message) != "alternate path" {
+		t.Fatalf("read = %q, %v", message, err)
+	}
+	if err := link.Write([]byte("received")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

@@ -284,12 +284,33 @@ func TestProviderRoutingWithLocalCodex(t *testing.T) {
 		t.Fatal("missing supplier silently fell back on resume")
 	}
 
+	// Opening without the original provider must only read history, even after
+	// an Agent restart, and must let the user switch to a different endpoint.
+	opened := lifecycleCall(t, a, app, "thread/resume", map[string]any{"threadId": threads[0]})
+	thread = opened["thread"].(map[string]any)
+	if thread["id"] != threads[0] || thread["codexrmProviderUnavailable"] != true || len(thread["turns"].([]any)) == 0 {
+		t.Fatalf("missing supplier prevented reading the same thread: %v", thread)
+	}
+	if _, err := a.callThread(ctx, app, "owner", "turn/start", queueInput(threads[0], "must not send")); err != errProviderUnavailable {
+		t.Fatalf("sending without a supplier was not explicitly blocked: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO providers (id, app_type, name, settings_config) VALUES ('1', 'codex', 'Same', '{}')"); err != nil {
+		t.Fatal(err)
+	}
+	update("1", "rotated-test-key-one")
+	switchFromClient(map[string]any{"threadId": threads[0], "providerId": items[0].ID, "model": "another-model"})
+	turnWithModel(threads[0], "/1", "rotated-test-key-one", "another-model", false)
+
 	// Migrate the selected provider, then remove the database from the Agent's
 	// configuration. A fresh Agent must still restore and route the old session.
 	if _, err := db.Exec("INSERT INTO providers (id, app_type, name, settings_config) VALUES ('2', 'codex', 'Same', '{}')"); err != nil {
 		t.Fatal(err)
 	}
 	update("2", "test-key-two")
+	switchFromClient(map[string]any{"threadId": threads[0], "providerId": items[1].ID, "model": "another-model"})
+	if _, err := db.Exec("DELETE FROM providers WHERE id = '1'"); err != nil {
+		t.Fatal(err)
+	}
 	if count, err := a.providerStore().ImportCCSwitch(ctx, path); err != nil || count != 1 {
 		t.Fatalf("import count=%d, err=%v", count, err)
 	}

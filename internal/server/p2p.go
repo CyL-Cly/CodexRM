@@ -21,8 +21,12 @@ type directPair struct {
 	agent                                                               *peer
 	deadline                                                            time.Time
 	agentTicket, clientTicket                                           string
-	lan, ipv6                                                           bool
+	lan, ipv6, clientInitiated                                          bool
 	agentOffer, clientOffer, agentReady, clientReady, requested, active bool
+}
+
+func publicVerifierIP(ip netip.Addr) bool {
+	return p2p.IsPublicIPv6(ip) || (ip.Is4() && ip.IsGlobalUnicast() && !ip.IsPrivate())
 }
 
 func (s *Server) startVerifier() error {
@@ -31,9 +35,10 @@ func (s *Server) startVerifier() error {
 	}
 	local, le := netip.ParseAddrPort(s.cfg.P2PVerifyListen)
 	public, pe := netip.ParseAddrPort(s.cfg.P2PVerifyPublic)
-	if len(s.stun) == 0 || le != nil || !local.Addr().Is4() || pe != nil || !public.Addr().Is4() ||
-		(!s.cfg.P2PLocalTest && (local.Port() == 0 || public.Port() == 0 || !public.Addr().IsGlobalUnicast() || public.Addr().IsPrivate())) {
-		return fmt.Errorf("P2P verification requires STUN plus local and advertised IPv4:UDP endpoints")
+	if len(s.stun) == 0 || le != nil || pe != nil || local.Addr().Zone() != "" || public.Addr().Zone() != "" ||
+		local.Addr().Is4In6() || public.Addr().Is4In6() || local.Addr().Is4() != public.Addr().Is4() ||
+		(!s.cfg.P2PLocalTest && (local.Port() == 0 || public.Port() == 0 || !publicVerifierIP(public.Addr()))) {
+		return fmt.Errorf("P2P verification requires STUN plus local and advertised UDP endpoints of the same IP family")
 	}
 	if s.cfg.P2PVerifyMore != "" && s.cfg.P2PVerifyKeyFile == "" {
 		return fmt.Errorf("additional P2P verifiers require a shared key file")
@@ -44,10 +49,10 @@ func (s *Server) startVerifier() error {
 			continue
 		}
 		addr, err := netip.ParseAddrPort(value)
-		if err != nil || !addr.Addr().Is4() || addr.Port() == 0 ||
+		if err != nil || addr.Addr().Zone() != "" || addr.Addr().Is4In6() || addr.Port() == 0 ||
 			addr == public || slices.Contains(s.verifyMore, addr.String()) || len(s.verifyMore) >= protocol.P2PMaxVerifiers-1 ||
-			(!s.cfg.P2PLocalTest && (!addr.Addr().IsGlobalUnicast() || addr.Addr().IsPrivate())) {
-			return fmt.Errorf("P2P verification requires up to %d distinct additional public IPv4:UDP endpoints", protocol.P2PMaxVerifiers-1)
+			(!s.cfg.P2PLocalTest && !publicVerifierIP(addr.Addr())) {
+			return fmt.Errorf("P2P verification requires up to %d distinct additional public UDP endpoints", protocol.P2PMaxVerifiers-1)
 		}
 		s.verifyMore = append(s.verifyMore, addr.String())
 	}
@@ -132,15 +137,7 @@ func (s *Server) stopDirectWithReason(client *peer, reason string) {
 }
 
 func directAlive(p *peer, now time.Time) bool {
-	if p == nil || !p.directIP.IsValid() || (!p.expires.IsZero() && !now.Before(p.expires)) {
-		return false
-	}
-	select {
-	case <-p.closed:
-		return false
-	default:
-		return true
-	}
+	return diagnosticPeerAlive(p, now) && p.directIP.IsValid()
 }
 
 func (s *Server) lanEligible(agent, client *peer) bool {
@@ -163,13 +160,20 @@ func (s *Server) directAvailable(agent, client *peer) bool {
 
 func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 	sig := env.P2P
-	if (len(s.stun) == 0 && !s.cfg.P2PLAN) || sig == nil || sig.Version != protocol.P2PVersion {
+	if sig == nil || sig.Version != protocol.P2PVersion {
+		return
+	}
+	if sig.Kind == "diagnose" || sig.Kind == "diagnose_result" {
+		s.handleNATDiagnostic(p, env)
 		return
 	}
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !directAlive(p, now) {
+	if p.role == protocol.RoleAgent && sig.Kind == "hello" && s.agents[p.agentID] == p {
+		p.natDiagnosticCapable = sig.NATDiagnostic
+	}
+	if (len(s.stun) == 0 && !s.cfg.P2PLAN) || !directAlive(p, now) {
 		return
 	}
 	var agent, client *peer
@@ -183,6 +187,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			}
 			p.directCapable = true
 			p.dualNATPunchCapable = sig.DualNATPunch
+			p.clientInitiatedCapable = sig.ClientInitiated
 			p.ipv6Capable = sig.IPv6
 			p.lanCapable = sig.LAN
 			routing := protocol.P2P("routing", "")
@@ -242,7 +247,9 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 		pair = &directPair{id: uuid.NewString(), agent: agent, deadline: now.Add(protocol.P2PAttempt), lan: lan, ipv6: ipv6}
 		start := protocol.P2P("start", pair.id)
 		start.Secret, start.STUN = hex.EncodeToString(key[:]), stun
-		start.LAN, start.IPv6 = lan, ipv6
+		start.LAN, start.IPv6, start.MultiPath = lan, ipv6, lan || len(stun) > 0
+		pair.clientInitiated = agent.clientInitiatedCapable && sig.ClientInitiated
+		start.ClientInitiated = pair.clientInitiated
 		start.DualNATPunch = len(stun) > 0 && agent.dualNATPunchCapable && sig.DualNATPunch
 		if s.verifier != nil {
 			var err error
@@ -283,7 +290,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			return
 		}
 		pin, err := hex.DecodeString(sig.Pin)
-		if err != nil || len(pin) != 32 || len(sig.Candidates) > protocol.P2PMaxCandidates || len(sig.Local) > protocol.P2PMaxCandidates || len(sig.Proofs) > protocol.P2PMaxVerifiers {
+		if err != nil || len(pin) != 32 || len(sig.Candidates) > protocol.P2PMaxCandidates || len(sig.Local) > protocol.P2PMaxCandidates || len(sig.Proofs) > protocol.P2PMaxCandidates || len(sig.PathMappings) > protocol.P2PMaxCandidates {
 			s.stopDirectWithReason(client, "invalid_offer")
 			return
 		}
@@ -307,12 +314,22 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 				continue
 			}
 			verified := false
-			if s.verifier != nil && ((a.Addr().IsGlobalUnicast() && !a.Addr().IsPrivate()) || (s.cfg.P2PLocalTest && a.Addr().IsLoopback())) {
+			if s.verifier != nil && (publicVerifierIP(a.Addr()) || (s.cfg.P2PLocalTest && a.Addr().IsLoopback())) {
 				verified = (i == 0 && s.verifier.Check(ticket, sig.Proof, a, now)) ||
-					(len(s.verifyMore) > 0 && s.verifier.Check(ticket, sig.Proofs[a.String()], a, now))
+					s.verifier.Check(ticket, sig.Proofs[a.String()], a, now)
 			}
 			if a.Addr() == p.directIP || verified {
 				forward.Candidates = append(forward.Candidates, a.String())
+				if a.Addr().Is4() {
+					hint := sig.PathMappings[a.String()]
+					mapping, step := protocol.NormalizeMapping(hint.Mapping, hint.Step)
+					if mapping != "" {
+						if forward.PathMappings == nil {
+							forward.PathMappings = make(map[string]protocol.P2PMappingHint)
+						}
+						forward.PathMappings[a.String()] = protocol.P2PMappingHint{Mapping: mapping, Step: step}
+					}
+				}
 			}
 		}
 		if pair.lan {
@@ -324,7 +341,9 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 				}
 			}
 		}
-		if len(forward.Candidates) == 0 && len(forward.Local) == 0 {
+		// With a pin-only client offer, the Agent learns the address from a
+		// session-authenticated UDP probe. The client still needs an Agent candidate.
+		if len(forward.Candidates) == 0 && len(forward.Local) == 0 && (p == agent || !pair.clientInitiated) {
 			reason := "client_candidate_unverified"
 			if p == agent {
 				reason = "agent_candidate_unverified"

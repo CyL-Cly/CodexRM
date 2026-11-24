@@ -210,6 +210,7 @@ function clearOutbox(entry) {
 
 const attachmentMarker = "[CodexRM attachment] ";
 const visionMimeTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const chatImageRPC = "codexrm/chatImage/";
 const cachedImageTypes = new Set([...visionMimeTypes, "image/bmp", "image/x-icon", "image/vnd.microsoft.icon", "image/avif"]);
 const maxHistoryImageBytes = 20 * 1024 * 1024;
 const historyImageDisk = {
@@ -343,7 +344,12 @@ function renderAttachments() {
   }
   hydrateAttachmentImages();
 }
+function isRelayImage(name, type) {
+  const mime = (type || "").split(";", 1)[0].toLowerCase();
+  return visionMimeTypes.has(mime) || ((!mime || mime === "application/octet-stream") && /\.(png|jpe?g|gif|webp)$/i.test(name));
+}
 function attachmentBlockedReason() {
+  if (state.fileTransferDirectOnly && !state.info?.attachments?.relayImages) return "请更新本地 Agent 以通过中继发送图片";
   if (!state.online) return "设备离线，请先启动本地 Agent";
   if (!state.loaded || state.loading) return "正在同步工作区，请稍候再添加附件";
   if (state.readOnly) return "此会话由另一个 Codex 实例运行，不能添加附件";
@@ -359,6 +365,10 @@ async function addAttachments(inputFiles) {
   const files = (state.attachmentDrafts[key] ||= []);
   const pending = [];
   for (const file of inputFiles) {
+    if (state.fileTransferDirectOnly && !isRelayImage(file.name, file.type)) {
+      toast("中继仅支持 PNG、JPEG、GIF 或 WebP 聊天图片，其他文件需要安卓端 P2P 直连");
+      continue;
+    }
     if (files.length >= 10) { toast("每条消息最多添加 10 个附件"); break; }
     if (file.size > state.info.attachments.maxSize) { toast(`${file.name} 超过单个附件 20 MB 的限制`); continue; }
     if (files.reduce((sum, f) => sum + f.size, 0) + file.size > 50 * 1024 * 1024) { toast("每条消息的附件总大小不能超过 50 MB"); continue; }
@@ -389,7 +399,7 @@ function pasteAttachments(event) {
   const files = [...(event.clipboardData.items || [])]
     .filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter(Boolean);
   if (!files.length) files.push(...(event.clipboardData.files || []));
-  if (!files.length) return;
+  if (!files.length || (state.fileTransferDirectOnly && !files.some((file) => isRelayImage(file.name, file.type)))) return;
   event.preventDefault();
   return addAttachments(files).catch(showError);
 }
@@ -404,8 +414,11 @@ async function uploadAttachment(file, key) {
     if (key === draftKey()) { renderAttachments(); renderComposerControls(); }
   };
   render();
+  const relayImage = state.info?.attachments?.relayImages && isRelayImage(file.name, file.mimeType);
+  const prefix = relayImage ? chatImageRPC : "codexrm/attachment/";
   try {
-    const begun = await rpc("codexrm/attachment/begin", { name: file.name, size: file.size });
+    if (state.fileTransferDirectOnly && !relayImage) throw new Error("此文件传输需要安卓端 P2P 直连");
+    const begun = await rpc(`${prefix}begin`, { name: file.name, size: file.size });
     id = begun.id;
     if (!active()) throw new Error("上传已中断，请重试");
     const chunkSize = Math.min(begun.chunkSize || 262144, 262144);
@@ -414,7 +427,7 @@ async function uploadAttachment(file, key) {
       let binary = "";
       for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
       if (!active()) throw new Error("上传已中断，请重试");
-      const result = await rpc("codexrm/attachment/chunk", { id, offset, data: btoa(binary) });
+      const result = await rpc(`${prefix}chunk`, { id, offset, data: btoa(binary) });
       if (!active()) throw new Error("上传已中断，请重试");
       if (result.offset !== offset + bytes.length) throw new Error("附件上传位置不匹配，请重试");
       offset = result.offset;
@@ -422,7 +435,7 @@ async function uploadAttachment(file, key) {
       render();
     }
     if (!active()) throw new Error("上传已中断，请重试");
-    const result = await rpc("codexrm/attachment/finish", { id });
+    const result = await rpc(`${prefix}finish`, { id });
     if (!active()) throw new Error("上传已中断，请重试");
     Object.assign(file, result);
     if (visionMimeTypes.has(file.mimeType)) {
@@ -435,7 +448,7 @@ async function uploadAttachment(file, key) {
     delete file.file;
   } catch (error) {
     file.error = error.message;
-    if (id && generation === state.generation && state.online) rpc("codexrm/attachment/abort", { id }).catch(() => {});
+    if (id && generation === state.generation && state.online) rpc(`${prefix}abort`, { id }).catch(() => {});
   } finally {
     file.uploading = false;
     persistAttachments();
@@ -522,8 +535,9 @@ function attachmentHTML(file) {
   const image = visionMimeTypes.has(file.mimeType);
   return `<button type="button" class="message-attachment${image ? " image-attachment" : ""}" data-attachment="${escapeHTML(file.id)}" data-focus-id="attachment:${escapeHTML(file.id)}" title="下载 ${escapeHTML(file.name)}">${image ? `<img data-attachment-image="${escapeHTML(file.id)}" ${cached?.url ? `src="${escapeHTML(cached.url)}"` : ""} alt="${escapeHTML(file.name)}" loading="lazy" />` : icon("file")}<span><strong>${escapeHTML(file.name)}</strong><small>${fileSize(file.size)} · 下载</small></span></button>`;
 }
-function readAttachment(id) {
-  return readCachedImage(attachmentCacheKey(id), () => readImageChunks("codexrm/attachment/read", { id }));
+function readAttachment(id, image = false) {
+  const method = image && state.info?.attachments?.relayImages ? `${chatImageRPC}read` : "codexrm/attachment/read";
+  return readCachedImage(attachmentCacheKey(id), () => readImageChunks(method, { id }));
 }
 async function readCachedImage(key, fetchImage) {
   const generation = state.generation;
@@ -555,6 +569,8 @@ async function readCachedImage(key, fetchImage) {
   }
 }
 async function readImageChunks(method, params) {
+  const relayImage = method === `${chatImageRPC}read`;
+  if (state.fileTransferDirectOnly && !relayImage) throw new Error("此文件传输需要安卓端 P2P 直连");
   const generation = state.generation;
   const chunks = [];
   let offset = 0;
@@ -566,6 +582,7 @@ async function readImageChunks(method, params) {
     if (!Number.isSafeInteger(metadata?.size) || metadata.size < 0 || metadata.size > maxHistoryImageBytes ||
         (file && (file.size !== metadata.size || file.version !== metadata.version)) ||
         (params.id && params.id !== metadata.id) || (params.path && !cachedImageTypes.has(metadata.mimeType)) ||
+        (relayImage && !visionMimeTypes.has(metadata.mimeType)) ||
         typeof result.data !== "string" || result.data.length > 360 * 1024) throw new Error("图片或附件内容无效");
     const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
     if (result.offset !== offset + bytes.length || result.offset > metadata.size || (!bytes.length && offset < metadata.size))
@@ -671,7 +688,7 @@ function hydrateAttachmentImages() {
       const generation = state.generation;
       const { attachmentImage, historyImage, imageItem } = img.dataset;
       const valid = () => img.isConnected && generation === state.generation;
-      const load = attachmentImage ? readAttachment(attachmentImage) : readHistoryImage(historyImage, imageItem, state.current?.cwd || selectedCwd());
+      const load = attachmentImage ? readAttachment(attachmentImage, true) : readHistoryImage(historyImage, imageItem, state.current?.cwd || selectedCwd());
       load.then((file) => { if (valid()) img.src = file.url; }).catch(() => {
         if (!valid()) return;
         if (/^https?:\/\//i.test(historyImage || "")) img.src = historyImage;
@@ -1212,6 +1229,7 @@ function connect({ reconnect = false } = {}) {
       return;
     }
     if (envelope.type === "welcome" || envelope.type === "agent_status") {
+      state.fileTransferDirectOnly = envelope.fileTransferDirectOnly === true;
       clearTimeout(state.connectionTimer);
       const wasOnline = state.online;
       state.online = envelope.status === "connected";
@@ -1252,6 +1270,7 @@ function connect({ reconnect = false } = {}) {
       if (msg.error) {
         const e = new Error(msg.error.message || "Codex 请求失败");
         e.code = msg.error.code;
+        if (e.code === -32098) e.uncertain = true;
         pending.reject(e);
       } else pending.resolve(msg.result);
     } else if (envelope.type === "error") {
@@ -1404,18 +1423,27 @@ function renderConnection() {
   renderMessageQueue();
   renderPersistentNotice();
 }
+const providerSwitchHint = "请切换到可用的供应商后继续对话";
+
 function renderComposerControls() {
   const running = isRunning();
   const unavailable = state.readOnly || state.loading || state.sending || !state.browserOnline || !state.online || !state.loaded;
   const files = currentAttachments();
+  const providerUnavailable = !!state.current?.codexrmProviderUnavailable;
+  const cannotSend = unavailable || providerUnavailable;
   const attachmentPending = files.some((f) => f.uploading || f.error);
   const queue = state.messageQueues.get(state.current?.id);
   const hasQueue = queue?.entries?.length > 0;
   const hasText = (!!$("prompt").value.trim() || files.length > 0) && !attachmentPending;
-  $("attach-files").disabled = unavailable || !state.info?.attachments;
-  $("attach-files").title = state.info?.attachments ? "添加文件或图片（每个最大 20 MB）" : "请更新本地 Agent 以支持文件和图片";
+  const attachments = state.info?.attachments;
+  const relayImagesOnly = state.fileTransferDirectOnly;
+  $("attach-files").disabled = unavailable || !attachments || (relayImagesOnly && !attachments.relayImages);
+  $("attach-files").title = relayImagesOnly
+    ? (attachments?.relayImages ? "添加图片（每张最大 20 MB）" : "请更新本地 Agent 以通过中继发送图片")
+    : attachments ? "添加文件或图片（每个最大 20 MB）" : "请更新本地 Agent 以支持文件和图片";
+  $("file-input").accept = relayImagesOnly ? ".png,.jpg,.jpeg,.gif,.webp" : "";
   const sendLabel = hasQueue ? "排队发送" : "发送消息";
-  $("send").disabled = unavailable || !hasText || (hasQueue && !state.info?.messageQueue);
+  $("send").disabled = cannotSend || !hasText || (hasQueue && !state.info?.messageQueue);
   const continuation = continuationTurn();
   $("send").hidden = running || !!continuation;
   $("continue-turn").hidden = !continuation;
@@ -1425,10 +1453,10 @@ function renderComposerControls() {
   $("stop").hidden = !running;
   $("stop").disabled = unavailable;
   $("running-actions").hidden = !running;
-  $("queue-send").disabled = unavailable || !hasText || !state.info?.messageQueue;
+  $("queue-send").disabled = cannotSend || !hasText || !state.info?.messageQueue;
   $("queue-send").title = state.info?.messageQueue ? "当前任务完成后发送（Enter）" : "请更新本地 Agent 以支持排队发送";
-  $("steer").disabled = unavailable || !hasText;
-  $("composer-hint").textContent = running ? "Enter 排队 · Ctrl / ⌘ Enter 插队 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行";
+  $("steer").disabled = cannotSend || !hasText;
+  $("composer-hint").textContent = providerUnavailable ? providerSwitchHint : running ? "Enter 排队 · Ctrl / ⌘ Enter 插队 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行";
   $("thread-actions").hidden = !state.current;
   $("activity").hidden = !running;
   $("activity-text").textContent = state.online
@@ -2017,7 +2045,9 @@ async function openThread(id, silent = false) {
     if (!active()) return;
     let thread = result.thread;
     let cursor = result.nextCursor || null;
-    if (thread.historyMode === "paginated" && !(readOnly && state.info?.threadSnapshots)) {
+    const hasSnapshotHistory = (readOnly && state.info?.threadSnapshots) ||
+      (thread.codexrmProviderUnavailable && Object.hasOwn(result, "nextCursor"));
+    if (thread.historyMode === "paginated" && !hasSnapshotHistory) {
       const page = await rpc("thread/turns/list", {
         threadId: id,
         limit: 30,
@@ -2461,7 +2491,7 @@ function isRunning() {
 const continuationPrompt = "请从中断处继续完成上一项任务。先核对已完成的工作和当前状态，再处理剩余步骤。";
 
 function continuationTurn() {
-  if (!state.current || state.readOnly || isRunning() || $("prompt").value.trim() || currentAttachments().length) return null;
+  if (!state.current || state.readOnly || state.current.codexrmProviderUnavailable || isRunning() || $("prompt").value.trim() || currentAttachments().length) return null;
   const queue = state.messageQueues.get(state.current.id);
   if (queue?.dispatching || (queue?.entries?.length && !queue.paused)) return null;
   const latest = state.turns.filter((turn) => turn.id && turn.id !== "error").at(-1);
@@ -2551,8 +2581,10 @@ function onEvent(msg) {
     if (state.current?.id !== p.threadId) return;
     const effort = state.current.model === p.model ? $("effort").value : "";
     state.current.codexrmProvider = p.providerId;
+    delete state.current.codexrmProviderUnavailable;
     state.current.model = p.model;
     selectThreadModel({ thread: state.current }, "", effort);
+    renderConnection();
     return;
   }
   if (method === "codexrm/thread/detached" || method === "codexrm/thread/loaded") {
@@ -2933,7 +2965,7 @@ function syncDisclosureSummary(details) {
 function operationGroupHTML(items, active = false) {
   const latest = items.at(-1);
   const id = `operations:${items[0].id}`;
-  const open = disclosureOpen(id, active);
+  const open = disclosureOpen(id, false);
   const title = active && latest.type === "reasoning" ? "正在思考" : operationTitle(latest);
   const status = [`${items.length} 条操作`, operationStatus(latest) || (active ? "进行中" : "")].filter(Boolean).join(" · ");
   const label = `${open ? "收起" : "展开"}：${title}`;
@@ -3154,7 +3186,7 @@ $("messages").addEventListener("click", async (event) => {
   if (attachmentButton) {
     attachmentButton.disabled = true;
     try {
-      const file = await readAttachment(attachmentButton.dataset.attachment);
+      const file = await readAttachment(attachmentButton.dataset.attachment, attachmentButton.classList.contains("image-attachment"));
       const link = document.createElement("a");
       link.href = file.url;
       link.download = file.file.name;
@@ -3190,6 +3222,18 @@ $("messages").addEventListener("toggle", (event) => {
 }, true);
 function isPermissionRequest(msg) {
   return ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"].includes(msg.method);
+}
+const permissionActions = [
+  ["允许一次", "accept"],
+  ["本次会话允许", "acceptForSession"],
+  ["拒绝", "decline"],
+  ["取消当前任务", "cancel"],
+];
+function permissionChoices(msg) {
+  const available = msg.params?.availableDecisions;
+  return Array.isArray(available)
+    ? permissionActions.filter(([, decision]) => available.includes(decision))
+    : permissionActions.slice(0, 3);
 }
 function permissionResult(msg, decision) {
   if (msg.method === "item/permissions/requestApproval")
@@ -3308,6 +3352,7 @@ function renderApprovals() {
     const batch = document.createElement("div");
     batch.className = "approval-buttons approval-batch";
     for (const [label, decision] of [[`全部允许 (${permissions.length})`, "accept"], ["全部拒绝", "decline"]]) {
+      if (!permissions.every(([, msg]) => permissionChoices(msg).some(([, choice]) => choice === decision))) continue;
       const button = document.createElement("button");
       button.textContent = label;
       button.className = decision === "accept" ? "accept" : "";
@@ -3316,7 +3361,7 @@ function renderApprovals() {
       };
       batch.append(button);
     }
-    root.append(batch);
+    if (batch.children.length) root.append(batch);
   }
   for (const [id, msg] of state.requests) {
     const p = msg.params || {};
@@ -3366,11 +3411,7 @@ function renderApprovals() {
       }
       const actions = document.createElement("div");
       actions.className = "approval-buttons";
-      for (const [label, decision] of [
-        ["允许一次", "accept"],
-        ["本次会话允许", "acceptForSession"],
-        ["拒绝", "decline"],
-      ]) {
+      for (const [label, decision] of permissionChoices(msg)) {
         const button = document.createElement("button");
         button.textContent = label;
         if (decision === "accept") button.className = "accept";
@@ -3470,7 +3511,7 @@ function renderMessageQueue() {
     const resume = document.createElement("button");
     resume.type = "button";
     resume.textContent = "继续排队";
-    resume.disabled = disabled;
+    resume.disabled = disabled || !!state.current?.codexrmProviderUnavailable;
     resume.onclick = () => changeMessageQueue("resume");
     header.append(resume);
   }
@@ -3575,6 +3616,7 @@ async function sendFollowup(text, mode) {
 }
 async function submit(event, mode = "auto") {
   event?.preventDefault();
+  if (state.current?.codexrmProviderUnavailable) return toast(providerSwitchHint);
   if (currentDevice() && state.online && (state.loading || !state.loaded))
     return toast("正在同步工作区，请稍候再发送");
   if (state.readOnly) {
@@ -4238,6 +4280,7 @@ $("model").onchange = async () => {
         });
         if (generation !== state.generation || state.current?.id !== thread.id) return;
         state.current.codexrmProvider = result.providerId;
+        delete state.current.codexrmProviderUnavailable;
         state.current.model = result.model;
         selectThreadModel({ thread: state.current }, "", sameModel ? previousEffort : model.defaultReasoningEffort);
         saveModelPreference();

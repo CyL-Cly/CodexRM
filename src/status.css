@@ -1,0 +1,61 @@
+:root {
+  color: var(--hi-v5-color-gray-900, #1f2733);
+  background: var(--hi-v5-color-gray-100, #f5f7fa);
+  font-family: system-ui, "Microsoft YaHei", sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+.status-page {
+  box-sizing: border-box;
+  max-width: 48rem;
+  margin-inline: auto;
+  padding: clamp(1rem, 5vw, 2.5rem);
+}
+
+.status-header {
+  margin-block: 1rem 1.5rem;
+}
+
+.status-brand {
+  margin: 0 0 0.25rem;
+  color: #515d70;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.status-header h1 {
+  margin: 0;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+  line-height: 1.3;
+}
+
+.status-check,
+.status-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.status-check {
+  justify-content: space-between;
+}
+
+.status-check h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.status-result {
+  color: #515d70;
+  font-size: 0.875rem;
+}
+
+.status-back {
+  display: inline-block;
+  margin-block-start: 1rem;
+  color: var(--hi-v5-color-primary-600, #0053bd);
+}

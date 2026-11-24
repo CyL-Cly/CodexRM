@@ -110,16 +110,44 @@ func localDirectFilePath(workspace, path string) (string, error) {
 	return filepath.Clean(path), nil
 }
 
+func computerDirectFilePath(path string) (string, string, error) {
+	invalid := errors.New("需要有效的电脑绝对路径")
+	if !filepath.IsAbs(path) || strings.IndexByte(path, 0) >= 0 {
+		return "", "", invalid
+	}
+	volume := filepath.VolumeName(path)
+	if runtime.GOOS == "windows" {
+		if len(volume) != 2 || volume[1] != ':' ||
+			!(volume[0] >= 'A' && volume[0] <= 'Z' || volume[0] >= 'a' && volume[0] <= 'z') {
+			return "", "", invalid
+		}
+	}
+	root := volume + string(filepath.Separator)
+	rel, err := localDirectFilePath(root, strings.TrimLeft(path[len(volume):], string(filepath.Separator)+"/"))
+	if err != nil {
+		return "", "", invalid
+	}
+	return root, rel, nil
+}
+
 func pathInside(parent, child string) bool {
 	rel, err := filepath.Rel(parent, child)
 	return err == nil && filepath.IsLocal(rel)
 }
 
-func directFileInfo(root *os.Root, path string) (os.FileInfo, error) {
-	// Skip links and special files. Root also enforces containment at open time.
-	if path == "." {
-		return root.Stat(path)
+func directFileInfo(root *os.Root, path string, private os.FileInfo) (os.FileInfo, error) {
+	// Check the root too, since a Windows drive letter can alias a directory.
+	base, err := root.Stat(".")
+	if err != nil {
+		return nil, err
 	}
+	if private != nil && os.SameFile(private, base) {
+		return nil, errDirectFilePrivate
+	}
+	if path == "." {
+		return base, nil
+	}
+	// Skip links and special files. Root also enforces containment at open time.
 	var info os.FileInfo
 	current := "."
 	for _, part := range strings.Split(path, string(filepath.Separator)) {
@@ -129,9 +157,14 @@ func directFileInfo(root *os.Root, path string) (os.FileInfo, error) {
 		if err != nil || !(info.IsDir() || info.Mode().IsRegular()) {
 			return nil, errors.New("文件不存在，或不是普通文件或目录")
 		}
+		if private != nil && os.SameFile(private, info) {
+			return nil, errDirectFilePrivate
+		}
 	}
 	return info, nil
 }
+
+var errDirectFilePrivate = errors.New("无法访问 Agent 数据目录")
 
 func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *directSession, method string, params map[string]any) (any, error) {
 	if d == nil {
@@ -145,6 +178,12 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 	}
 	s := &d.files
 	switch method {
+	case protocol.DirectFilePrefix + "roots":
+		roots, err := directFileRoots()
+		if err != nil {
+			return nil, errors.New("无法读取电脑盘符")
+		}
+		return map[string]any{"roots": roots}, nil
 	case protocol.DirectFilePrefix + "read", protocol.DirectFilePrefix + "close":
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -183,18 +222,7 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 	default:
 		return nil, errors.New("未知的文件操作")
 	}
-	workspace, err := a.directWorkspace(ctx, app, params)
-	if err != nil {
-		return nil, err
-	}
-	requested, _ := params["path"].(string)
-	// Codex emits absolute paths even when the displayed workspace is an alias.
-	if original, _ := params["workspace"].(string); filepath.IsAbs(requested) && original != workspace {
-		if rel, e := localDirectFilePath(original, requested); e == nil {
-			requested = rel
-		}
-	}
-	path, err := localDirectFilePath(workspace, requested)
+	base, path, err := a.directFileLocation(ctx, app, params)
 	if err != nil {
 		return nil, err
 	}
@@ -203,17 +231,22 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 		private = a.cfg.DataDir
 	}
 	protected := func(path string) bool {
-		return filepath.IsAbs(private) && pathInside(private, filepath.Join(workspace, path))
+		return filepath.IsAbs(private) && pathInside(private, filepath.Join(base, path))
 	}
 	if protected(path) {
-		return nil, errors.New("无法访问 Agent 数据目录")
+		return nil, errDirectFilePrivate
 	}
-	root, err := os.OpenRoot(workspace)
+	root, err := os.OpenRoot(base)
 	if err != nil {
-		return nil, errors.New("无法打开工作区")
+		return nil, errors.New("无法打开电脑目录")
 	}
 	defer root.Close()
-	info, err := directFileInfo(root, path)
+	// Also compare directory identities, since Windows paths can use short aliases.
+	var privateInfo os.FileInfo
+	if filepath.IsAbs(private) {
+		privateInfo, _ = os.Stat(private)
+	}
+	info, err := directFileInfo(root, path, privateInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +259,9 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 			return nil, errors.New("无法读取文件夹")
 		}
 		defer f.Close()
+		if actual, err := f.Stat(); err != nil || !os.SameFile(info, actual) {
+			return nil, errors.New("文件夹已变更，请重试")
+		}
 		items, err := f.ReadDir(directFileListLimit + 1)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, errors.New("无法读取文件夹")
@@ -278,4 +314,23 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 	s.closeRead()
 	s.read = &directFileRead{id: uuid.NewString(), file: f, info: actual}
 	return map[string]any{"id": s.read.id, "name": actual.Name(), "size": actual.Size()}, nil
+}
+
+func (a *Agent) directFileLocation(ctx context.Context, app *appserver.Client, params map[string]any) (string, string, error) {
+	requested, _ := params["path"].(string)
+	if params["scope"] == "computer" {
+		return computerDirectFilePath(requested)
+	}
+	workspace, err := a.directWorkspace(ctx, app, params)
+	if err != nil {
+		return "", "", err
+	}
+	// Codex emits absolute paths even when the displayed workspace is an alias.
+	if original, _ := params["workspace"].(string); filepath.IsAbs(requested) && original != workspace {
+		if rel, err := localDirectFilePath(original, requested); err == nil {
+			requested = rel
+		}
+	}
+	path, err := localDirectFilePath(workspace, requested)
+	return workspace, path, err
 }

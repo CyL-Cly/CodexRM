@@ -6,6 +6,10 @@ internal class ThreadListState {
 
     // A newly created thread can be absent from thread/list until its first turn is persisted.
     private val unlistedIds = mutableSetOf<String>()
+    private val unlistedActiveIds = mutableSetOf<String>()
+
+    val activeIds: Set<String>
+        get() = entries.filter { it.active }.mapTo(unlistedActiveIds.toMutableSet()) { it.id }
 
     fun addCreated(thread: ThreadSummary) {
         if (entries.any { it.id == thread.id }) return
@@ -22,21 +26,28 @@ internal class ThreadListState {
     }
 
     fun commit(values: List<ThreadSummary>) {
-        values.forEach { unlistedIds.remove(it.id) }
+        values.forEach {
+            unlistedIds.remove(it.id)
+            unlistedActiveIds.remove(it.id)
+        }
         entries = values + entries.filter { it.id in unlistedIds }
     }
 
     fun updateActivity(id: String, active: Boolean, updatedAt: Long) {
+        if (id.isEmpty()) return
+        if (active && entries.none { it.id == id }) unlistedActiveIds.add(id) else unlistedActiveIds.remove(id)
         entries = entries.map { if (it.id == id) it.copy(active = active, updatedAt = updatedAt) else it }
     }
 
     fun remove(id: String) {
         unlistedIds.remove(id)
+        unlistedActiveIds.remove(id)
         entries = entries.filterNot { it.id == id }
     }
 
     fun clear() {
         unlistedIds.clear()
+        unlistedActiveIds.clear()
         entries = emptyList()
     }
 }

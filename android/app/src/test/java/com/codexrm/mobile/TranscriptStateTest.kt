@@ -3,6 +3,8 @@ package com.codexrm.mobile
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Test
 
 class TranscriptStateTest {
@@ -45,6 +47,31 @@ class TranscriptStateTest {
         assertEquals(listOf("item-1", "stopped-turn-1", "item-2", "error-turn-2", "item-3"), merged.messages.map { it.id })
         assertEquals("new error", merged.messages.single { it.id == "error-turn-2" }.body)
         assertEquals(setOf("item-1", "stopped-turn-1"), merged.historyIds)
+    }
+
+    @Test fun `snapshot preserves rendered rows and updates changed messages or action inputs`() {
+        fun user(path: String) = ChatMessage("user", MessageKind.USER, "", "prompt").apply {
+            turnId = "turn-1"
+            userInput = JSONArray().put(JSONObject().put("type", "localImage").put("path", path))
+        }
+        val previousUser = user("first.png")
+        val previousReply = ChatMessage("reply", MessageKind.ASSISTANT, "Codex", "answer").apply {
+            rendered = "formatted answer"
+            dirty = false
+        }
+        val unchanged = TranscriptState.latest(
+            listOf(previousUser, previousReply), emptySet(), listOf(user("first.png"), previousReply.copy()), false,
+        ).messages
+        assertSame(previousUser, unchanged[0])
+        assertSame(previousReply, unchanged[1])
+        assertEquals("formatted answer", unchanged[1].rendered)
+        assertFalse(unchanged[1].dirty)
+
+        val newImage = user("second.png")
+        val newReply = previousReply.copy(body = "updated answer")
+        val changed = TranscriptState.latest(unchanged, emptySet(), listOf(newImage, newReply), false).messages
+        assertSame(newImage, changed[0])
+        assertSame(newReply, changed[1])
     }
 
     @Test fun `id-less items keep a stable identity across overlapping page reparse`() {

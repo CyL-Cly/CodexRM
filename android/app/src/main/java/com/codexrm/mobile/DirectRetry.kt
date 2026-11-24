@@ -19,6 +19,12 @@ internal class DirectRetry {
         suspendedForMapping = false
     }
 
+    fun onNetworkChanged() {
+        suspendedForMapping = false
+        failures = 0
+        retryAt = 0
+    }
+
     fun requested(now: Long) {
         // RM rate limits begin per WebSocket for the 20-second P2PAttempt window.
         // Allow a small margin when there is no start response to anchor the timer.

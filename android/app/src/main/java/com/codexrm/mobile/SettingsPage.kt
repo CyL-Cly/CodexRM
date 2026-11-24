@@ -1,11 +1,11 @@
 package com.codexrm.mobile
 
-import android.app.AlertDialog
-import android.app.Dialog
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.drawable.ColorDrawable
-import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -13,9 +13,25 @@ import android.view.Window
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.text.input.KeyboardType
+import top.yukonga.miuix.kmp.basic.SmallTopAppBar
+import top.yukonga.miuix.kmp.preference.ArrowPreference
+import top.yukonga.miuix.kmp.preference.SwitchPreference
+import top.yukonga.miuix.kmp.theme.MiuixTheme
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 
 internal class SettingsPage(
     private val activity: MainActivity,
@@ -24,16 +40,56 @@ internal class SettingsPage(
     private val direct: () -> Boolean,
     private val request: (String, JSONObject, Boolean, RpcCallback) -> Unit,
     private val catalogChanged: () -> Unit,
-    private val actions: List<Action>,
+    private val sections: (Action) -> List<Section>,
+    private val agentSections: (Action) -> List<Section> = { emptyList() },
+    private val appearance: ChatAppearance? = null,
+    private val pickBackground: (AppearanceArea) -> Unit = {},
+    private val reportBackground: (Boolean) -> Unit = {},
 ) {
     data class Action(val title: String, val open: () -> Unit, val summary: (() -> String)? = null)
+    data class Toggle(val title: String, val checked: () -> Boolean, val change: (Boolean) -> Unit, val summary: String? = null)
+    data class Choice(val title: String, val options: List<String>, val selectedIndex: () -> Int, val select: (Int) -> Unit)
+    data class Section(
+        val title: String,
+        val actions: List<Action> = emptyList(),
+        val toggle: Toggle? = null,
+        val choice: Choice? = null,
+    )
 
-    private val actionSummaries = mutableMapOf<TextView, () -> String>()
-    private var back: () -> Unit = { dismiss() }
-    private val dialog = object : Dialog(activity) {
-        @Deprecated("Deprecated in Java")
-        @Suppress("DEPRECATION")
-        override fun onBackPressed() = back()
+    private enum class Page(val parent: Page? = null) {
+        HOME,
+        LICENSES(HOME),
+        LICENSE(LICENSES),
+        APPEARANCE(HOME),
+        GALLERY(APPEARANCE),
+        CROP(APPEARANCE),
+        AGENT(HOME),
+        CATALOG(AGENT),
+        PROVIDER(CATALOG),
+        ADD_PROVIDER(CATALOG),
+        NATIVE_PROVIDER(CATALOG),
+        EDIT_PROVIDER(PROVIDER),
+        REFRESH_PROVIDER(PROVIDER),
+        REFRESH_NEW_PROVIDER(CATALOG),
+    }
+
+    private var refresh by mutableIntStateOf(0)
+    private var settingsRoot: View? = null
+    private val pageViews = mutableMapOf<Page, View>()
+    private var refreshPreviews: (() -> Unit)? = null
+    private var gallery: AppearanceGallery? = null
+    private var cropLoad: AppearanceImages.Job? = null
+    private val dialog = PredictiveBackDialog(activity).apply {
+        setOnDismissListener {
+            pageVersion++
+            cropLoad?.cancel()
+            cropLoad = null
+            gallery?.close()
+            gallery = null
+            settingsRoot = null
+            pageViews.clear()
+            refreshPreviews = null
+        }
     }
     private lateinit var content: LinearLayout
     private var pageVersion = 0
@@ -41,6 +97,7 @@ internal class SettingsPage(
     private var editorSaving = false
     private var modelDraft: ProviderModelDraft? = null
     private var catalogs = emptyList<JSONObject>()
+    private var gptProviderSettings = false
 
     fun show() {
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -49,71 +106,333 @@ internal class SettingsPage(
         dialog.show()
         @Suppress("DEPRECATION")
         dialog.window?.apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         }
     }
 
+    val isShowing: Boolean get() = dialog.isShowing
+
     fun dismiss() { dialog.dismiss() }
 
     fun refreshActionSummaries() {
-        actionSummaries.forEach { (view, summary) -> view.text = summary() }
+        refresh++
     }
 
-    private fun page(title: String, goBack: () -> Unit) {
-        actionSummaries.clear()
+    fun refreshAppearance() {
+        appearance?.let { style ->
+            pageViews.values.forEach { it.background = style.drawable(AppearanceArea.SETTINGS) }
+        }
+        refreshPreviews?.invoke()
+        refreshActionSummaries()
+    }
+
+    private fun page(
+        destination: Page,
+        title: String,
+        fixedContent: View? = null,
+        canSlide: () -> Boolean = { true },
+        goBack: () -> Unit,
+    ) {
+        refreshPreviews = null
         pageVersion++
-        back = goBack
-        val root = Ui.column(activity).apply { setBackgroundColor(Ui.BACKGROUND) }
-        val header = Ui.column(activity, false).apply { gravity = Gravity.CENTER_VERTICAL }
-        header.addView(Ui.iconButton(activity, "back", "返回") { goBack() })
-        header.addView(Ui.text(activity, title, 21f, bold = true).apply {
-            if (android.os.Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
-        }, LinearLayout.LayoutParams(0, dp(56), 1f))
+        val root = Ui.column(activity).apply {
+            background = appearance?.drawable(AppearanceArea.SETTINGS) ?: ColorDrawable(Ui.BACKGROUND)
+        }
+        val header = ComposeView(activity).apply {
+            setContent {
+                CodexMiuixTheme {
+                    refresh
+                    SmallTopAppBar(
+                        title = title,
+                        color = if (appearance?.bitmap(AppearanceArea.SETTINGS) != null)
+                            androidx.compose.ui.graphics.Color.Transparent else MiuixTheme.colorScheme.surface,
+                        defaultWindowInsetsPadding = false,
+                        navigationIcon = { MiuixActionIcon("back", "返回", goBack) },
+                    )
+                }
+            }
+        }
         content = Ui.column(activity).apply { setPadding(dp(16), dp(8), dp(16), dp(20)) }
-        val scroll = ScrollView(activity).apply { isFillViewport = true; addView(content) }
+        (fixedContent?.parent as? ViewGroup)?.removeView(fixedContent)
+        val body = fixedContent ?: ScrollView(activity).apply { isFillViewport = true; addView(content) }
         root.addView(header, match())
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        dialog.setContentView(root)
+        root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
+        showPageContent(destination, root, canSlide, goBack)
     }
 
-    private fun showHome() {
-        page("设置") { dismiss() }
-        section("模型与连接")
-        row("模型供应商", deviceName) { loadCatalog() }
-        val appActions = actions.filter { it.title == "工作区设置" || it.title == "下载位置" }
-        val supportActions = actions.filterNot { it in appActions }
-        if (appActions.isNotEmpty()) {
-            section("应用与数据")
-            appActions.forEach(::actionRow)
+    private fun showHome() = composePage(Page.HOME, "设置", ::dismiss) {
+        sections(Action("电脑 Agent 设置", ::showAgentSettings) { deviceName })
+    }
+
+    fun showOpenSourceLicenses() = composePage(Page.LICENSES, "开放源代码许可", ::showHome) {
+        listOf(Section("第三方项目", actions = OpenSourceLicenses.projects.map { project ->
+            Action(project.name, { showLicense(project) }) { project.license }
+        }))
+    }
+
+    private fun showLicense(project: OpenSourceLicenses.Project) {
+        val text = try {
+            project.assets.joinToString("\n\n") { path ->
+                activity.assets.open(path).bufferedReader().use { it.readText().trimEnd() }
+            }
+        } catch (_: IOException) {
+            showError(IOException("无法读取许可文本"))
+            return
         }
-        if (supportActions.isNotEmpty()) {
-            section("支持")
-            supportActions.forEach(::actionRow)
+        page(Page.LICENSE, project.name, goBack = ::showOpenSourceLicenses)
+        row("项目主页", project.url) { openExternalUrl(project.url) }
+        content.addView(Ui.text(activity, text, 14f, Ui.TEXT).apply {
+            setTextIsSelectable(true)
+            setLineSpacing(dp(3).toFloat(), 1f)
+        }, match(12))
+    }
+
+    fun openRepository() = openExternalUrl(OpenSourceLicenses.REPOSITORY)
+
+    private fun openExternalUrl(url: String) {
+        try {
+            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: ActivityNotFoundException) {
+            showError(IllegalStateException("没有可打开链接的应用\n$url"))
         }
     }
 
-    private fun actionRow(action: Action) {
-        val summary = action.summary
-        val view = row(action.title, summary?.invoke(), action.open)
-        if (view != null && summary != null) actionSummaries[view] = summary
+    private fun showAgentSettings() = composePage(Page.AGENT, "电脑 Agent 设置", ::showHome) {
+        agentSections(Action("模型供应商", { loadCatalog() }) { deviceName })
     }
 
-    private fun section(title: String) {
-        content.addView(Ui.text(activity, title, 13f, Ui.MUTED, bold = true).apply {
-            setPadding(dp(4), dp(12), dp(4), dp(4))
-            if (android.os.Build.VERSION.SDK_INT >= 28) isAccessibilityHeading = true
-        }, match(4))
+    private fun composePage(
+        destination: Page,
+        title: String,
+        goBack: () -> Unit,
+        groups: () -> List<Section>,
+    ) {
+        pageVersion++
+        refreshPreviews = null
+        val compose = ComposeView(activity).apply {
+            background = appearance?.drawable(AppearanceArea.SETTINGS)
+            setContent {
+                MiuixSettingsScreen(
+                    title = title,
+                    darkTheme = { Ui.dark },
+                    sections = {
+                        // Observe changes made by child dialogs and system pickers.
+                        refresh
+                        groups()
+                    },
+                    onBack = goBack,
+                    onChanged = ::refreshActionSummaries,
+                    hasWallpaper = {
+                        refresh
+                        appearance?.bitmap(AppearanceArea.SETTINGS) != null
+                    },
+                )
+            }
+        }
+        showPageContent(destination, compose, { true }, goBack)
+    }
+
+    private fun showPageContent(destination: Page, view: View, canSlide: () -> Boolean, goBack: () -> Unit) {
+        val ancestors = generateSequence(destination.parent) { it.parent }.toSet()
+        pageViews.keys.retainAll(ancestors)
+        val previous = pageViews[destination.parent]
+        pageViews[destination] = view
+        settingsRoot = view
+        val motion = if (destination.parent == null) BackMotion.PAGE else BackMotion.SUBPAGE
+        dialog.setBackContent(view, motion, previous, canSlide, goBack)
+        dialog.window?.setBackgroundDrawable(ColorDrawable(
+            if (motion == BackMotion.PAGE) Color.TRANSPARENT else Ui.BACKGROUND,
+        ))
+    }
+
+    fun showAppearance() {
+        val style = appearance ?: return
+        gallery?.close()
+        gallery = null
+        page(Page.APPEARANCE, "背景与透明度", goBack = ::showHome)
+        val previews = mutableListOf<() -> Unit>()
+        for (area in AppearanceArea.entries) {
+            val card = appearanceCard(area.title)
+            val preview = android.widget.FrameLayout(activity).apply {
+                background = style.drawable(area)
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }
+            card.addView(preview, LinearLayout.LayoutParams(-1, dp(88)).apply { topMargin = dp(8) })
+            val source = Ui.text(activity, style.summary(area), 13f, Ui.MUTED).apply {
+                accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            }
+            card.addView(source, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            card.addView(Ui.button(activity, "更换${area.title}") { chooseBackground(area, style) },
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+            addOpacity(card, "遮罩不透明度", style.mask(area), preview = { value ->
+                (preview.background as? WallpaperDrawable)?.mask = value
+            }) { style.setMask(area, it) }
+            previews += {
+                preview.background = style.drawable(area)
+                source.text = style.summary(area)
+            }
+        }
+        val bubbles = appearanceCard("对话气泡")
+        val sample = android.widget.FrameLayout(activity)
+        val bubble = Ui.text(activity, "存在问题可反馈给开发者", 14f).apply {
+            setPadding(dp(14), dp(9), dp(14), dp(9))
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        sample.addView(bubble, android.widget.FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL).apply {
+            marginEnd = dp(12)
+        })
+        bubbles.addView(sample, LinearLayout.LayoutParams(-1, dp(58)).apply { topMargin = dp(8) })
+        fun renderBubble(value: Int) {
+            bubble.background = Ui.rounded(appearanceOpacity(Ui.SURFACE_ALT, value), dp(19).toFloat())
+        }
+        addOpacity(bubbles, "气泡不透明度", style.bubbleOpacity(), ::renderBubble) { style.setBubbleOpacity(it) }
+        previews += {
+            sample.background = style.drawable(AppearanceArea.CHAT)
+            renderBubble(style.bubbleOpacity())
+        }
+        refreshPreviews = { previews.forEach { it() } }
+        refreshPreviews?.invoke()
+    }
+
+    private fun appearanceCard(title: String) = Ui.column(activity).apply {
+        background = Ui.rounded(Ui.SURFACE, dp(14).toFloat())
+        setPadding(dp(12), dp(10), dp(12), dp(8))
+        addView(Ui.text(activity, title, 15f, bold = true).apply { isAccessibilityHeading = true }, match())
+        content.addView(this, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) })
+    }
+
+    private fun addOpacity(card: LinearLayout, title: String, initial: Int, preview: (Int) -> Unit, save: (Int) -> Unit) {
+        val value = Ui.text(activity, "", 13f, Ui.TEXT)
+        fun display(percent: Int) { value.text = "$title · $percent%" }
+        display(initial)
+        card.addView(value, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
+        card.addView(SeekBar(activity).apply {
+            max = 100
+            progress = initial
+            contentDescription = title
+            val tint = android.content.res.ColorStateList.valueOf(Ui.ACCENT)
+            progressTintList = tint
+            thumbTintList = tint
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                private var dragging = false
+                override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    display(progress)
+                    preview(progress)
+                    if (!dragging) save(progress)
+                }
+                override fun onStartTrackingTouch(bar: SeekBar) { dragging = true }
+                override fun onStopTrackingTouch(bar: SeekBar) { dragging = false; save(bar.progress) }
+            })
+        }, match())
+    }
+
+    private fun chooseBackground(area: AppearanceArea, style: ChatAppearance) {
+        val workPage = style.workPage(area)
+        val options = listOfNotNull("选择本地图片", "随机图片 · 每 3 天更新", "AI 拟人图库", "恢复默认背景",
+            workPage?.let { "查看当前作品来源与授权" })
+        MiuixDialog.Builder(activity).setTitle(area.title)
+            .setItems(options.toTypedArray()) { _, index ->
+                when (index) {
+                    0 -> pickBackground(area)
+                    1 -> style.random(area, reportBackground)
+                    2 -> showGallery()
+                    3 -> style.reset(area)
+                    4 -> workPage?.let {
+                        runCatching { activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it))) }
+                    }
+                }
+            }.setNegativeButton("取消", null).show()
+    }
+
+    private fun showGallery() {
+        gallery?.close()
+        val browser = AppearanceGallery(activity)
+        gallery = browser
+        page(Page.GALLERY, "AI 拟人图库", browser.view, canSlide = { !browser.showingWorks }) {
+            if (!browser.back()) showAppearance()
+        }
+    }
+
+    fun cropLocalImage(area: AppearanceArea, uri: Uri) {
+        val style = appearance ?: return
+        cropLoad?.cancel()
+        val body = Ui.column(activity)
+        fun cancel() {
+            cropLoad?.cancel()
+            cropLoad = null
+            showAppearance()
+        }
+        if (Page.APPEARANCE !in pageViews) showAppearance()
+        page(Page.CROP, "裁剪 · ${area.title}", body, goBack = ::cancel)
+        val loading = Ui.text(activity, "正在读取图片…", 14f, Ui.MUTED).apply {
+            gravity = Gravity.CENTER
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        body.addView(loading, LinearLayout.LayoutParams(-1, 0, 1f))
+        body.addView(Ui.button(activity, "取消") { cancel() }, match())
+        val version = pageVersion
+        cropLoad = style.loadLocal(uri) { job, result ->
+            if (cropLoad !== job || pageVersion != version || !dialog.isShowing) return@loadLocal
+            cropLoad = null
+            val image = result.getOrNull()
+            if (image == null) {
+                loading.text = "无法读取图片，请返回后重试"
+                return@loadLocal
+            }
+            body.removeAllViews()
+            val editor = WallpaperCropView(activity, image) { backgroundAspect(area) }
+            body.addView(editor, LinearLayout.LayoutParams(-1, 0, 1f))
+            val controls = Ui.column(activity, vertical = false).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12), dp(4), dp(12), 0)
+            }
+            controls.addView(Ui.text(activity, "拖动图片调整位置，双指缩放", 13f, Ui.TEXT), LinearLayout.LayoutParams(0, -2, 1f))
+            controls.addView(Ui.iconButton(activity, "minus", "缩小图片") { editor.zoomBy(0.8f) })
+            controls.addView(Ui.iconButton(activity, "plus", "放大图片") { editor.zoomBy(1.25f) })
+            body.addView(controls, match())
+            val actions = Ui.column(activity, vertical = false).apply {
+                setPadding(dp(12), dp(4), dp(12), dp(8))
+            }
+            fun addAction(label: String, primary: Boolean = false, run: () -> Unit) {
+                actions.addView(Ui.button(activity, label, primary) { run() }, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                    if (actions.childCount != 0) marginStart = dp(6)
+                })
+            }
+            addAction("取消", run = ::cancel)
+            addAction("重置", run = editor::reset)
+            addAction("确认裁剪", primary = true) confirm@{
+                val region = editor.selectedRegion() ?: return@confirm
+                showAppearance()
+                style.saveCrop(area, image, region, reportBackground)
+            }
+            body.addView(actions, match())
+        }
+    }
+
+    private fun backgroundAspect(area: AppearanceArea): Float {
+        val target = if (area == AppearanceArea.SETTINGS) settingsRoot else activity.backgroundTarget(area)
+        val decor = dialog.window?.decorView ?: activity.window.decorView
+        val width = target?.width?.takeIf { it > 0 } ?: target?.layoutParams?.width?.takeIf { it > 0 }
+            ?: decor.width.coerceAtLeast(1)
+        val height = target?.height?.takeIf { it > 0 } ?: decor.height.coerceAtLeast(1)
+        return width.toFloat() / height
     }
 
     private fun loadCatalog(open: String? = null) {
         val blocked = supported()
         val previous = open?.let { id -> catalogs.firstOrNull { it.string("id") == id } }
-        page(if (open == null) "模型供应商" else "模型管理") {
+        val destination = when {
+            previous != null -> Page.REFRESH_PROVIDER
+            open == null -> Page.CATALOG
+            else -> Page.REFRESH_NEW_PROVIDER
+        }
+        page(destination, if (open == null) "模型供应商" else "模型管理") {
             when {
                 previous != null -> showProvider(previous)
-                open == null -> showHome()
+                open == null -> showAgentSettings()
                 else -> showCatalog()
             }
         }
@@ -132,6 +451,7 @@ internal class SettingsPage(
                 button("重试") { loadCatalog(open) }
                 return@request
             }
+            gptProviderSettings = result.optBoolean("gptProviderSettings")
             val groups = result.arrayAt("providers")
             catalogs = (0 until groups.length()).mapNotNull { groups.optJSONObject(it) }
             val selected = open?.let { id -> catalogs.firstOrNull { it.string("id") == id } }
@@ -148,10 +468,11 @@ internal class SettingsPage(
 
     private fun showCatalog(warning: String = "") {
         modelDraft = null
-        page("模型供应商") { showHome() }
+        page(Page.CATALOG, "模型供应商", goBack = ::showAgentSettings)
         note(deviceName)
         if (warning.isNotEmpty()) note(warning)
         button("添加供应商") { showEditor() }
+        if (gptProviderSettings) row("当前 Codex 供应商设置", "编辑电脑端 config.toml") { loadNativeProviderSettings() }
         button("刷新模型列表") { loadCatalog() }
         catalogs.forEach { provider ->
             val modelCount = provider.arrayAt("models").length()
@@ -166,7 +487,9 @@ internal class SettingsPage(
         val draft = modelDraft?.takeIf { it.providerId == id }?.apply { replaceModels(models) }
             ?: ProviderModelDraft(id, models).also { modelDraft = it }
         val status = Ui.text(activity, if (draft.hasChanges) "有未保存改动，返回时自动保存" else "暂无未保存改动", 13f, Ui.MUTED)
-        page(provider.string("name")) { saveModelsAndReturn(provider, draft, status) }
+        page(Page.PROVIDER, provider.string("name"), canSlide = { !savingModels && !draft.hasChanges }) {
+            saveModelsAndReturn(provider, draft, status)
+        }
         if (id.isNotEmpty()) button("编辑供应商配置") { if (!savingModels) loadEditor(id) }
         provider.string("warning").takeIf(String::isNotEmpty)?.let(::note)
         val rows = Ui.column(activity)
@@ -238,21 +561,15 @@ internal class SettingsPage(
     }
 
     private fun promptModel(add: (String) -> Unit) {
-        val input = Ui.boxInput(activity, "上游模型 ID").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        }
-        val form = Ui.column(activity).apply {
-            setPadding(dp(20), dp(12), dp(20), 0)
-            addView(input, match())
-        }
-        val prompt = AlertDialog.Builder(activity).setTitle("添加模型").setView(form)
+        val input = MiuixFieldView(activity, "上游模型 ID")
+        val prompt = MiuixDialog.Builder(activity).setTitle("添加模型").setView(input)
             .setPositiveButton("添加", null).setNegativeButton("取消", null).create()
         prompt.show()
-        prompt.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-            val id = input.text.toString().trim()
+        prompt.getButton(MiuixDialog.POSITIVE).setOnClickListener {
+            val id = input.text.trim()
             if (id.isEmpty() || id.toByteArray(Charsets.UTF_8).size > 256 || id.any { it == '\r' || it == '\n' || it == '\u0000' }) {
                 input.error = if (id.isEmpty()) "模型 ID 为必填项" else "请输入有效的模型 ID"
-                input.requestFocus()
+                input.focusInput()
                 return@setOnClickListener
             }
             add(id)
@@ -289,7 +606,7 @@ internal class SettingsPage(
                 setEnabledRecursively(content, true)
                 status.text = "保存失败，改动仍保留；可重试或继续编辑"
                 val message = InteractionCopy.modelSaveError(error?.message)
-                AlertDialog.Builder(activity).setTitle("模型改动未保存").setMessage(message)
+                MiuixDialog.Builder(activity).setTitle("模型改动未保存").setMessage(message)
                     .setPositiveButton("重试") { _, _ -> saveModelsAndReturn(provider, draft, status) }
                     .setNegativeButton("继续编辑", null)
                     .setNeutralButton("放弃改动") { _, _ -> showCatalog() }
@@ -305,6 +622,88 @@ internal class SettingsPage(
         }
     }
 
+    private fun loadNativeProviderSettings() {
+        page(Page.NATIVE_PROVIDER, "当前 Codex 供应商设置", goBack = { showCatalog() })
+        val version = pageVersion
+        note("正在读取 $deviceName 的 Codex 配置…")
+        request("nativeCapabilities", JSONObject(), false) { result, error ->
+            if (!dialog.isShowing || version != pageVersion) return@request
+            if (result != null && error == null) {
+                showNativeProviderSettings(result)
+            } else {
+                content.removeAllViews()
+                note(error?.message ?: "无法读取 Codex 配置")
+                button("重试") { loadNativeProviderSettings() }
+            }
+        }
+    }
+
+    private fun showNativeProviderSettings(details: JSONObject) {
+        val initial = details.optBoolean("gptOfficial")
+        var checked by mutableStateOf(initial)
+        var saving by mutableStateOf(false)
+        page(Page.NATIVE_PROVIDER, "当前 Codex 供应商设置", canSlide = { !saving && checked == initial }) {
+            if (!saving) {
+                if (checked == initial) showCatalog() else confirmProviderChanges { showCatalog() }
+            }
+        }
+        if (!details.optBoolean("editable")) {
+            note("当前 Codex 配置没有可编辑的自定义供应商。内置官方供应商无需开启此选项。")
+            return
+        }
+        gptProviderToggle({ checked }, { !saving }) { checked = it }
+        note("保存到 $deviceName 的 Codex 配置。保存后请在新建或重新打开的会话中使用。")
+        button("保存", primary = true) { view ->
+            if (checked == initial) {
+                showCatalog()
+                return@button
+            }
+            val save = view as MiuixButtonView
+            val version = pageVersion
+            saving = true
+            save.isEnabled = false
+            save.text = "正在保存…"
+            val params = JSONObject().put("gptOfficial", checked).put("version", details.string("version"))
+            request("nativeCapabilities", params, false) { result, error ->
+                if (!dialog.isShowing || version != pageVersion) return@request
+                saving = false
+                if (result != null && error == null) {
+                    catalogChanged()
+                    loadCatalog()
+                } else {
+                    save.isEnabled = true
+                    save.text = "保存"
+                    showError(error)
+                }
+            }
+        }
+    }
+
+    private fun gptProviderToggle(checked: () -> Boolean, enabled: () -> Boolean, change: (Boolean) -> Unit) {
+        val title = "模型提供商是否为GPT官方"
+        val tile = ComposeView(activity).apply {
+            setContent {
+                CodexMiuixTheme {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        SwitchPreference(
+                            title = title,
+                            checked = checked(),
+                            enabled = enabled(),
+                            onCheckedChange = change,
+                            modifier = Modifier.weight(1f),
+                        )
+                        MiuixActionIcon("help", "$title：说明") {
+                            MiuixDialog.Builder(activity).setTitle(title)
+                                .setMessage("如果选项开启会打开wss和远程压缩（Compact），这有助于加快响应和减少压缩上下文的Token消耗\n\n仅在接入地址支持这两项能力时开启。远程压缩配置需要 Codex CLI 0.162.0 或更高版本。")
+                                .setPositiveButton("确定", null).show()
+                        }
+                    }
+                }
+            }
+        }
+        content.addView(tile, match(8))
+    }
+
     private fun loadEditor(id: String) {
         val version = pageVersion
         request("details", JSONObject().put("id", id), false) { result, error ->
@@ -316,7 +715,8 @@ internal class SettingsPage(
     private fun showEditor(id: String = "", details: JSONObject = JSONObject()) {
         editorSaving = false
         var editorDirty: () -> Boolean = { false }
-        page(if (id.isEmpty()) "添加供应商" else "编辑供应商") {
+        val destination = if (id.isEmpty()) Page.ADD_PROVIDER else Page.EDIT_PROVIDER
+        page(destination, if (id.isEmpty()) "添加供应商" else "编辑供应商", canSlide = { !editorSaving && !editorDirty() }) {
             if (editorSaving) {
                 android.widget.Toast.makeText(activity, "正在保存供应商配置，请稍候", android.widget.Toast.LENGTH_SHORT).show()
             } else {
@@ -331,62 +731,66 @@ internal class SettingsPage(
         val name = field("名称", initialName)
         val notes = field("备注", initialNotes)
         val official = details.optBoolean("official")
-        val endpoint = if (official) null else field("接入地址", initialBase).apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-        }
-        val key = if (official) null else field("API Key", "", "留空保留现有密钥").apply {
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            transformationMethod = android.text.method.PasswordTransformationMethod.getInstance()
-            if (android.os.Build.VERSION.SDK_INT >= 26) importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
-        }
+        val endpoint = if (official) null else field("接入地址", initialBase, KeyboardType.Uri)
+        val key = if (official) null else MiuixFieldView(
+            activity, "API Key", keyboardType = KeyboardType.Password, secret = true,
+            supportingText = "留空保留现有密钥",
+        ).also { content.addView(it, match(12)) }
         if (official) note("官方账号登录由电脑端 Codex 管理。")
         else {
             note("修改现有接入地址或密钥需要 P2P 直连。保存后，选择该供应商即可使用更新后的接入配置。")
             if (id.isNotEmpty() && initialBase.isEmpty()) note("现有地址未显示，留空可保留。")
         }
         val defaultModel = field("默认模型 ID（可选）", initialModel)
+        val initialGptOfficial = details.optBoolean("gptOfficial")
+        var gptOfficial by mutableStateOf(initialGptOfficial)
+        var toggleEnabled by mutableStateOf(true)
+        if (gptProviderSettings) gptProviderToggle({ gptOfficial }, { !official && toggleEnabled }) { gptOfficial = it }
         editorDirty = {
-            name.text.toString() != initialName || notes.text.toString() != initialNotes ||
-                (endpoint?.text?.toString() ?: initialBase) != initialBase ||
-                defaultModel.text.toString() != initialModel || key?.text?.isNotEmpty() == true
+            name.text != initialName || notes.text != initialNotes ||
+                (endpoint?.text ?: initialBase) != initialBase ||
+                defaultModel.text != initialModel || gptOfficial != initialGptOfficial || key?.text?.isNotEmpty() == true
         }
         button("保存", primary = true) { view ->
-            val save = view as android.widget.Button
+            val save = view as MiuixButtonView
             val params = JSONObject().put("id", id)
-            val label = name.text.toString().trim()
+            val label = name.text.trim()
             if (label.isEmpty()) {
                 name.error = "供应商名称为必填项"
-                name.requestFocus()
+                name.focusInput()
                 return@button
             }
             if (id.isEmpty() || label != initialName) params.put("name", label)
-            val note = notes.text.toString()
+            val note = notes.text
             if (note != initialNotes) params.put("notes", note)
-            val base = endpoint?.text?.toString()?.trim().orEmpty()
+            val base = endpoint?.text?.trim().orEmpty()
             if (id.isEmpty() && base.isEmpty()) {
                 endpoint?.error = "接入地址为必填项"
-                endpoint?.requestFocus()
+                endpoint?.focusInput()
                 return@button
             }
             if (base != initialBase) params.put("baseUrl", base)
-            val model = defaultModel.text.toString().trim()
+            val model = defaultModel.text.trim()
             if (model != initialModel) params.put("defaultModel", model)
-            val apiKey = key?.text?.toString()?.trim().orEmpty()
+            if (gptOfficial != initialGptOfficial) params.put("gptOfficial", gptOfficial)
+            val apiKey = key?.text?.trim().orEmpty()
             val requiresDirect = apiKey.isNotEmpty() || id.isNotEmpty() && params.has("baseUrl")
             if (requiresDirect && !direct()) {
                 if (apiKey.isNotEmpty()) key?.error = "请等电脑 P2P 直连后再修改密钥"
                 else endpoint?.error = "请等电脑 P2P 直连后再修改接入地址"
-                (if (apiKey.isNotEmpty()) key else endpoint)?.requestFocus()
+                (if (apiKey.isNotEmpty()) key else endpoint)?.focusInput()
                 return@button
             }
             if (apiKey.isNotEmpty()) params.put("apiKey", apiKey)
             val version = pageVersion
             editorSaving = true
+            toggleEnabled = false
             save.isEnabled = false
             save.text = "正在保存…"
             setEnabledRecursively(content, false)
             request("save", params, requiresDirect) { result, error ->
                 editorSaving = false
+                toggleEnabled = true
                 if (error == null) catalogChanged()
                 if (!dialog.isShowing || version != pageVersion) return@request
                 setEnabledRecursively(content, true)
@@ -407,22 +811,22 @@ internal class SettingsPage(
             leave()
             return
         }
-        AlertDialog.Builder(activity).setTitle("放弃未保存的更改？")
+        confirmProviderChanges(leave)
+    }
+
+    private fun confirmProviderChanges(leave: () -> Unit) {
+        MiuixDialog.Builder(activity).setTitle("放弃未保存的更改？")
             .setMessage("供应商配置尚未保存。")
             .setPositiveButton("放弃更改") { _, _ -> leave() }
             .setNegativeButton("继续编辑", null)
             .show()
     }
 
-    private fun field(label: String, value: String, hint: String = label) = Ui.boxInput(activity, hint).apply {
-        content.addView(Ui.text(activity, label, 12f, Ui.MUTED), match(12))
-        setText(value)
-        contentDescription = label
-        content.addView(this, match(4))
-    }
+    private fun field(label: String, value: String, keyboardType: KeyboardType = KeyboardType.Text) =
+        MiuixFieldView(activity, label, value, keyboardType).also { content.addView(it, match(12)) }
 
     private fun showError(error: Exception?) {
-        AlertDialog.Builder(activity).setTitle("操作未完成").setMessage(error?.message ?: "操作失败，请重试")
+        MiuixDialog.Builder(activity).setTitle("操作未完成").setMessage(error?.message ?: "操作失败，请重试")
             .setPositiveButton("确定", null).show()
     }
 
@@ -434,24 +838,11 @@ internal class SettingsPage(
         content.addView(Ui.button(activity, text, primary, click), match(8))
     }
 
-    private fun row(title: String, subtitle: String? = null, click: () -> Unit): TextView? {
-        val summary = subtitle?.takeIf(String::isNotEmpty)?.let { Ui.text(activity, it, 12f, Ui.MUTED) }
-        val tile = Ui.column(activity, false).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(64)
-            setPadding(dp(14), dp(8), dp(10), dp(8))
-            background = Ui.ripple(Ui.SURFACE, dp(10).toFloat())
-            isFocusable = true
-            setOnClickListener { click() }
-            val labels = Ui.column(activity).apply {
-                addView(Ui.text(activity, title, 16f), match())
-                if (summary != null) addView(summary, match(3))
-            }
-            addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(IconView(activity, "right", Ui.MUTED), LinearLayout.LayoutParams(dp(24), dp(24)))
+    private fun row(title: String, subtitle: String? = null, click: () -> Unit) {
+        val tile = ComposeView(activity).apply {
+            setContent { CodexMiuixTheme { ArrowPreference(title = title, summary = subtitle, onClick = click) } }
         }
         content.addView(tile, match(8))
-        return summary
     }
 
     private fun dp(value: Int) = Ui.dp(activity, value)

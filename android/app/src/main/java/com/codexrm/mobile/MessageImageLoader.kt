@@ -16,7 +16,13 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.Executors
 
-internal data class ImageEnvironment(val scope: String, val cwd: String, val client: CodexClient?, val localImages: Boolean)
+internal data class ImageEnvironment(
+    val scope: String,
+    val cwd: String,
+    val client: CodexClient?,
+    val localImages: Boolean,
+    val relayImages: Boolean = false,
+)
 
 internal class MessageImageLoader(context: Context, private val environment: () -> ImageEnvironment) {
     private val disk = ImageFileCache(File(context.filesDir, "message-images"))
@@ -118,17 +124,18 @@ internal class MessageImageLoader(context: Context, private val environment: () 
 
     private fun readAgent(image: MessageImage, env: ImageEnvironment, complete: (Result<ByteArray>) -> Unit) {
         val client = env.client
-        if (client == null) { complete(Result.failure(IOException("设备未连接，点击重试"))); return }
+        if (client == null) { complete(Result.failure(IOException("设备未连接"))); return }
         if (image.attachmentId.isEmpty() && !env.localImages) { complete(Result.failure(IOException("请更新电脑端 Agent 以显示本地图片"))); return }
         val output = ByteArrayOutputStream()
         var offset = 0L
         var expectedSize = -1L
         var version = ""
+        val attachmentRead = if (env.relayImages && !client.usingDirect) "${CHAT_IMAGE_RPC}read" else "codexrm/attachment/read"
         fun chunk() {
             if (closed) return
             val params = JSONObject().put("offset", offset)
             val method = if (image.attachmentId.isNotEmpty()) {
-                params.put("id", image.attachmentId); "codexrm/attachment/read"
+                params.put("id", image.attachmentId); attachmentRead
             } else {
                 params.put("path", image.source).put("cwd", env.cwd).put("version", version); "codexrm/image/read"
             }

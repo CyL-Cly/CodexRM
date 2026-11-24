@@ -144,6 +144,9 @@ jobs:
           git archive HEAD web | tar -x -C "$server"
           rm -f "$server/web/app.test.mjs" "$server/web/sw.test.mjs"
           cp LICENSE "$server/"
+          install -m 0755 build/scripts/install-server.sh "$server/install-server.sh"
+          install -d "$server/deploy"
+          install -m 0644 deploy/codexrm.service deploy/nginx-location.conf "$server/deploy/"
           tar -czf "nightly-dist/CodexRM-$TAG-linux-amd64-server.tar.gz" -C "$server" .
 
       - uses: actions/setup-java@v6.3.0

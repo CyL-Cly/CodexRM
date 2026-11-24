@@ -32,32 +32,33 @@ internal object PairingWarningCheck {
             )
             val screen = activity
             onMain(test) { invoke(screen, "cancelUpdateOperation") }
+            val initialOperation = field(screen, "pairOperation") as Int
 
             submitManualHttp(test, screen)
             expectWarning(test)
-            checkPairCall(screen, expected = false, "manual HTTP connected before confirmation")
+            checkPairOperation(screen, initialOperation, "manual HTTP connected before confirmation")
             capture(test, context, "http-pairing-warning.png")
             clickText(test, cancel)
-            checkPairCall(screen, expected = false, "manual cancellation created a pairing request")
+            checkPairOperation(screen, initialOperation, "manual cancellation created a pairing request")
             expectWarningAbsent(test)
 
             submitScannedHttp(test, screen)
             expectWarning(test)
-            checkPairCall(screen, expected = false, "scanned HTTP connected before confirmation")
+            checkPairOperation(screen, initialOperation, "scanned HTTP connected before confirmation")
             clickText(test, cancel)
-            checkPairCall(screen, expected = false, "scan cancellation created a pairing request")
+            checkPairOperation(screen, initialOperation, "scan cancellation created a pairing request")
             expectWarningAbsent(test)
 
             submitManualHttp(test, screen)
             expectWarning(test)
             clickText(test, proceed)
-            checkPairCall(screen, expected = true, "manual confirmation did not start pairing")
+            checkPairOperation(screen, initialOperation + 1, "manual confirmation did not start pairing")
             cancelPairCall(test, screen)
 
             submitScannedHttp(test, screen)
             expectWarning(test)
             clickText(test, proceed)
-            checkPairCall(screen, expected = true, "scan confirmation did not start pairing")
+            checkPairOperation(screen, initialOperation + 2, "scan confirmation did not start pairing")
             cancelPairCall(test, screen)
 
             test.finish(Activity.RESULT_OK, Bundle().apply {
@@ -104,33 +105,40 @@ internal object PairingWarningCheck {
     }
 
     private fun expectWarningAbsent(test: ImageRenderingInstrumentation) {
-        test.waitForIdleSync()
-        val root = test.uiAutomation.rootInActiveWindow ?: error("No active window after dismissing warning")
-        check(root.findAccessibilityNodeInfosByText(warning).isEmpty()) { "HTTP warning remained visible" }
+        val deadline = SystemClock.uptimeMillis() + 5_000
+        do {
+            val root = test.uiAutomation.rootInActiveWindow
+            if (root != null && root.matchingTextNodes(warning).isEmpty()) return
+            SystemClock.sleep(100)
+        } while (SystemClock.uptimeMillis() < deadline)
+        error("HTTP warning remained visible")
     }
 
     private fun expectText(test: ImageRenderingInstrumentation, text: String) {
-        test.waitForIdleSync()
-        SystemClock.sleep(100)
-        val root = test.uiAutomation.rootInActiveWindow ?: error("No active window while checking $text")
-        check(root.findAccessibilityNodeInfosByText(text).any { it.text?.toString() == text }) {
-            "Missing visible text: $text"
-        }
+        check(awaitText(test, text) != null) { "Missing visible text: $text" }
     }
 
     private fun clickText(test: ImageRenderingInstrumentation, text: String) {
-        test.waitForIdleSync()
-        val root = test.uiAutomation.rootInActiveWindow ?: error("No active window while clicking $text")
-        val nodes = root.findAccessibilityNodeInfosByText(text)
-        val node = nodes.firstOrNull { it.isClickable }
-            ?: nodes.firstOrNull()?.parent?.takeIf { it.isClickable }
-            ?: error("No clickable action: $text")
-        check(node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) { "Could not click $text" }
+        var node = awaitText(test, text)
+        while (node != null && !node.isClickable) node = node.parent
+        check(node?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true) { "Could not click $text" }
         test.waitForIdleSync()
     }
 
-    private fun checkPairCall(screen: Activity, expected: Boolean, message: String) {
-        check((pairCall(screen) != null) == expected) { message }
+    private fun awaitText(test: ImageRenderingInstrumentation, text: String): AccessibilityNodeInfo? {
+        val deadline = SystemClock.uptimeMillis() + 5_000
+        do {
+            val node = test.uiAutomation.rootInActiveWindow?.matchingTextNodes(text)
+                ?.firstOrNull { it.text?.toString() == text }
+            if (node != null) return node
+            SystemClock.sleep(100)
+        } while (SystemClock.uptimeMillis() < deadline)
+        return null
+    }
+
+    private fun checkPairOperation(screen: Activity, expected: Int, message: String) {
+        // The loopback request may fail before accessibility finishes delivering the click.
+        check(field(screen, "pairOperation") == expected) { message }
     }
 
     private fun cancelPairCall(test: ImageRenderingInstrumentation, screen: Activity) =

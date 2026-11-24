@@ -272,6 +272,8 @@ func (a *Agent) providerSettingsRPC(ctx context.Context, app *appserver.Client, 
 	switch method {
 	case "codexrm/provider/catalog":
 		return a.modelCatalogWithSettings(ctx, app, true)
+	case "codexrm/provider/nativeCapabilities":
+		return nativeProviderCapabilitiesRPC(ctx, app, raw)
 	case "codexrm/provider/details":
 		var params struct {
 			ID string `json:"id"`

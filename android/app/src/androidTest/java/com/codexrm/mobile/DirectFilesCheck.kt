@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 internal object DirectFilesCheck {
-    fun verify(test: Instrumentation, screen: Activity, device: Device, custom: Boolean, batchCopy: Boolean = false): String {
+    fun verify(test: Instrumentation, screen: Activity, device: Device, custom: Boolean, batchCopy: Boolean = false, otherDriveFile: String? = null): String {
         var client: CodexClient? = null
         var cwd = ""
         waitFor("active P2P and workspace") {
@@ -66,11 +66,11 @@ internal object DirectFilesCheck {
                 check(it.moveToFirst() && it.getString(0) == "${Environment.DIRECTORY_DOWNLOADS}/" && it.getInt(1) == 0)
             }
         }
-        fun visible(text: String) = test.uiAutomation.rootInActiveWindow?.findAccessibilityNodeInfosByText(text)?.isNotEmpty() == true
+        fun visible(text: String) = test.uiAutomation.rootInActiveWindow?.matchingTextNodes(text)?.isNotEmpty() == true
         fun clickVisible(text: String, prefix: Boolean = false, longPress: Boolean = false) {
             var match: android.graphics.Rect? = null
             waitFor(text) {
-                match = test.uiAutomation.rootInActiveWindow?.findAccessibilityNodeInfosByText(text)
+                match = test.uiAutomation.rootInActiveWindow?.matchingTextNodes(text)
                     ?.firstOrNull {
                         val label = (it.text ?: it.contentDescription)?.toString()
                         it.isEnabled && it.isVisibleToUser &&
@@ -86,6 +86,41 @@ internal object DirectFilesCheck {
                 event.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
                 try { check(test.uiAutomation.injectInputEvent(event, true)) } finally { event.recycle() }
             }
+        }
+        if (otherDriveFile != null) {
+            val parts = otherDriveFile.replace('\\', '/').split('/')
+            val drive = parts.first() + "\\"
+            val workspaceDrive = cwd.take(2) + "\\"
+            check(!workspaceDrive.equals(drive, ignoreCase = true)) { "Expected a fixture on a different drive" }
+            clickVisible("电脑文件管理")
+            waitFor("computer drive list") { visible("此电脑") && visible(workspaceDrive) && visible(drive) }
+            clickVisible(drive)
+            clickVisible("上一级")
+            waitFor("back to drives") { visible("此电脑") && visible(drive) }
+            clickVisible("后退")
+            waitFor("back into drive") { visible(parts[1]) }
+            parts.drop(1).forEach { clickVisible(it) }
+            val otherKey = WorkspaceDownloads.key(device, RemoteFile(cwd, "", otherDriveFile, computer = true))
+            waitFor("cross-drive file saved") { downloads.contains(otherKey) }
+            val downloaded = requireNotNull(downloads.findReadable(otherKey))
+            try {
+                check(resolver.openInputStream(downloaded)!!.bufferedReader().use { it.readText() } == "computer-files-fixture")
+            } finally {
+                resolver.delete(downloaded, null, null)
+            }
+            clickVisible("关闭文件管理")
+            test.runOnMainSync {
+                val workspace = screen.javaClass.getDeclaredField("workspaceButton").apply { isAccessible = true }.get(screen) as View
+                check(workspace.performLongClick())
+            }
+            waitFor("workspace shortcut") { visible("reports") }
+            clickVisible("上一级")
+            waitFor("workspace parent") { visible(cwd.substringAfterLast('\\')) }
+            clickVisible("后退")
+            waitFor("back to workspace") { visible("reports") }
+            clickVisible("关闭文件管理")
+            check(resolver.delete(uri, null, null) == 1)
+            return "computerDrives=true crossDriveDownload=true workspaceParent=true sha256Match=true"
         }
         test.runOnMainSync {
             val buttons = arrayListOf<View>()
@@ -151,8 +186,8 @@ internal object DirectFilesCheck {
             }
         }
         clickVisible("reports", longPress = true)
-        waitFor("single file action grid") { visible("复制 →") && visible("移动 →") && visible("属性") && visible("关闭操作菜单") }
-        clickVisible("关闭操作菜单")
+        waitFor("single file action grid") { visible("复制 →") && visible("移动 →") && visible("属性") && visible("关闭") }
+        clickVisible("关闭")
         clickVisible("reports")
         waitFor("entered reports") { visible(name) }
         clickVisible("后退")
@@ -166,7 +201,7 @@ internal object DirectFilesCheck {
         waitFor("selection action grid") { visible("复制 →") && visible("移动 →") }
         if (batchCopy) {
             val original = saved
-            clickVisible("关闭操作菜单")
+            clickVisible("关闭")
             clickVisible("notes.txt")
             waitFor("two files selected") { visible("已选 2") }
             clickVisible("所选文件的操作")
@@ -211,7 +246,7 @@ internal object DirectFilesCheck {
                 check(resolver.delete(original, null, null) == 1)
             }
         } else {
-            clickVisible("关闭操作菜单")
+            clickVisible("关闭")
         }
         val reopened = AtomicReference<Intent>()
         val openCount = AtomicInteger()
@@ -242,6 +277,62 @@ internal object DirectFilesCheck {
             check(downloads.findReadable(key) == null)
         }
         return "defaultDownload=true settings=true customDownload=$custom offlineReopen=true dualPane=true cardFilter=true actionGrid=true paneHistory=true batchCopy=$batchCopy p2pBytes=$bytes sha256Match=true"
+    }
+
+    fun verifyImageReference(test: Instrumentation, screen: Activity): String {
+        check(android.os.Build.VERSION.SDK_INT >= 29)
+        var client: CodexClient? = null
+        waitFor("active P2P and workspace") {
+            onMain(test) {
+                client = screen.javaClass.getDeclaredField("client").apply { isAccessible = true }.get(screen) as? CodexClient
+                val cwd = screen.javaClass.getDeclaredField("currentCwd").apply { isAccessible = true }.get(screen) as String
+                client?.usingDirect == true && cwd.isNotEmpty()
+            }
+        }
+        val loader = screen.javaClass.getDeclaredField("imageLoader").apply { isAccessible = true }.get(screen) as MessageImageLoader
+        val id = "image-ref-${SystemClock.elapsedRealtime()}"
+        val destination = "reports/%E9%A2%84%E8%A7%88%20A%2BB.png"
+        lateinit var body: android.widget.TextView
+        lateinit var imageLink: android.text.style.ClickableSpan
+        var downloaded: ArtifactCard? = null
+        test.runOnMainSync {
+            body = android.widget.TextView(screen).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(-1, -2)
+            }
+            Markdown(screen, loader) { downloaded = it }.bind(body, ProtocolFormatter.fromItem(JSONObject()
+                .put("id", id).put("type", "agentMessage")
+                .put("text", "[预览图片]($destination) [下载文件](reports/notes.txt)")))
+            val richText = body.text as android.text.Spanned
+            val links = richText.getSpans(0, richText.length, android.text.style.ClickableSpan::class.java)
+                .associateBy { richText.subSequence(richText.getSpanStart(it), richText.getSpanEnd(it)).toString() }
+            requireNotNull(links["下载文件"]).onClick(body)
+            check(downloaded?.path == "reports/notes.txt")
+            downloaded = null
+            imageLink = requireNotNull(links["预览图片"])
+            imageLink.onClick(body)
+        }
+        fun matching(label: String) = arrayListOf<View>().also { found ->
+            android.view.inspector.WindowInspector.getGlobalWindowViews().forEach {
+                it.findViewsWithText(found, label, View.FIND_VIEWS_WITH_CONTENT_DESCRIPTION)
+            }
+        }
+        fun awaitPreview() = waitFor("full-screen image from Agent") {
+            onMain(test) {
+                val picture = matching("预览 A+B.png").singleOrNull() as? android.widget.ImageView
+                val bitmap = (picture?.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                bitmap?.width == 2400 && bitmap.height == 960 && bitmap.getPixel(0, 0) == android.graphics.Color.RED
+            }
+        }
+        awaitPreview()
+        test.runOnMainSync {
+            check(downloaded == null)
+            check(matching("关闭图片预览").single().performClick())
+            client!!.stop()
+            imageLink.onClick(body)
+        }
+        awaitPreview()
+        test.runOnMainSync { check(matching("关闭图片预览").single().performClick()) }
+        return "PASS: Codex Markdown image link loaded the Agent PNG over P2P and reopened it offline. Ordinary links still download."
     }
 
     private fun onMain(test: Instrumentation, action: () -> Boolean): Boolean {

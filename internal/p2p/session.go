@@ -15,6 +15,8 @@ import (
 	"math/big"
 	"net"
 	"net/netip"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/codexrm/codexrm/internal/protocol"
@@ -33,21 +35,32 @@ type Session struct {
 	key          []byte
 	cert         tls.Certificate
 	sockets      []*net.UDPConn
+	pathSockets  int // wildcard socket plus routable, locally bound alternatives
 	lan          []netip.Prefix
+	paths        []directPath
 	mapping      string
 	dualNATPunch bool
 	ipv6         bool
+
+	clientInitiated bool
 }
 
 func Prepare(ctx context.Context, agent bool, start protocol.P2PSignal) (*Session, *protocol.P2PSignal, error) {
-	var local []netip.Prefix
-	if start.LAN {
-		local = lanInterfaces()
-	}
-	return PrepareWithLocalPrefixes(ctx, agent, start, local)
+	return PrepareWithSources(ctx, agent, start, sourceInterfaces())
 }
 
 func PrepareWithLocalPrefixes(ctx context.Context, agent bool, start protocol.P2PSignal, local []netip.Prefix) (*Session, *protocol.P2PSignal, error) {
+	var sources []Source
+	for _, p := range local {
+		sources = append(sources, Source{Prefix: p, LAN: true})
+	}
+	if len(sources) == 0 && !start.LAN {
+		return Prepare(ctx, agent, start)
+	}
+	return PrepareWithSources(ctx, agent, start, sources)
+}
+
+func PrepareWithSources(ctx context.Context, agent bool, start protocol.P2PSignal, sources []Source) (*Session, *protocol.P2PSignal, error) {
 	key, err := hex.DecodeString(start.Secret)
 	if err != nil || len(key) != 32 || len(start.ID) != 36 || len(start.STUN) > 4 {
 		return nil, nil, errors.New("invalid direct session")
@@ -63,9 +76,11 @@ func PrepareWithLocalPrefixes(ctx context.Context, agent bool, start protocol.P2
 	}
 	s := &Session{agent: agent, id: start.ID, key: key, cert: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}}
 	s.dualNATPunch, s.ipv6 = start.DualNATPunch, start.IPv6
+	s.clientInitiated = start.ClientInitiated
 	if start.LAN {
-		for _, p := range local {
-			if IsLANIPv4(p.Addr()) && p.Bits() > 0 && p.Bits() < 32 {
+		for _, src := range sources {
+			p := src.Prefix
+			if src.LAN && IsLANIPv4(p.Addr()) && p.Bits() > 0 && p.Bits() < 32 {
 				s.lan = append(s.lan, p)
 			}
 		}
@@ -102,54 +117,186 @@ func PrepareWithLocalPrefixes(ctx context.Context, agent bool, start protocol.P2
 		}
 		offer.Candidates = append(offer.Candidates, a.String())
 	}
-	queries := discover(ctx, s.sockets[0], start)
-	s.mapping, offer.Step = classifyMapping(queries)
+	paths := s.discoverPaths(ctx, start, sources)
+	s.mapping, offer.Step = classifyPathMappings(paths)
 	offer.Mapping = s.mapping
-	for _, q := range queries {
-		add(q.mapped)
-		if !q.verifier || q.proof == "" {
+	ranked := s.rankedPaths()
+	hints := make(map[string]protocol.P2PMappingHint)
+	for _, i := range ranked {
+		for _, q := range paths[i] {
+			if q.mapped.Addr().Is4() {
+				raw := q.mapped.String()
+				hint := s.paths[i].hint
+				if prev, exists := hints[raw]; exists && prev != hint {
+					hint = protocol.P2PMappingHint{}
+				}
+				hints[raw] = hint
+			}
+		}
+	}
+	// Keep a verifier-backed candidate first for old RMs. Give distinct egress
+	// IPs priority over additional ports from IPs already offered.
+	proofs := make(map[string]string)
+	observed := make(map[netip.Addr]bool)
+	for _, distinct := range []bool{true, false} {
+		for _, verified := range []bool{true, false} {
+			for _, i := range ranked {
+				for _, q := range paths[i] {
+					if !q.mapped.IsValid() || (q.proof != "") != verified {
+						continue
+					}
+					if verified {
+						proofs[q.mapped.String()] = q.proof
+					}
+					if distinct && observed[q.mapped.Addr()] {
+						continue
+					}
+					add(q.mapped)
+					observed[q.mapped.Addr()] = true
+				}
+			}
+		}
+	}
+	for i, raw := range offer.Candidates {
+		if proof := proofs[raw]; proof != "" {
+			if i == 0 {
+				offer.Proof = proof
+			}
+			if start.MultiPath || len(start.VerifyMore) > 0 {
+				if offer.Proofs == nil {
+					offer.Proofs = make(map[string]string)
+				}
+				offer.Proofs[raw] = proof
+			}
+		}
+		if hint := hints[raw]; start.MultiPath && hint.Mapping != "" {
+			if offer.PathMappings == nil {
+				offer.PathMappings = make(map[string]protocol.P2PMappingHint)
+			}
+			offer.PathMappings[raw] = hint
+		}
+	}
+	// Keep the wildcard's LAN offer for compatibility and include the exact
+	// bound socket ports, one address per route before duplicate addresses.
+	addLAN := func(p netip.Prefix, port uint16) {
+		raw := netip.AddrPortFrom(p.Addr(), port).String()
+		if len(offer.Local) < protocol.P2PMaxCandidates && !slices.Contains(offer.Local, raw) {
+			offer.Local = append(offer.Local, raw)
+		}
+	}
+	for _, i := range ranked {
+		if i == 0 {
 			continue
 		}
-		if offer.Candidates[0] == q.mapped.String() {
-			offer.Proof = q.proof
+		src := s.paths[i].source
+		addr := s.sockets[i].LocalAddr().(*net.UDPAddr).AddrPort()
+		if start.LAN && src.LAN && IsLANIPv4(addr.Addr()) && src.Prefix.Bits() > 0 && src.Prefix.Bits() < 32 {
+			addLAN(src.Prefix, addr.Port())
 		}
-		if len(start.VerifyMore) > 0 {
-			if offer.Proofs == nil {
-				offer.Proofs = make(map[string]string)
-			}
-			offer.Proofs[q.mapped.String()] = q.proof
+		if (!start.LAN || len(start.STUN) > 0) && (IsPublicIPv6(addr.Addr()) || canExpand(addr.Addr())) {
+			add(addr)
 		}
 	}
 	port := s.sockets[0].LocalAddr().(*net.UDPAddr).AddrPort().Port()
+	// Local RM deployments may configure a loopback STUN endpoint and also
+	// rely on on-host connectivity when STUN itself is unavailable.
+	for _, endpoint := range start.STUN {
+		if dst, err := netip.ParseAddrPort(endpoint); err == nil && dst.Addr().IsLoopback() && supportsFamily(s.sockets[0], dst.Addr().Is6()) {
+			add(netip.AddrPortFrom(dst.Addr(), port))
+		}
+	}
 	for _, p := range s.lan {
-		if len(offer.Local) >= protocol.P2PMaxCandidates {
-			break
-		}
-		offer.Local = append(offer.Local, netip.AddrPortFrom(p.Addr(), port).String())
+		addLAN(p, port)
 	}
-	if addrs, e := net.InterfaceAddrs(); e == nil && (!start.LAN || len(start.STUN) > 0) {
-		// List IPv6 host addresses ahead of IPv4 host addresses.
-		var ipv4 []netip.Addr
-		for _, a := range addrs {
-			p, err := netip.ParsePrefix(a.String())
-			if err != nil {
-				continue
-			}
-			if s.ipv6 && IsPublicIPv6(p.Addr()) {
-				add(netip.AddrPortFrom(p.Addr(), port))
-			} else if p.Addr().Is4() {
-				ipv4 = append(ipv4, p.Addr())
+	if !start.LAN || len(start.STUN) > 0 {
+		for _, src := range orderSources(sources, s.ipv6) {
+			ip := src.Prefix.Addr()
+			if ip.Is6() || ip.Is4() {
+				add(netip.AddrPortFrom(ip, port))
 			}
 		}
-		for _, ip := range ipv4 {
-			add(netip.AddrPortFrom(ip, port))
-		}
 	}
-	if ctx.Err() != nil || (len(offer.Candidates) == 0 && len(offer.Local) == 0) {
+	if ctx.Err() != nil || (len(offer.Candidates) == 0 && len(offer.Local) == 0 && (s.agent || !s.clientInitiated)) {
 		s.Close()
 		return nil, nil, errors.New("no UDP candidates")
 	}
 	return s, offer, nil
+}
+
+type directPath struct {
+	source Source
+	hint   protocol.P2PMappingHint
+	rtt    time.Duration
+}
+
+func (s *Session) rankedPaths() []int {
+	order := make([]int, max(1, s.pathSockets))
+	for i := range order {
+		order[i] = i
+	}
+	if len(s.paths) == len(order) {
+		slices.SortStableFunc(order, func(i, j int) int {
+			a, b := s.paths[i].rtt, s.paths[j].rtt
+			switch {
+			case a == b:
+				return 0
+			case a == 0 || (b != 0 && a > b):
+				return 1
+			default:
+				return -1
+			}
+		})
+	}
+	return order
+}
+
+// Keep each socket from discovery through punching and QUIC. A failed STUN
+// probe does not eliminate directly routable LAN or public IPv6 host addresses.
+func (s *Session) discoverPaths(ctx context.Context, start protocol.P2PSignal, sources []Source) [][]discoveryQuery {
+	s.paths = []directPath{{}}
+	if start.MultiPath {
+		for _, src := range orderSources(sources, s.ipv6) {
+			if len(s.sockets) >= maxDirectPaths || ctx.Err() != nil {
+				break
+			}
+			if c, err := listenSource(ctx, src); err == nil {
+				s.sockets = append(s.sockets, c)
+				s.paths = append(s.paths, directPath{source: src})
+			}
+		}
+	}
+	paths := make([][]discoveryQuery, len(s.sockets))
+	var wg sync.WaitGroup
+	for i, c := range s.sockets {
+		wg.Add(1)
+		go func() { defer wg.Done(); paths[i] = discover(ctx, c, start) }()
+	}
+	wg.Wait()
+	keep := 0
+	for i, queries := range paths {
+		path := s.paths[i]
+		ip := path.source.Prefix.Addr()
+		var rtts []time.Duration
+		for _, q := range queries {
+			if q.mapped.IsValid() {
+				rtts = append(rtts, q.rtt)
+			}
+		}
+		if len(rtts) == 0 && i != 0 && !IsPublicIPv6(ip) && !canExpand(ip) &&
+			!(start.LAN && path.source.LAN && IsLANIPv4(ip)) {
+			_ = s.sockets[i].Close()
+			continue
+		}
+		if len(rtts) > 0 {
+			slices.Sort(rtts)
+			path.rtt = rtts[len(rtts)/2]
+		}
+		path.hint.Mapping, path.hint.Step = classifyMapping(queries)
+		paths[keep], s.sockets[keep], s.paths[keep] = queries, s.sockets[i], path
+		keep++
+	}
+	s.sockets, s.paths, s.pathSockets = s.sockets[:keep], s.paths[:keep], keep
+	return paths[:keep]
 }
 
 func (s *Session) openSocket() (*net.UDPConn, error) {
@@ -208,27 +355,39 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 			local = append(local, a)
 		}
 	}
-	if len(targets) == 0 && len(local) == 0 {
+	// Only the Agent can wait for a probe without a verified peer candidate.
+	passive := s.agent && s.clientInitiated && len(offer.Candidates) == 0 && len(offer.Local) == 0
+	if len(targets) == 0 && len(local) == 0 && !passive {
 		return nil, ErrNoPeerCandidate
 	}
 	remoteMapping, remoteStep := protocol.NormalizeMapping(offer.Mapping, offer.Step)
-	dualUnpredictable := s.mapping == protocol.P2PMappingVaries && remoteMapping == protocol.P2PMappingVaries
+	hints := make(map[netip.AddrPort]protocol.P2PMappingHint, len(targets))
+	dualUnpredictable := s.mapping == protocol.P2PMappingVaries && len(targets) > 0
+	for _, a := range targets {
+		hint := protocol.P2PMappingHint{Mapping: remoteMapping, Step: remoteStep}
+		if len(offer.PathMappings) > 0 {
+			hint = offer.PathMappings[a.String()]
+			hint.Mapping, hint.Step = protocol.NormalizeMapping(hint.Mapping, hint.Step)
+		}
+		hints[a] = hint
+		dualUnpredictable = dualUnpredictable && a.Addr().Is4() && hint.Mapping == protocol.P2PMappingVaries
+	}
 	publicDualPunch := dualUnpredictable && s.dualNATPunch && len(targets) > 0
 	punchCtx := ctx
-	if dualUnpredictable {
+	if dualUnpredictable && !passive {
 		limit := dualNATPunchTimeout
 		if !publicDualPunch {
 			if len(local) == 0 {
 				return nil, ErrDualUnpredictableNAT
 			}
-			targets = nil
+			targets, hints = nil, nil
 			limit = 3 * time.Second
 		}
 		var cancel context.CancelFunc
 		punchCtx, cancel = context.WithTimeout(ctx, limit)
 		defer cancel()
 	}
-	i, addr, err := s.punch(punchCtx, targets, local, exactWindow(s.mapping, remoteMapping), remoteStep, publicDualPunch)
+	i, addr, err := s.punchPaths(punchCtx, targets, local, hints, 0, publicDualPunch)
 	if err != nil {
 		if dualUnpredictable && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
 			return nil, ErrDualUnpredictableNAT
@@ -252,6 +411,10 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 	}}
 	tr := &quic.Transport{Conn: c}
 	qc := &quic.Config{HandshakeIdleTimeout: 3 * time.Second, MaxIdleTimeout: 8 * time.Second, KeepAlivePeriod: 2 * time.Second, MaxIncomingStreams: 1, MaxIncomingUniStreams: -1}
+	if s.agent {
+		// One message stream and one Android-to-desktop file stream.
+		qc.MaxIncomingStreams = 2
+	}
 	link := &Link{trans: tr, udp: c, ipv6: addr.Addr().Is6()}
 	for _, a := range local {
 		if a.Addr() == addr.Addr() {

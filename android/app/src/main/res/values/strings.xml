@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">CodexRM</string>
+    <string name="chat_widget_label">CodexRM 会话快捷入口</string>
+    <string name="chat_entry_new">新建会话</string>
+    <string name="chat_entry_search">搜索会话</string>
 </resources>

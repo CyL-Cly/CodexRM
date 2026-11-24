@@ -1,6 +1,7 @@
 package com.codexrm.mobile
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -57,6 +58,47 @@ internal class AttachmentStore(context: Context) {
     fun remove(key: String, file: JSONObject) {
         localFile(file)?.delete()
         save(key, load(key).filter { it.string("draftId") != file.string("draftId") })
+    }
+
+    fun replaceWithMarkup(key: String, original: JSONObject, bitmap: Bitmap, complete: (String?) -> Unit) {
+        worker.execute {
+            var local: File? = null
+            val error = try {
+                val id = UUID.randomUUID().toString()
+                val destination = File(directory, id)
+                local = destination
+                destination.outputStream().use { output ->
+                    if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) throw IOException("无法保存标注")
+                }
+                val size = destination.length()
+                val existing = load(key)
+                val index = existing.indexOfFirst {
+                    it.string("draftId") == original.string("draftId") && it.string("localPath") == original.string("localPath")
+                }
+                if (index < 0) throw IOException("原图片已从草稿移除")
+                if (size > MAX_SIZE || existing.sumOf { it.optLong("size") } - existing[index].optLong("size") + size > MAX_TOTAL) {
+                    throw IOException("标注后的图片超过附件大小限制")
+                }
+                val oldFile = localFile(existing[index])
+                existing[index] = JSONObject()
+                    .put("draftId", id)
+                    .put("name", original.string("name").substringBeforeLast('.').take(180) + "-标注.png")
+                    .put("mimeType", "image/png").put("size", size).put("localPath", destination.absolutePath)
+                if (!prefs.edit().putString(key, JSONArray(existing).toString()).commit()) {
+                    save(key, load(key).toMutableList().apply { this[index] = original })
+                    throw IOException("无法保存标注草稿")
+                }
+                local = null
+                oldFile?.delete()
+                null
+            } catch (error: Exception) {
+                error.message ?: "保存图片标注失败"
+            } finally {
+                local?.delete()
+                bitmap.recycle()
+            }
+            main.post { complete(error) }
+        }
     }
 
     // Copy document-provider streams off the UI thread. The private copy keeps
@@ -116,7 +158,14 @@ internal class AttachmentStore(context: Context) {
         const val MAX_TOTAL = 50L * 1024 * 1024
         const val MARKER = "[CodexRM attachment] "
         val IMAGE_TYPES = setOf("image/png", "image/jpeg", "image/gif", "image/webp")
+        private val IMAGE_EXTENSIONS = setOf("png", "jpg", "jpeg", "gif", "webp")
         private val worker = Executors.newSingleThreadExecutor()
+
+        fun isRelayImage(name: String, mimeType: String): Boolean {
+            val mime = mimeType.substringBefore(';').lowercase(Locale.ROOT)
+            return mime in IMAGE_TYPES || (mime in setOf("", "application/octet-stream") &&
+                name.substringAfterLast('.', "").lowercase(Locale.ROOT) in IMAGE_EXTENSIONS)
+        }
 
         fun sizeLabel(size: Long): String = if (size >= 1024 * 1024) String.format(Locale.US, "%.1f MB", size / 1024.0 / 1024.0)
             else "${maxOf(1L, (size + 1023) / 1024)} KB"

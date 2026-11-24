@@ -2,7 +2,10 @@ package com.codexrm.mobile
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network as AndroidNetwork
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -15,12 +18,23 @@ import org.json.JSONObject
 import org.json.JSONArray
 import java.io.IOException
 import java.net.Inet4Address
+import java.net.Inet6Address
 import kotlin.math.min
 
+private const val RPC_OUTCOME_UNKNOWN = -32098
+private const val DIRECT_START_TIMEOUT_MS = 8_000L
+// Allow the start signal and a full native P2P negotiation (P2PAttempt in Go).
+private const val DESKTOP_SHARE_CONNECT_TIMEOUT_MS = 30_000L
 private const val DUAL_UNPREDICTABLE_NAT = "dual_unpredictable_nat"
 
 internal enum class ConnectionState { CONNECTING, RECONNECTING, ONLINE, OFFLINE }
 internal class RpcOutcomeUnknown(message: String) : IOException(message)
+internal class CodexRpcError(message: String) : IOException(message)
+
+internal fun decodeCodexRpcError(error: JSONObject): IOException {
+    val message = error.string("message").ifEmpty { "Codex 请求失败" }
+    return if (error.optInt("code") == RPC_OUTCOME_UNKNOWN) RpcOutcomeUnknown(message) else CodexRpcError(message)
+}
 
 internal fun interface RpcCallback { fun onComplete(result: JSONObject?, error: Exception?) }
 
@@ -46,6 +60,15 @@ internal class CodexClient(
     }
 
     private data class Pending(val callback: RpcCallback, val timeout: Runnable, val direct: Boolean)
+    private class PendingNAT(val id: String, val callback: (NatDiagnosticResult) -> Unit, val timeout: Runnable) {
+        var started = false
+        var phoneDone = false
+        var usesP2PStun = false
+        var phone: JSONObject? = null
+        var agent: JSONObject? = null
+    }
+    private var pendingNAT: PendingNAT? = null
+    private var natRetryAtMs = 0L
     private val main = Handler(Looper.getMainLooper())
     private val pending = HashMap<Int, Pending>()
     private var socket: WebSocket? = null
@@ -61,6 +84,29 @@ internal class CodexClient(
     private var directActive = false
     private var directLan = false
     internal val usingDirect: Boolean get() = directActive
+    internal fun directTransport(): DirectTransport? = activeDirectTransport
+    private val activeDirectTransport: DirectTransport? get() = direct.takeIf { directActive }
+
+    internal fun withDesktopShareTransport(ready: (DirectTransport?) -> Unit): () -> Unit {
+        val started = SystemClock.elapsedRealtime()
+        val connection = socket
+        val check = object : Runnable {
+            private var negotiated = directStatus == DirectStatus.Negotiating
+            override fun run() {
+                val transport = activeDirectTransport
+                val now = SystemClock.elapsedRealtime()
+                negotiated = negotiated || directStatus == DirectStatus.Negotiating
+                if (transport != null || !active || !online || socket !== connection || relayOnly || !NativeP2P.available ||
+                    (negotiated && directStatus is DirectStatus.Relay) || directRetry.delay(now) == null ||
+                    (!directAvailable && now - started >= DIRECT_START_TIMEOUT_MS) ||
+                    now - started >= DESKTOP_SHARE_CONNECT_TIMEOUT_MS
+                ) ready(transport)
+                else main.postDelayed(this, 100)
+            }
+        }
+        main.post(check)
+        return { main.removeCallbacks(check) }
+    }
     var directStatus: DirectStatus = initialDirectStatus()
         private set
     private var startTimeout: Runnable? = null
@@ -70,9 +116,9 @@ internal class CodexClient(
     private val directRetry = DirectRetry()
     private val retryDirect = Runnable { tryDirect() }
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
-    private var defaultNetwork: android.net.Network? = null
+    private var defaultNetwork: AndroidNetwork? = null
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: android.net.Network) {
+        override fun onAvailable(network: AndroidNetwork) {
             main.post {
                 if (!active || connectivity?.activeNetwork != network || network == defaultNetwork) return@post
                 val changed = defaultNetwork != null || socket != null || reconnect != null
@@ -80,7 +126,7 @@ internal class CodexClient(
                 if (changed) scheduleReconnect(networkRestored = true)
             }
         }
-        override fun onLost(network: android.net.Network) {
+        override fun onLost(network: AndroidNetwork) {
             main.post {
                 if (active && network == defaultNetwork && connectivity?.activeNetwork != network) {
                     defaultNetwork = null
@@ -88,6 +134,29 @@ internal class CodexClient(
                 }
             }
         }
+    }
+    private var directSources = emptyList<DirectSource>()
+    private val refreshDirectSources = Runnable {
+        if (active) {
+            val sources = collectDirectSources()
+            if (sources != directSources) {
+                directSources = sources
+                // Let a live QUIC connection finish on its current network. If it
+                // goes away the native link fails and the next offer uses this list.
+                directRetry.onNetworkChanged()
+                tryDirect()
+            }
+        }
+    }
+    private val directNetworksCallback = object : ConnectivityManager.NetworkCallback() {
+        private fun changed() {
+            main.removeCallbacks(refreshDirectSources)
+            main.postDelayed(refreshDirectSources, 500)
+        }
+        override fun onAvailable(network: AndroidNetwork) = changed()
+        override fun onLost(network: AndroidNetwork) = changed()
+        override fun onLinkPropertiesChanged(network: AndroidNetwork, linkProperties: LinkProperties) = changed()
+        override fun onCapabilitiesChanged(network: AndroidNetwork, networkCapabilities: NetworkCapabilities) = changed()
     }
     private val renewDirectLease = object : Runnable {
         override fun run() {
@@ -105,6 +174,11 @@ internal class CodexClient(
         active = true
         defaultNetwork = connectivity?.activeNetwork
         runCatching { connectivity?.registerDefaultNetworkCallback(networkCallback) }
+        if (!relayOnly && NativeP2P.available) {
+            directSources = collectDirectSources()
+            val networks = NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build()
+            runCatching { connectivity?.registerNetworkCallback(networks, directNetworksCallback) }
+        }
         main.postDelayed(renewDirectLease, 4_000)
         listener.onState(ConnectionState.CONNECTING, null)
         open()
@@ -176,10 +250,13 @@ internal class CodexClient(
                     dropDirect()
                     resetDirectStatus()
                     rejectPending("远程设备已离线")
+                    finishNAT("远程设备已离线。")
                 }
                 if (online) tryDirect()
             }
-            "p2p" -> envelope.optJSONObject("p2p")?.let(::directSignal)
+            "p2p" -> envelope.optJSONObject("p2p")?.let {
+                if (it.string("kind").startsWith("diagnose_")) handleNAT(it) else directSignal(it)
+            }
             "server_message" -> {
                 val message = envelope.optJSONObject("message") ?: return
                 if (message.has("method")) {
@@ -192,7 +269,7 @@ internal class CodexClient(
                 main.removeCallbacks(request.timeout)
                 val error = message.optJSONObject("error")
                 if (error == null) request.callback.onComplete(message.optJSONObject("result") ?: JSONObject(), null)
-                else request.callback.onComplete(null, IOException(error.string("message").ifEmpty { "Codex 请求失败" }))
+                else request.callback.onComplete(null, decodeCodexRpcError(error))
             }
             "error" -> {
                 val id = envelope.string("streamId").toIntOrNull()
@@ -212,20 +289,124 @@ internal class CodexClient(
         if (id.isNotEmpty()) signal.put("id", id)
         if (kind == "begin") {
             signal.put("dualNatPunch", true)
+            signal.put("clientInitiated", true)
             signal.put("ipv6", true)
-            if (localPrefixes().isNotEmpty()) signal.put("lan", true)
+            if (collectDirectSources().any { it.lan }) signal.put("lan", true)
         }
         return socket?.send(JSONObject().put("type", "p2p").put("p2p", signal).toString()) == true
     }
 
-    private fun localPrefixes(): List<String> {
-        val network = connectivity?.activeNetwork ?: return emptyList()
-        val caps = connectivity.getNetworkCapabilities(network) ?: return emptyList()
-        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
-            !(caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) return emptyList()
-        return connectivity.getLinkProperties(network)?.linkAddresses.orEmpty()
-            .filter { it.address is Inet4Address && it.address.isSiteLocalAddress && it.prefixLength in 1..31 }
-            .take(8).map { "${it.address.hostAddress}/${it.prefixLength}" }
+    fun diagnoseNAT(callback: (NatDiagnosticResult) -> Unit) {
+        val unavailable = when {
+            !active || !online -> "Agent 未连接。"
+            !NativeP2P.available -> "手机无法加载 P2P 原生库。"
+            pendingNAT != null -> "诊断已在进行，请稍后再试。"
+            SystemClock.elapsedRealtime() < natRetryAtMs -> "诊断刚刚发起过，请稍后重试。"
+            else -> null
+        }
+        if (unavailable != null) {
+            callback(NatDiagnosticResult(null, null, unavailable, retryAtMs = natRetryAtMs))
+            return
+        }
+        val id = java.util.UUID.randomUUID().toString()
+        val timeout = Runnable {
+            val reason = if (pendingNAT?.started == true) "部分诊断未在时限内返回。" else "RM 未响应诊断请求，请检查 RM 是否已升级。"
+            finishNAT(reason)
+        }
+        pendingNAT = PendingNAT(id, callback, timeout)
+        main.postDelayed(timeout, 4_000)
+        if (!sendSignal("diagnose", id)) finishNAT("无法通过 RM 发送诊断请求。")
+    }
+
+    private fun handleNAT(signal: JSONObject) {
+        val request = pendingNAT ?: return
+        if (signal.optInt("version") != 1 || signal.string("id") != request.id) return
+        when (signal.string("kind")) {
+            "diagnose_error" -> {
+                val reason = signal.string("reason")
+                if (reason == "diagnose_busy") setNATCooldown(signal, 14_000)
+                finishNAT(when (reason) {
+                    "agent_unavailable" -> "Agent 未连接。"
+                    "agent_unsupported" -> "Agent 不支持 NAT 诊断，请更新 Agent。"
+                    "no_ipv4_stun" -> "RM 没有可用的 IPv4 诊断端点，请管理员配置 CODEXRM_P2P_NAT_STUN。"
+                    "diagnose_busy" -> "诊断刚刚发起过，请稍后重试。"
+                    else -> "RM 无法启动 NAT 诊断。"
+                })
+            }
+            "diagnose_start" -> {
+                if (request.started) return
+                val endpoints = signal.optJSONArray("stun")?.takeIf { it.length() in 1..4 }
+                if (endpoints == null) { finishNAT("RM 没有下发可用的 STUN 端点。"); return }
+                request.started = true
+                request.usesP2PStun = signal.optBoolean("natUsesP2PStun")
+                setNATCooldown(signal, 14_000)
+                main.removeCallbacks(request.timeout)
+                main.postDelayed(request.timeout, 14_000)
+                val data = endpoints.toString().toByteArray(Charsets.UTF_8)
+                Thread({
+                    val report = runCatching {
+                        NativeP2P.diagnoseNat(data)?.let { JSONObject(it.toString(Charsets.UTF_8)) }
+                    }.getOrNull()
+                    main.post {
+                        if (pendingNAT !== request) return@post
+                        request.phone = report
+                        request.phoneDone = true
+                        if (request.agent != null) finishNAT()
+                    }
+                }, "codexrm-nat-diagnostic").start()
+            }
+            "diagnose_result" -> if (request.started) {
+                request.agent = signal.optJSONObject("natResult") ?: return
+                if (request.phoneDone) finishNAT()
+            }
+        }
+    }
+
+    private fun setNATCooldown(signal: JSONObject, fallbackMs: Long) {
+        val waitMs = signal.optLong("natRetryAfterMs", fallbackMs).coerceIn(1, 14_000)
+        natRetryAtMs = SystemClock.elapsedRealtime() + waitMs
+    }
+
+    private fun finishNAT(reason: String? = null) {
+        val request = pendingNAT ?: return
+        pendingNAT = null
+        main.removeCallbacks(request.timeout)
+        request.callback(NatDiagnosticResult(request.phone, request.agent, reason, request.usesP2PStun, natRetryAtMs))
+    }
+
+    private data class DirectSource(val handle: Long, val prefix: String, val lan: Boolean)
+
+    @Suppress("DEPRECATION")
+    private fun collectDirectSources(): List<DirectSource> {
+        val manager = connectivity ?: return emptyList()
+        val default = manager.activeNetwork
+        if (default != null && manager.getNetworkCapabilities(default)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+            return emptyList()
+        }
+        val networks = (listOfNotNull(default) + manager.allNetworks.sortedBy { it.networkHandle }).distinct()
+        val addresses = networks.mapNotNull { network ->
+            val caps = manager.getNetworkCapabilities(network) ?: return@mapNotNull null
+            val lan = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+            val cell = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) || (!lan && !cell) ||
+                (cell && (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
+                    (network != default && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))))) return@mapNotNull null
+            manager.getLinkProperties(network)?.linkAddresses.orEmpty().asSequence()
+                .filter { link ->
+                    val address = link.address
+                    !address.isAnyLocalAddress && !address.isLoopbackAddress && !address.isLinkLocalAddress && !address.isMulticastAddress &&
+                        (address is Inet4Address || (address is Inet6Address && address.address[0].toInt() and 0xe0 == 0x20))
+                }
+                .sortedBy { it.address.hostAddress }
+                .groupBy { it.address is Inet6Address }.values.map { family ->
+                    family.take(2).map { link ->
+                        val ip = link.address.hostAddress.orEmpty().substringBefore('%')
+                        DirectSource(network.networkHandle, "$ip/${link.prefixLength}",
+                            lan && link.address is Inet4Address && link.address.isSiteLocalAddress && link.prefixLength in 1..31)
+                    }
+                }
+        }.flatten()
+        return ((addresses.mapNotNull { it.getOrNull(0) }) + addresses.mapNotNull { it.getOrNull(1) }).take(12)
     }
 
     private fun tryDirect() {
@@ -249,7 +430,7 @@ internal class CodexClient(
             retryAfterDirectFailure("等待 RM 开始直连协商超时。")
         }
         startTimeout = timeout
-        main.postDelayed(timeout, 8_000)
+        main.postDelayed(timeout, DIRECT_START_TIMEOUT_MS)
     }
 
     private fun initialDirectStatus() = DirectStatus.Relay(
@@ -321,7 +502,11 @@ internal class CodexClient(
                 cancelDirectTimers()
                 directRetry.started(SystemClock.elapsedRealtime())
                 directLan = false
-                signal.put("localPrefixes", JSONArray(if (signal.optBoolean("lan")) localPrefixes() else emptyList<String>()))
+                val sources = collectDirectSources()
+                directSources = sources
+                signal.put("localSources", JSONArray(sources.map {
+                    JSONObject().put("network", it.handle.toString()).put("prefix", it.prefix).put("lan", it.lan)
+                }))
                 val transport = DirectTransport.open(signal) ?: run {
                     sendSignal("stop", id)
                     retryAfterDirectFailure("手机无法启动 P2P 直连。")
@@ -409,7 +594,20 @@ internal class CodexClient(
     }
 
     fun request(method: String, params: JSONObject = JSONObject(), timeoutMs: Long = 120_000, callback: RpcCallback) {
-        request(method, params, requireDirect = false, timeoutMs = timeoutMs, callback = callback)
+        val directOnly = method.startsWith("codexrm/attachment/") || method == "codexrm/image/read"
+        if (directOnly && !usingDirect) {
+            main.post { callback.onComplete(null, IOException("此文件传输需要 P2P 直连")) }
+            return
+        }
+        request(method, params, requireDirect = directOnly, timeoutMs = timeoutMs, callback = callback)
+    }
+
+    fun requestDesktopShare(transport: DirectTransport, operation: String, params: JSONObject, callback: RpcCallback) {
+        if (activeDirectTransport !== transport) {
+            main.post { callback.onComplete(null, IOException(DESKTOP_SHARE_DIRECT_REQUIRED)) }
+            return
+        }
+        request("codexrm/attachment/$operation", params, requireDirect = true, timeoutMs = 120_000, callback = callback)
     }
 
     fun requestProviderSettings(operation: String, params: JSONObject, requireDirect: Boolean, callback: RpcCallback) {
@@ -488,6 +686,7 @@ internal class CodexClient(
         socket?.cancel()
         socket = null
         rejectPending("服务器连接中断")
+        finishNAT("服务器连接中断。")
         listener.onState(ConnectionState.RECONNECTING, null)
         reconnect?.let(main::removeCallbacks)
         val delay = if (networkRestored) {
@@ -517,6 +716,8 @@ internal class CodexClient(
         active = false
         online = false
         runCatching { connectivity?.unregisterNetworkCallback(networkCallback) }
+        runCatching { connectivity?.unregisterNetworkCallback(directNetworksCallback) }
+        main.removeCallbacks(refreshDirectSources)
         main.removeCallbacks(renewDirectLease)
         main.removeCallbacks(welcomeTimeout)
         dropDirect()
@@ -525,6 +726,7 @@ internal class CodexClient(
         reconnect?.let(main::removeCallbacks)
         reconnect = null
         rejectPending("连接已关闭")
+        finishNAT("连接已关闭。")
         socket?.close(1000, "Activity stopped")
         socket = null
     }

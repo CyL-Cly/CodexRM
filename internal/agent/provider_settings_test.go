@@ -213,3 +213,45 @@ func TestProviderModelBatchCommitsTogether(t *testing.T) {
 		t.Fatal("unrelated provider was modified")
 	}
 }
+
+func TestGPTProviderSettingsPersistAndReachRuntimeOverrides(t *testing.T) {
+	ctx := context.Background()
+	a := &Agent{cfg: Config{DataDir: t.TempDir(), CCSwitchDB: providerFixture(t)}}
+	saved, err := providers.Load(ctx, a.cfg.CCSwitchDB)
+	if err != nil || len(saved) == 0 {
+		t.Fatalf("load saved providers: %v", err)
+	}
+	created, err := a.providerSettingsRPC(ctx, nil, "codexrm/provider/save", mustJSON(map[string]any{
+		"name": "Custom provider", "baseUrl": "https://local-provider.example/v1",
+	}), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{saved[0].ID, created.(map[string]string)["id"]} {
+		for _, step := range []struct {
+			enabled bool
+			mode    string
+		}{{true, "v2"}, {false, "unsupported"}} {
+			if _, err = a.providerSettingsRPC(ctx, nil, "codexrm/provider/save", mustJSON(map[string]any{
+				"id": id, "gptOfficial": step.enabled,
+			}), false); err != nil {
+				t.Fatal(err)
+			}
+			details, err := a.providerSettingsRPC(ctx, nil, "codexrm/provider/details", mustJSON(map[string]string{"id": id}), false)
+			if err != nil || details.(providers.ProviderDetails).GPTOfficial != step.enabled || details.(providers.ProviderDetails).Official {
+				t.Fatalf("unexpected provider details: %+v, %v", details, err)
+			}
+			params := map[string]any{"codexrmProvider": id}
+			if err := a.prepareProvider(ctx, nil, "thread/start", params); err != nil {
+				t.Fatal(err)
+			}
+			config := params["config"].(map[string]any)["model_providers."+id].(map[string]any)
+			if config["supports_websockets"] != step.enabled || config["capabilities"].(map[string]any)["remote_compaction"] != step.mode {
+				t.Fatal("runtime overrides are missing the saved provider capabilities")
+			}
+			if id == saved[0].ID && config["experimental_bearer_token"] != "secret-1" {
+				t.Fatal("capabilities edit changed existing provider credentials")
+			}
+		}
+	}
+}

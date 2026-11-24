@@ -14,12 +14,16 @@ import android.view.View
 import android.widget.TextView
 import io.noties.markwon.AbstractMarkwonPlugin
 import io.noties.markwon.MarkwonSpansFactory
+import io.noties.markwon.LinkResolver
+import io.noties.markwon.core.CoreProps
+import io.noties.markwon.core.spans.LinkSpan
 import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.AsyncDrawableScheduler
 import io.noties.markwon.image.AsyncDrawableSpan
 import io.noties.markwon.image.ImageProps
 import org.commonmark.node.Image
+import org.commonmark.node.Link
 import java.util.Collections
 import java.util.WeakHashMap
 
@@ -41,7 +45,7 @@ internal class MessageImagesPlugin(private val context: Context, private val ima
                         // Empty bounds otherwise collapse an already decoded image.
                         setBounds(0, 0, intrinsicWidth, intrinsicHeight)
                     } },
-                    onFailure = { label("图片加载失败，点击重试") },
+                    onFailure = { label("图片无法显示，点击查看详情") },
                 ))
             }
         }
@@ -50,18 +54,25 @@ internal class MessageImagesPlugin(private val context: Context, private val ima
     }
 
     override fun configureSpansFactory(builder: MarkwonSpansFactory.Builder) {
+        builder.setFactory(Link::class.java) { configuration, props ->
+            val destination = CoreProps.LINK_DESTINATION.require(props)
+            val image = MessageImage.fromMarkdown(destination, link = true)?.copy(messageId = messageId)
+            val resolver = if (image == null) configuration.linkResolver() else LinkResolver { view, _ ->
+                showImagePreview(view.context, images, image)
+            }
+            LinkSpan(configuration.theme(), destination, resolver)
+        }
         builder.setFactory(Image::class.java) { configuration, props ->
             val source = ImageProps.DESTINATION.require(props)
             val drawable = AsyncDrawable(source, loader, configuration.imageSizeResolver(), ImageProps.IMAGE_SIZE.get(props))
-            val image = MessageImage.fromSource(source)?.copy(messageId = messageId)
+            val image = MessageImage.fromMarkdown(source)?.copy(messageId = messageId)
             if (image != null) sources[drawable] = image
             arrayOf<Any>(
                 AsyncDrawableSpan(configuration.theme(), drawable, AsyncDrawableSpan.ALIGN_BOTTOM, false),
                 object : ClickableSpan() {
                     override fun onClick(widget: View) {
                         val bitmap = (drawable.result as? BitmapDrawable)?.bitmap
-                        if (bitmap != null && image != null) showImagePreview(widget.context, images, image, bitmap)
-                        else loader.load(drawable)
+                        if (image != null) showImagePreview(widget.context, images, image, bitmap)
                     }
                     override fun updateDrawState(ds: TextPaint) { ds.isUnderlineText = false }
                 },
@@ -86,5 +97,5 @@ internal class MessageImagesPlugin(private val context: Context, private val ima
         override fun setColorFilter(colorFilter: ColorFilter?) { paint.colorFilter = colorFilter }
         @Deprecated("Deprecated in Java")
         override fun getOpacity(): Int = PixelFormat.OPAQUE
-    }
+    }.apply { setBounds(0, 0, intrinsicWidth, intrinsicHeight) }
 }

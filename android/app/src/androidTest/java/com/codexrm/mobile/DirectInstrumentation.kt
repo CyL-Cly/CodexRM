@@ -38,6 +38,7 @@ class DirectInstrumentation : Instrumentation() {
                 "Unlock the device normally before running this test"
             }
             val cm = targetContext.getSystemService(ConnectivityManager::class.java)
+            val verifyImageReference = args.getString("imageReference") == "true"
             val verifyFiles = args.getString("files") == "true"
             val verifyLan = args.getString("lan") == "true"
             fun onExpectedNetwork(): Boolean {
@@ -45,7 +46,7 @@ class DirectInstrumentation : Instrumentation() {
                 val transport = if (verifyLan) NetworkCapabilities.TRANSPORT_WIFI else NetworkCapabilities.TRANSPORT_CELLULAR
                 return caps.hasTransport(transport) && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
             }
-            check(verifyFiles || onExpectedNetwork()) { "Default network does not match the test" }
+            check(verifyFiles || verifyImageReference || onExpectedNetwork()) { "Default network does not match the test" }
             val url = requireNotNull(args.getString("rm"))
             val code = requireNotNull(args.getString("pair"))
             val rounds = (args.getString("rounds")?.toIntOrNull() ?: 20).coerceIn(1, 200)
@@ -59,38 +60,71 @@ class DirectInstrumentation : Instrumentation() {
             }
             val agent = claim.getJSONObject("agent")
             val device = Device(claim.getString("clientId"), claim.getString("token"), url, agent.getString("agentId"), agent.optString("serverName", "P2P QA"))
+            args.getString("shareSpeed")?.let { mode ->
+                val mib = (args.getString("mib")?.toIntOrNull() ?: 128).coerceIn(0, 512)
+                val screen = startActivitySync(Intent().setClassName(targetContext.packageName,
+                    "com.codexrm.mobile.MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                activity = screen
+                val summary = DirectShareSpeedCheck.run(this, device, mode, mib)
+                runOnMainSync { screen.finish() }
+                result.putString("stream", "\n$summary\n")
+                finish(Activity.RESULT_OK, result)
+                return
+            }
+            val natMode = args.getString("nat")
             val verifyIndicator = args.getString("indicator") == "true"
-            if (verifyIndicator || verifyFiles) {
+            // RPC-only checks must not wait for Android to foreground an Activity.
+            if (natMode != null || verifyIndicator || verifyFiles || verifyImageReference) {
                 DeviceStore(targetContext).apply {
                     save(listOf(device))
                     selectedId = device.agentId
                 }
+                val screen = startActivitySync(Intent().setClassName(targetContext.packageName,
+                    "com.codexrm.mobile.MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                activity = screen
+                if (verifyImageReference) {
+                    val summary = DirectFilesCheck.verifyImageReference(this, screen)
+                    runOnMainSync { screen.finish() }
+                    finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "\n$summary\n") })
+                    return
+                }
+                if (verifyFiles) {
+                    result.putString("stream", "\n" + DirectFilesCheck.verify(this, screen, device,
+                        args.getString("customDownloads") == "true", args.getString("batchCopy") == "true", args.getString("otherDriveFile")) + "\n")
+                    runOnMainSync { screen.finish() }
+                    finish(Activity.RESULT_OK, result)
+                    return
+                }
+                if (natMode != null) {
+                    val detail = NatDiagnosticCheck.run(this, screen, natMode, args.getString("natRetry") == "true")
+                    check(onExpectedNetwork()) { "Default network changed during NAT diagnosis" }
+                    runOnMainSync { screen.finish() }
+                    finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "\n$detail\n") })
+                    return
+                }
+                if (verifyIndicator) {
+                    val detail = checkIndicator(screen, expectedDirect, verifyLan)
+                    result.putString("stream", "\nconnectionIndicator=$detail\n")
+                    runOnMainSync { screen.finish() }
+                    finish(Activity.RESULT_OK, result)
+                    return
+                }
             }
-            val screen = startActivitySync(Intent().setClassName(targetContext.packageName,
-                "com.codexrm.mobile.MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            activity = screen
-            if (verifyFiles) {
-                result.putString("stream", "\n" + DirectFilesCheck.verify(this, screen, device, args.getString("customDownloads") == "true", args.getString("batchCopy") == "true") + "\n")
-                runOnMainSync { screen.finish() }
-                finish(Activity.RESULT_OK, result)
-                return
-            }
-            if (verifyIndicator) {
-                val detail = checkIndicator(screen, expectedDirect, verifyLan)
-                result.putString("stream", "\nconnectionIndicator=$detail\n")
-                runOnMainSync { screen.finish() }
-                finish(Activity.RESULT_OK, result)
-                return
+            val reportProgress = args.getString("progress") == "true"
+            fun progress(message: String) {
+                if (reportProgress) sendStatus(0, Bundle().apply { putString("stream", "\n$message\n") })
             }
             val durations = mutableListOf<Long>()
             var relay = 0
             for (round in 1..rounds) {
                 check(onExpectedNetwork()) { "Default network changed" }
+                progress("round=$round start")
                 val relayDone = CountDownLatch(1)
                 val directDone = CountDownLatch(1)
                 val directElapsed = AtomicReference<Long?>()
                 lateinit var client: CodexClient
                 var relayStarted = false
+                val directStatus = AtomicReference<String?>()
                 val started = SystemClock.elapsedRealtime()
                 runOnMainSync {
                     client = CodexClient(targetContext, device, object : CodexClient.Listener {
@@ -104,6 +138,13 @@ class DirectInstrumentation : Instrumentation() {
                         }
                         override fun onRpcEvent(message: JSONObject) = Unit
                         override fun onAuthorizationExpired() = Unit
+                        override fun onDirectStatusChanged() {
+                            directStatus.set(when (val status = client.directStatus) {
+                                is DirectStatus.Connected -> if (status.lan) "lan" else "public"
+                                is DirectStatus.Negotiating -> "negotiating"
+                                is DirectStatus.Relay -> status.reason
+                            })
+                        }
                         override fun onDirectFallback() = Unit
                         override fun onFailure(message: String) = Unit
                     })
@@ -131,7 +172,9 @@ class DirectInstrumentation : Instrumentation() {
                     }
                     if (relayDone.count == 0L) relay++
                     directElapsed.get()?.let(durations::add)
-                    Log.i("CodexRM-P2P-QA", "round=" + round + " relay=" + (relayDone.count == 0L) + " directMs=" + directElapsed.get())
+                    val summary = "round=$round relay=${relayDone.count == 0L} directMs=${directElapsed.get()}"
+                    Log.i("CodexRM-P2P-QA", summary)
+                    progress("$summary status=${directStatus.get()}")
                 } finally {
                     runOnMainSync { client.stop() }
                 }
@@ -143,7 +186,6 @@ class DirectInstrumentation : Instrumentation() {
                 verifyLan -> durations.size == rounds
                 else -> durations.size * 2 > rounds
             }) { "Unexpected direct success rate" }
-            runOnMainSync { screen.finish() }
             finish(Activity.RESULT_OK, result)
         } catch (failure: Throwable) {
             Log.e("CodexRM-P2P-QA", "Instrumentation failed", failure)

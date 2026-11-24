@@ -43,6 +43,15 @@ class ComposerStateTest {
         assertEquals("new\noriginal", ComposerText.afterFailedSend("new\noriginal", "original"))
     }
 
+    @Test fun relayImagesUseSupportedMimeTypesOrExtensionsForUnknownTypes() {
+        assertTrue(AttachmentStore.isRelayImage("camera", "image/jpeg"))
+        assertTrue(AttachmentStore.isRelayImage("preview.WeBp", ""))
+        assertTrue(AttachmentStore.isRelayImage("preview.GIF", "application/octet-stream"))
+        assertFalse(AttachmentStore.isRelayImage("fake.png", "text/plain"))
+        assertFalse(AttachmentStore.isRelayImage("drawing.svg", "image/svg+xml"))
+        assertFalse(AttachmentStore.isRelayImage("notes.pdf", ""))
+    }
+
     @Test fun queuedDraftPreservesExistingTextAndUploadedAttachments() {
         val photo = JSONObject().put("id", "uploaded-image").put("name", "photo.png")
             .put("mimeType", "image/png").put("path", "/uploads/photo.png").put("size", 128)

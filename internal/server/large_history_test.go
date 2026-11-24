@@ -214,7 +214,8 @@ func TestLargeThreadHistoryKeepsRelayConnected(t *testing.T) {
 		t.Fatalf("pagination returned %d turns, want %d", len(loaded), len(turns))
 	}
 	for i, turn := range loaded {
-		if string(turn) != string(turns[i]) {
+		filtered, _ := protocol.WithoutInlineFiles(turns[i])
+		if string(turn) != string(filtered) {
 			t.Fatalf("turn %d was changed, skipped or reordered", i)
 		}
 	}
@@ -237,7 +238,7 @@ func TestLargeThreadHistoryKeepsRelayConnected(t *testing.T) {
 		t.Fatalf("oversized turn marker or identity lost: %+v (%v)", omitted, err)
 	}
 	older := decode(call("thread/turns/list", map[string]any{"threadId": oversizedTurn, "cursor": degraded.Result.NextCursor}))
-	if older.Error != nil || len(older.Result.Data) != 1 || string(older.Result.Data[0]) != string(turns[0]) {
+	if older.Error != nil || len(older.Result.Data) != 1 || !bytes.Equal(older.Result.Data[0], loaded[0]) {
 		t.Fatal("could not paginate past an oversized turn")
 	}
 	if result := decode(call("thread/read", map[string]any{"threadId": oversizedTurn, "includeTurns": true})); result.Error == nil {
@@ -247,33 +248,8 @@ func TestLargeThreadHistoryKeepsRelayConnected(t *testing.T) {
 	if files.Error != nil || len(files.Result.Thread.Turns) != 1 || !bytes.Equal(files.Result.Thread.Turns[0], filesTurn) {
 		t.Fatal("generated file references were lost in history")
 	}
-	for i, item := range fileItems {
-		var got []byte
-		version := ""
-		for len(got) < imageSize {
-			var reply struct {
-				Result struct {
-					File   struct{ Version string }
-					Data   []byte
-					Offset int
-				}
-				Error *struct{ Message string }
-			}
-			message := call("codexrm/image/read", map[string]any{"path": item["savedPath"], "offset": len(got), "version": version})
-			if err := json.Unmarshal(message, &reply); err != nil || reply.Error != nil {
-				t.Fatalf("generated image %d could not be read: %v (%+v)", i, err, reply.Error)
-			}
-			chunk := reply.Result.Data
-			if len(chunk) == 0 || len(chunk) > 256<<10 || reply.Result.Offset != len(got)+len(chunk) {
-				t.Fatalf("invalid chunk for generated image %d at offset %d", i, len(got))
-			}
-			version = reply.Result.File.Version
-			got = append(got, chunk...)
-		}
-		want := append(bytes.Clone(png), bytes.Repeat([]byte{byte(i)}, imageSize-len(png))...)
-		if !bytes.Equal(got, want) {
-			t.Fatalf("generated image %d changed during transfer", i)
-		}
+	for _, item := range fileItems {
+		assertRelayFileDenied(t, c, "codexrm/image/read", map[string]any{"path": item["savedPath"]})
 	}
 	callID++
 	rpc(t, c, callID, "test/emitGeneratedImages", nil)
@@ -290,8 +266,8 @@ func TestLargeThreadHistoryKeepsRelayConnected(t *testing.T) {
 		}
 		_ = json.Unmarshal(e.Message, &event)
 		if event.Method == "item/completed" {
-			if receivedImages >= len(inlineItems) || event.Params.Item["id"] != inlineItems[receivedImages]["id"] || event.Params.Item["result"] != largeImage {
-				t.Fatal("generated image notification was changed or reordered")
+			if receivedImages >= len(inlineItems) || event.Params.Item["id"] != inlineItems[receivedImages]["id"] || event.Params.Item["result"] != "" {
+				t.Fatal("generated image metadata was reordered or image bytes reached the relay")
 			}
 			receivedImages++
 		}

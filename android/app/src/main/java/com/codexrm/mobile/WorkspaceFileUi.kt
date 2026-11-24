@@ -2,7 +2,6 @@ package com.codexrm.mobile
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.Intent
 import android.content.ActivityNotFoundException
 import android.content.pm.PackageManager
@@ -10,7 +9,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.SystemClock
-import android.widget.ProgressBar
 import android.widget.Toast
 import kotlin.concurrent.thread
 
@@ -26,7 +24,7 @@ internal class WorkspaceFileUi(
     val hasCustomDownloadLocation: Boolean get() = downloads.location != null
     private var manager: WorkspaceFilesDialog? = null
     private var transfer: DirectFileDownload? = null
-    private var progress: AlertDialog? = null
+    private var progress: MiuixDialog? = null
     private data class Request(val key: String, val source: RemoteFile, val name: String, val folder: PhoneFolder?)
     private data class DownloadJob(val owner: Device, val requests: List<Request>, val copying: Boolean = false)
     private var pendingPermission: DownloadJob? = null
@@ -63,10 +61,10 @@ internal class WorkspaceFileUi(
         }
     }
 
-    fun open(source: RemoteFile) {
+    fun open(source: RemoteFile, computerFiles: Boolean = false, startAtComputer: Boolean = false) {
         manager?.dismiss()
         lateinit var next: WorkspaceFilesDialog
-        next = WorkspaceFilesDialog(activity, source, client, downloads, { chooseFolder(PICK_BROWSER_TREE) },
+        next = WorkspaceFilesDialog(activity, source, computerFiles, startAtComputer, client, downloads, { chooseFolder(PICK_BROWSER_TREE) },
             ::openOrDownload, ::copyFiles, ::openLocal) {
             if (manager === next) manager = null
         }
@@ -166,8 +164,7 @@ internal class WorkspaceFileUi(
             return
         }
         val request = job.requests[index]
-        val bar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 1000
+        val bar = MiuixProgressView(activity, linear = true, maximum = 1000).apply {
             isIndeterminate = true
             contentDescription = "文件传输进度"
         }
@@ -180,7 +177,7 @@ internal class WorkspaceFileUi(
             addView(bar)
         }
         val title = if (job.requests.size == 1) request.name else "${index + 1}/${job.requests.size} · ${request.name}"
-        val dialog = AlertDialog.Builder(activity).setTitle(title).setView(layout)
+        val dialog = MiuixDialog.Builder(activity).setTitle(title).setView(layout)
             .setNegativeButton("取消") { _, _ -> activityStopped() }.create()
         dialog.setOnCancelListener { activityStopped() }
         progress = dialog
@@ -200,7 +197,7 @@ internal class WorkspaceFileUi(
                 else {
                     status.text = "正在保存文件…"
                     bar.isIndeterminate = true
-                    dialog.getButton(AlertDialog.BUTTON_NEGATIVE).isEnabled = false
+                    dialog.getButton(MiuixDialog.NEGATIVE).isEnabled = false
                     dialog.setCancelable(false)
                     saveTo(job, index, file, epoch)
                 }
