@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -86,15 +88,21 @@ func Login(ctx context.Context, cfg CloudreveConfig) (*Client, error) {
 }
 
 func (c *Client) request(ctx context.Context, method, path string, value any) (json.RawMessage, error) {
-	data, err := json.Marshal(value)
+	var body io.Reader
+	if method != http.MethodGet && method != http.MethodHead {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(data)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.base+path, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -158,21 +166,94 @@ func (c *Client) Link(ctx context.Context, name string) (string, error) {
 }
 
 func (c *Client) Upload(ctx context.Context, name string, reader io.ReaderAt, size int64, mimeType string) error {
+	if size <= 0 {
+		return errors.New("cannot upload an empty file")
+	}
+	const partSize int64 = 8 << 20
+	hash := sha256.New()
+	partHashes := make([][8]uint32, 0)
+	for offset := int64(0); offset < size; offset += partSize {
+		n := partSize
+		if size-offset < n {
+			n = size - offset
+		}
+		if _, err := io.Copy(hash, io.NewSectionReader(reader, offset, n)); err != nil {
+			return err
+		}
+		if offset+n < size {
+			state, err := hash.(encoding.BinaryMarshaler).MarshalBinary()
+			if err != nil {
+				return err
+			}
+			var words [8]uint32
+			for i := range words {
+				words[i] = binary.BigEndian.Uint32(state[4+i*4 : 8+i*4])
+			}
+			partHashes = append(partHashes, words)
+		}
+	}
+	contentHash := hex.EncodeToString(hash.Sum(nil))
 	data, err := c.request(ctx, "PUT", "/file/upload", map[string]any{
-		"uri": c.uri(name), "size": size, "last_modified": time.Now().UnixMilli(), "mime_type": mimeType, "entity_type": "version",
+		"uri":           c.uri(name),
+		"size":          size,
+		"last_modified": time.Now().UnixMilli(),
+		"mime_type":     mimeType,
+		"entity_type":   "version",
+		"content_hash":  contentHash,
+		"part_hashes":   partHashes,
+		"chunk_size":    partSize,
 	})
 	if err != nil {
 		return err
 	}
 	var session struct {
-		ID        string `json:"session_id"`
-		ChunkSize int64  `json:"chunk_size"`
-		Policy    struct {
+		ID             string   `json:"session_id"`
+		URLs           []string `json:"upload_urls"`
+		CallbackSecret string   `json:"callback_secret"`
+		ChunkSize      int64    `json:"chunk_size"`
+		Policy         struct {
 			Type  string `json:"type"`
 			Relay bool   `json:"relay"`
 		} `json:"storage_policy"`
 	}
 	if err = json.Unmarshal(data, &session); err != nil {
+		return err
+	}
+	if session.Policy.Type == "yun139" && !session.Policy.Relay {
+		if session.ID == "" || session.CallbackSecret == "" || session.ChunkSize != partSize {
+			return errors.New("invalid yun139 upload session")
+		}
+		expected := (size + partSize - 1) / partSize
+		if len(session.URLs) != 0 && int64(len(session.URLs)) != expected {
+			return errors.New("yun139 upload URL count differs from package chunks")
+		}
+		for i, target := range session.URLs {
+			u, err := url.Parse(target)
+			if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+				return errors.New("invalid yun139 upload URL")
+			}
+			offset := int64(i) * partSize
+			n := partSize
+			if size-offset < n {
+				n = size - offset
+			}
+			req, err := http.NewRequestWithContext(ctx, "PUT", target, io.NewSectionReader(reader, offset, n))
+			if err != nil {
+				return err
+			}
+			req.ContentLength = n
+			req.Header.Set("Content-Type", "application/octet-stream")
+			resp, err := c.HTTP.Do(req)
+			if err != nil {
+				return fmt.Errorf("yun139 chunk %d upload failed", i)
+			}
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				return fmt.Errorf("yun139 chunk %d HTTP %d", i, resp.StatusCode)
+			}
+		}
+		_, err := c.request(ctx, "GET", "/callback/yun139/"+url.PathEscape(session.ID)+"/"+url.PathEscape(session.CallbackSecret), nil)
 		return err
 	}
 	if session.ID == "" || session.Policy.Type != "local" && !session.Policy.Relay {
@@ -181,9 +262,6 @@ func (c *Client) Upload(ctx context.Context, name string, reader io.ReaderAt, si
 	chunk := session.ChunkSize
 	if chunk <= 0 || chunk > size {
 		chunk = size
-	}
-	if size <= 0 {
-		return errors.New("cannot upload an empty file")
 	}
 	for offset, index := int64(0), 0; offset < size; index++ {
 		length := chunk

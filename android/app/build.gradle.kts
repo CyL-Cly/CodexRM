@@ -59,8 +59,8 @@ android {
         minSdk = 28
         targetSdk = 35
         ndk { abiFilters.add("arm64-v8a") }
-        versionCode = 54
-        versionName = "1.6.3"
+        versionCode = 55
+        versionName = "1.6.4"
         testInstrumentationRunner = if (p2pQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {
