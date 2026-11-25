@@ -14,9 +14,16 @@
 
 功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复；发送在途记录独立保存，进程或页面中断后标记为“发送状态未确认”，先同步核对，不自动重发。配对失效可直接重新配对，草稿继续保留。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
 
-网页采用 DeepSeek Harness 的主题、侧栏、居中新对话页、圆角输入区、消息气泡和模型菜单布局，适配 CodexRM 的设备、工作区和 Codex 通信。模型菜单提供按供应商分组、搜索及思考强度选择。新对话沿用当前浏览器内这台设备最近选择或成功发送使用的供应商、模型和思考强度，跨工作区、刷新后保留；仅查看旧对话不会覆盖最近选择。无记录或模型已不可用时，选择可用的默认模型。复用主题和布局样式的 MIT 许可见 `web/dsh-LICENSE.txt`。
+网页采用 DeepSeek Harness 的主题、侧栏、居中新对话页、圆角输入区、消息气泡和模型菜单布局，适配 CodexRM 的设备、工作区和 Codex 通信。模型菜单提供按供应商分组、搜索及思考强度选择。新对话沿用当前浏览器内这台设备最近选择或成功发送使用的供应商、模型和思考强度，跨工作区、刷新后保留；仅查看旧对话不会覆盖最近选择。没有最近使用的模型时，保持当前 Codex 配置，不另选一个模型。复用主题和布局样式的 MIT 许可见 `web/dsh-LICENSE.txt`。
 
 Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、JPEG、GIF、WebP 图片，无需 P2P 直连。普通聊天附件、「发送到电脑」、工作区文件下载和读取远端工作区图片仍需要 Android P2P 直连。聊天附件每个最大 20 MB，每条消息最多 10 个附件、合计 50 MB；附件保存在 Agent 数据目录下，中继不保存图片文件。
+
+### 电脑端远程访问权限
+
+在电脑的 **Agent 设置 → 服务器连接 → 远程访问权限** 中，可开启「允许远程管理文件」。新安装及没有这项配置的旧安装默认关闭，保存后 Agent 会重新连接。
+
+- **远程管理文件**：关闭时不允许浏览电脑目录、按任意路径下载或向电脑的下载目录发送文件。Android 通过 P2P 直连后，仍可下载当前会话中 AI 回复以 Markdown 链接明确引用的工作区内文件（例如 `[报告](./报告.pdf)`）。纯文字路径、工具日志和用户消息不会授权下载。需要时可重新打开会话以重新加载历史链接。
+- 这个开关不改变聊天、普通聊天附件或 Codex 自身的工具审批和沙箱设置。不要将它用作 Codex 工作区的隔离机制。
 
 ## 界面预览
 
@@ -42,7 +49,7 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 
 ## 快速开始
 
-先在要被远程控制的电脑上安装并登录 Codex 桌面版，或在同一用户账号下配置 Codex CLI。远程操作的一侧只需要浏览器或 Android 客户端。Agent 需要保持运行，电脑休眠或退出 Agent 后，远程端将显示离线。
+先在要连接的电脑上安装并登录 Codex 桌面版，或在同一用户账号下配置 Codex CLI。远程操作的一侧只需要浏览器或 Android 客户端。Agent 需要保持运行，电脑休眠或退出 Agent 后，远程端将显示离线。
 
 ### 选择下载包
 
@@ -56,7 +63,7 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 | Linux x86-64 中继主机 | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
 | Android ARM64 手机 | `android-arm64-v8a-release-unsigned.apk` | 签名后安装，再扫描配对二维码 |
 
-Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 提供未签名的 Release APK，可在发布环境用 Android SDK 的 `apksigner` 签名后安装。覆盖安装需要沿用原版本的签名证书。手机也可以直接用浏览器访问。
+Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 只发布签名证书与现有发行版一致、可直接安装的 APK。若当次没有 APK附件，请选择有签名 Android 安装包的发布。 手机也可以直接用浏览器访问。
 
 ### 首次配对和发起任务
 
@@ -84,6 +91,8 @@ Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm6
 设置页首次打开时随机监听一个 `127.0.0.1` 端口，之后持续监听至 Agent 退出；再次打开复用同一端口。连接设置和日志在 `.state/` 中，设备身份继续按当前用户和服务器复用。相同配置路径的重复启动会打开已有实例的设置页；`--restart` 等待旧实例退出后重启。
 
 已配对设备使用该浏览器检测到的完整 WebGL GPU 型号作为名称；检测不可用时回退为系统和浏览器名称。旧配对在浏览器重新连接后自动更新名称，无需重新配对。
+
+在 Windows 系统托盘右键点击 **文件传输助手**，可以直接进入 Agent 设置里的文件传输页；也可从设置左侧进入。这里会列出当前服务器的待发送文件与最近接收记录。取消发送只清除传输缓存，不删除电脑原文件，也不能撤回已完整送达的文件。点击已接收的文件名会打开下载文件夹中的原文件。此页仅可在 Windows Agent 本机打开。电脑和 Android 端均支持新版文件流时，下载使用独立的 P2P 二进制流；与旧版本搭配时仍可按原方式下载。
 
 ## Linux 无桌面设置
 
@@ -253,6 +262,31 @@ sudo bash build/scripts/install-server.sh /path/to/server-package/codexrm-server
 
 注册密钥仅用于 Agent 注册；浏览器使用 10 分钟有效的一次性配对码换取专属 token。服务器记录配对设备的最近连接时间及 IP，Agent 设置页可查看；在线心跳持续更新时间。服务器启动时及每分钟清理超过 7 天未连接的设备授权，持续在线的设备保留；升级前缺少连接记录的设备给予一次性的 7 天宽限，重启不会延长。设备信息 API、WebSocket、解除配对均校验凭据；支持 Origin 检查和设备间路由隔离。可在 Agent 设置的“已配对设备管理”中删除授权，删除后立即失效并需要重新配对。默认无注册密钥时仅接受直接来自 loopback 的注册，反向代理场景需配置注册密钥。配对浏览器可以操作对应电脑上的 Codex，权限由新会话的 sandbox 与审批设置控制。
 
+### Server 版本和自动更新
+
+Server 独立于 Windows、Android 和 Linux Agent 维护版本。运行 `/opt/codexrm/bin/codexrm-server --version`，或查看 `/api/v1/health` 的 `serverVersionName`、`serverVersionCode`。原有 `version` 字段仍是协议版本。`/server-update.json` 是**可用更新**的清单，不一定等于正在运行的版本；没有发布时返回 404。
+
+带 `codexrm-server-updater` 的 Server 安装包首次安装时会启用 systemd 定时器。此前已安装的主机需要手动用新安装包执行一次 `sudo bash install-server.sh`，才能启用自动更新；已有更新设置不会被覆盖。支持本节的 Linux x86-64 `codexrm.service` 安装方式，其他部署方式继续手动更新。
+
+默认每天 **03:00（`Asia/Singapore`，UTC+8）**检查并安装更高版本。编辑 `/etc/codexrm/server-update.env` 即可修改，下次定时检查时生效，不需要重启中继：
+
+```ini
+CODEXRM_SERVER_AUTO_UPDATE=true
+CODEXRM_SERVER_UPDATE_CRON="0 3 * * *"
+CODEXRM_SERVER_UPDATE_TZ=Asia/Singapore
+# 可选：换成自己信任并控制的 HTTPS Server 更新源
+# CODEXRM_SERVER_UPDATE_URL=https://releases.example.com/server-update.json
+```
+
+- 关闭自动更新：设置 `CODEXRM_SERVER_AUTO_UPDATE=false`。也可运行 `sudo systemctl disable --now codexrm-server-update.timer` 停止定时器；要恢复，设置为 `true`，再运行 `sudo systemctl enable --now codexrm-server-update.timer`。
+- Cron 使用五字段：分、时、日、月、星期。例：`"30 4 * * MON-FRI"` 表示工作日 04:30；`"0 3 * * SUN"` 表示每周日 03:00。`CODEXRM_SERVER_UPDATE_TZ` 支持 IANA 时区名。机器关机或定时器关闭时错过的检查不补跑。
+- 默认清单源为 `https://codexrm.dagongren.tech/server-update.json`。清单和下载都要求 HTTPS，安装前核对大小与 SHA-256。只信任管理员控制的更新源；不要把 Server 清单交给中继账户或其他非发布人员写入。
+- 更新会一起替换 Server 程序和 Web 前端并重启中继，现有 WebSocket 会短暂断开。新版本启动失败或健康接口版本不匹配时，会尝试恢复旧程序和页面。更新器不替换 `server.env`、`data/` 或 systemd 中继配置；升级前仍建议备份。查看更新日志：`sudo journalctl -u codexrm-server-update.service -n 50 --no-pager`。
+
+**发布 Server 更新（Windows 构建机）**：首次用 `build\release-server.cmd nopause` 构建。后续发布前分别修改 `internal/release/server.go` 的 `ServerVersionName` 并递增 `ServerVersionCode`，不要重复使用已发布的版本号。输出在 `build/dist/`，其中 `.tar.gz` 是手动安装包，`.zip` 是自动更新包，`server-update.json` 是清单。使用 `build\release-server.cmd nopause -Publish` 构建并通过现有的 Cloudreve/RM 配置发布，失败可用 `-PublishOnly` 重试原包。首发前须先手动安装支持该接口的 Server。发布更新清单不会立即重启中继。
+
+若自行托管清单，把 ZIP 上传到 HTTPS 存储，填写清单的 `downloadUrl`，再由管理员原子替换 `/opt/codexrm/server-updates/server-update.json`（目录 `root:root`、权限 `0755`，清单 `root:root`、权限 `0644`）。这是和 Agent 清单分开的目录；不要放入 `data/updates/`。
+
 ### Android NAT 诊断
 
 在 Android 顶栏点击连接图标 →「诊断」，可同时测手机和已配对 Agent 的 IPv4 UDP 路径，即使业务走 RM 中继也能测。RFC 3489 显示传统类型，RFC 5780 分开显示映射和过滤行为。多个配置端点以独立 UDP socket 测试，先获得完整分类的可用端点胜出；不会把不同端点的映射与过滤拼成一份结果。「不支持」和「未响应」不是 NAT 类型，也不能证明无法直连。
@@ -260,6 +294,8 @@ sudo bash build/scripts/install-server.sh /path/to/server-package/codexrm-server
 要部署完整诊断，准备支持两套协议的专用 STUN。一个端点须具有两个可达公网 IPv4 × 两个不同的 UDP 端口，并能从请求指定的备用来源回包。例如可在拥有两条可正确映射的公网 IPv4 的主机上运行 STUNTMAN 的 `full` 模式，为每个地址同时开放主、备用 UDP 端口；若主机绑定的是云内网地址，还需配置对应的公网 advertised 地址并确认 UDP 出站使用对应公网源地址。保留服务的防洪保护，不要把临时公共 STUN 当作唯一生产依赖。有条件时配置两套独立端点。
 
 仓库的 `deploy/codexrm-nat-stun.json.example` 和 `deploy/codexrm-nat-stun.service.example` 是 Linux 自建模板：准备 STUNTMAN 的 `stunserver` 可执行文件（或在 unit 中改为实际路径），替换示例 IP，将配置放到 `/etc/codexrm/nat-stun.json`，将 unit 放到 `/etc/systemd/system/codexrm-nat-stun.service`，再 `systemctl daemon-reload` 和 `systemctl enable --now codexrm-nat-stun.service`。不在主机上直接绑定公网 IP 时，两个 `*interface` 填本机绑定地址、两个 `*advertised` 分别填公网地址。
+
+只有单公网 IPv4 的主机可以两台配对，各自监听两个 STUN UDP 端口，并通过相互认证的 UDP 通道完成换 IP 回包。参见 [两节点部署说明](deploy/codexrm-nat-stun-pair.md)。
 
 先从可正常收发 IPv4 UDP 的主机检查（替换示例 IPv4）：
 
@@ -290,6 +326,7 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | `GET /update.json` | Windows 客户端自动更新清单 |
 | `GET /android-update.json` | Android 客户端手动更新清单 |
 | `GET /linux-update.json` | Linux amd64 Agent 更新清单 |
+| `GET /server-update.json` | Linux x86-64 Server 自动更新清单 |
 | `POST /api/v1/agent/enroll` | 注册/续期，远程注册需 `X-Enrollment-Key` |
 | `POST /api/v1/agent/pair` | Agent 生成配对码 |
 | `GET /api/v1/agent/pair/status` | 查询配对状态，需 Agent token |

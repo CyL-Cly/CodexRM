@@ -39,6 +39,7 @@ internal fun CodexClient.uploadAttachment(
     progress: (Int) -> Unit,
     begun: JSONObject? = null,
     desktopTransport: DirectTransport? = null,
+    desktopControl: DesktopUploadControl? = null,
     relayImage: Boolean = false,
     complete: RpcCallback,
 ) {
@@ -60,9 +61,11 @@ internal fun CodexClient.uploadAttachment(
         complete.onComplete(null, error)
     }
     fun chunk() {
+        if (desktopControl?.cancelled == true) { fail(IOException("发送已取消")); return }
         if (offset == size) {
             runCatching { stream?.close() }
             stream = null
+            desktopControl?.committing()
             requestPart("finish", JSONObject().put("id", id)) { result, error ->
                 if (error != null || result == null) fail(error ?: IOException("附件上传失败"))
                 else {

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/server"
 	"github.com/codexrm/codexrm/internal/updater"
 )
@@ -169,5 +171,55 @@ func TestCustomUpdateDirectory(t *testing.T) {
 	s.Handler().ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/updates/client.zip", nil))
 	if r.Code != 200 || !strings.Contains(r.Body.String(), "custom release") {
 		t.Fatal("custom update directory was ignored")
+	}
+}
+
+func TestServerVersionAndUpdateRoute(t *testing.T) {
+	root := t.TempDir()
+	clientDir := filepath.Join(root, "updates")
+	serverDir := filepath.Join(root, "server-updates")
+	for _, dir := range []string{clientDir, serverDir} {
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := updater.Manifest{VersionCode: 2, VersionName: "0.1.1", DownloadURL: "https://releases.example/server.zip", FileSize: 123, SHA256: strings.Repeat("a", 64)}
+	manifest, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Never fall back to a Server manifest supplied from a client-writable directory.
+	if err = os.WriteFile(filepath.Join(clientDir, release.ServerManifestName), manifest, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := server.New(server.Config{DataDir: root, UpdateDir: clientDir, ServerUpdateDir: serverDir, AdminToken: "private-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	handler := s.Handler()
+	get := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, httptest.NewRequest(http.MethodGet, path, nil))
+		return res
+	}
+	path := "/" + release.ServerManifestName
+	res := get(path)
+	if res.Code != http.StatusNotFound || res.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("unpublished Server manifest: %d %s", res.Code, res.Body)
+	}
+	if err = os.WriteFile(filepath.Join(serverDir, release.ServerManifestName), manifest, 0644); err != nil {
+		t.Fatal(err)
+	}
+	res = get(path)
+	actual, err := updater.ReadManifest(res.Body)
+	if err != nil || actual != m || res.Code != http.StatusOK || res.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("published Server manifest: %v, %v, status %d", actual, err, res.Code)
+	}
+	res = get("/api/v1/health")
+	var health release.ServerHealth
+	if err = json.Unmarshal(res.Body.Bytes(), &health); err != nil || !health.OK || health.Service != "codexrm" || health.ProtocolVersion != protocol.Version || health.VersionCode != release.ServerVersionCode || health.VersionName != release.ServerVersionName {
+		t.Fatalf("running Server health: %v, %v", health, err)
 	}
 }

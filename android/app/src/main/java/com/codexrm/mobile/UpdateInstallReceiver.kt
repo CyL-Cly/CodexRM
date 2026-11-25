@@ -11,21 +11,19 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
     @Suppress("DEPRECATION")
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_INSTALL_STATUS) return
-        when (intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
+        when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                val confirmation = if (Build.VERSION.SDK_INT >= 33) {
-                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
-                } else {
-                    intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
-                }
-                if (confirmation != null) {
-                    runCatching { context.startActivity(confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
-                        .onFailure { reportFailure(context, intent, "无法打开系统安装确认界面") }
-                } else {
-                    reportFailure(context, intent, "系统安装器未提供确认界面")
-                }
+                dispatch(
+                    context,
+                    intent,
+                    ACTION_INSTALL_INTERACTIVE,
+                    status,
+                    parcelableIntent(intent, Intent.EXTRA_INTENT),
+                    null,
+                )
             }
             PackageInstaller.STATUS_SUCCESS -> {
+                dispatch(context, intent, ACTION_INSTALL_FINISHED, status, null, null)
                 toast(context, "CodexRM 更新安装完成")
                 val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
                 if (launch != null) {
@@ -33,24 +31,45 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
                     runCatching { context.startActivity(launch) }
                 }
             }
-            PackageInstaller.STATUS_FAILURE_ABORTED -> reportFailure(context, intent, "已取消安装更新")
+            PackageInstaller.STATUS_FAILURE_ABORTED -> dispatch(
+                context,
+                intent,
+                ACTION_INSTALL_FAILED,
+                status,
+                null,
+                "已取消安装更新",
+            )
             else -> {
-                val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
+                val detail = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
                     ?.takeIf { it.isNotBlank() } ?: "未知错误"
-                reportFailure(context, intent, "更新安装失败：$message")
+                dispatch(
+                    context,
+                    intent,
+                    ACTION_INSTALL_FAILED,
+                    status,
+                    null,
+                    "更新安装失败：$detail",
+                )
             }
         }
     }
 
-    private fun reportFailure(context: Context, status: Intent, message: String) {
-        val requestId = status.getStringExtra(EXTRA_REQUEST_ID)
-        if (requestId != null) {
-            val failure = Intent(ACTION_INSTALL_FAILED)
-                .setPackage(context.packageName)
-                .putExtra(EXTRA_REQUEST_ID, requestId)
-            context.sendBroadcast(failure)
-        }
-        toast(context, message)
+    private fun dispatch(
+        context: Context,
+        status: Intent,
+        action: String,
+        statusCode: Int,
+        confirmation: Intent?,
+        message: String?,
+    ) {
+        val requestId = status.getStringExtra(EXTRA_REQUEST_ID) ?: return
+        val outgoing = Intent(action)
+            .setPackage(context.packageName)
+            .putExtra(EXTRA_REQUEST_ID, requestId)
+            .putExtra(EXTRA_STATUS, statusCode)
+        if (confirmation != null) outgoing.putExtra(EXTRA_CONFIRM_INTENT, confirmation)
+        if (message != null) outgoing.putExtra(EXTRA_MESSAGE, message)
+        context.sendBroadcast(outgoing)
     }
 
     private fun toast(context: Context, message: String) {
@@ -60,6 +79,22 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_INSTALL_STATUS = "com.codexrm.mobile.action.UPDATE_INSTALL_STATUS"
         const val ACTION_INSTALL_FAILED = "com.codexrm.mobile.action.UPDATE_INSTALL_FAILED"
+        const val ACTION_INSTALL_INTERACTIVE = "com.codexrm.mobile.action.UPDATE_INSTALL_INTERACTIVE"
+        const val ACTION_INSTALL_FINISHED = "com.codexrm.mobile.action.UPDATE_INSTALL_FINISHED"
         const val EXTRA_REQUEST_ID = "com.codexrm.mobile.extra.UPDATE_REQUEST_ID"
+        const val EXTRA_STATUS = "com.codexrm.mobile.extra.UPDATE_INSTALL_STATUS_CODE"
+        const val EXTRA_MESSAGE = "com.codexrm.mobile.extra.UPDATE_INSTALL_MESSAGE"
+        const val EXTRA_CONFIRM_INTENT = "com.codexrm.mobile.extra.UPDATE_INSTALL_CONFIRM"
+
+        internal fun interactiveConfirmation(intent: Intent): Intent? =
+            parcelableIntent(intent, EXTRA_CONFIRM_INTENT)
     }
 }
+
+@Suppress("DEPRECATION")
+private fun parcelableIntent(intent: Intent, name: String): Intent? =
+    if (Build.VERSION.SDK_INT >= 33) {
+        intent.getParcelableExtra(name, Intent::class.java)
+    } else {
+        intent.getParcelableExtra(name)
+    }

@@ -149,22 +149,70 @@ jobs:
           install -m 0644 deploy/codexrm.service deploy/nginx-location.conf "$server/deploy/"
           tar -czf "nightly-dist/CodexRM-$TAG-linux-amd64-server.tar.gz" -C "$server" .
 
+      - name: Check Android signing configuration
+        id: android-signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+        run: |
+          if [[ -z "$KEYSTORE_BASE64" && -z "$KEYSTORE_PASSWORD" ]]; then
+            echo '::warning::Android signing secrets are not configured. No APK will be uploaded.'
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+          elif [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" ]]; then
+            echo '::error::Configure both Android signing secrets, or remove both to skip Android.'
+            exit 1
+          else
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-java@v6.3.0
+        if: steps.android-signing.outputs.enabled == 'true'
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
       - uses: android-actions/setup-android@v4.0.4
+        if: steps.android-signing.outputs.enabled == 'true'
 
-      - name: Package Android arm64-v8a Release
+      - name: Build Android arm64-v8a Release
+        if: steps.android-signing.outputs.enabled == 'true'
         run: |
-          # Read SDK pins from the selected source commit.
+          # Android 17 and newer SDK packages use major.minor IDs.
           sdk=$(awk '$1 == "compileSdk" && $2 == "=" {print $3}' android/app/build.gradle.kts)
           ndk=$(awk -F '"' '/^[[:space:]]*ndkVersion[[:space:]]*=/ {print $2}' android/app/build.gradle.kts)
-          sdkmanager --install "platforms;android-$sdk" "ndk;$ndk"
+          [[ "$sdk" =~ ^[0-9]+$ && "$ndk" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if (( sdk >= 37 )); then sdk="$sdk.0"; fi
+          sdkmanager --install "platforms;android-$sdk" "ndk;$ndk" "build-tools;36.0.0"
           (cd android && bash gradlew --no-daemon :app:assembleRelease)
-          cp android/app/build/outputs/apk/release/app-release-unsigned.apk "nightly-dist/CodexRM-$TAG-android-arm64-v8a-release-unsigned.apk"
+
+      - name: Sign and verify Android Release APK
+        if: steps.android-signing.outputs.enabled == 'true'
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
+          # Public certificate fingerprint from the already distributed CodexRM APK.
+          EXPECTED_SIGNER: a8b22ad8ba654a4b511c3464181913126ac92206ce88887e0fada7fcd481be61
+        run: |
+          umask 077
+          scratch=$(mktemp -d "$RUNNER_TEMP/codexrm-android-signing.XXXXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$scratch/release.keystore"
+          unset KEYSTORE_BASE64
+          apksigner="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          apk="CodexRM-$TAG-android-arm64-v8a-release.apk"
+          "$apksigner" sign --ks "$scratch/release.keystore" --ks-key-alias androiddebugkey \
+            --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEYSTORE_PASSWORD \
+            --out "$scratch/$apk" android/app/build/outputs/apk/release/app-release-unsigned.apk
+          unset KEYSTORE_PASSWORD
+          certificates=$("$apksigner" verify --print-certs "$scratch/$apk")
+          actual=$(awk '/^Signer #[0-9]+ certificate SHA-256 digest:/ {print $NF}' <<< "$certificates")
+          if [[ "$actual" != "$EXPECTED_SIGNER" ]]; then
+            echo '::error::APK signing certificate does not match existing CodexRM installations.'
+            exit 1
+          fi
+          mv -- "$scratch/$apk" "nightly-dist/$apk"
 
       - uses: actions/upload-artifact@v7.0.2
         with:
@@ -199,8 +247,14 @@ jobs:
             "CodexRM-$TAG-linux-amd64-agent.tar.gz"
             "CodexRM-$TAG-linux-arm64-agent.tar.gz"
             "CodexRM-$TAG-linux-amd64-server.tar.gz"
-            "CodexRM-$TAG-android-arm64-v8a-release-unsigned.apk"
           )
+          apk="CodexRM-$TAG-android-arm64-v8a-release.apk"
+          android_note='Android APK omitted: release signing is not configured.'
+          if [[ -f "$apk" ]]; then
+            assets+=("$apk")
+            android_note='The Android arm64-v8a APK is signed and can be installed directly.'
+          fi
+          notes="Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation. $android_note"
           sha256sum "${assets[@]}" > SHA256SUMS.txt
           assets+=(SHA256SUMS.txt)
           if existing=$(gh release view "$TAG" --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv'); then
@@ -211,8 +265,13 @@ jobs:
             fi
             [[ "$target" == "$SOURCE_SHA" ]]
             gh release upload "$TAG" "${assets[@]}" --clobber
-            gh release edit "$TAG" --draft=false --prerelease --latest=false
+            legacy_apk="CodexRM-$TAG-android-arm64-v8a-release-unsigned.apk"
+            old_assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+            if grep -Fxq "$legacy_apk" <<< "$old_assets"; then
+              gh release delete-asset "$TAG" "$legacy_apk" --yes
+            fi
+            gh release edit "$TAG" --draft=false --prerelease --latest=false --notes "$notes"
           else
             gh release create "$TAG" "${assets[@]}" --target "$SOURCE_SHA" --title "$TAG" \
-              --prerelease --latest=false --notes "Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation. The Android arm64-v8a Release APK requires signing before installation."
+              --prerelease --latest=false --notes "$notes"
           fi

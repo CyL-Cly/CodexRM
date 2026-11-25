@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.view.View
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.EditText
+import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -23,7 +24,7 @@ internal object UiReviewCheck {
     private lateinit var output: File
     private val checks = JSONArray()
 
-    fun run(instrumentation: ImageRenderingInstrumentation, settingsOnly: Boolean = false, workspaceOnly: Boolean = false) {
+    fun run(instrumentation: ImageRenderingInstrumentation, settingsOnly: Boolean = false, workspaceOnly: Boolean = false, composerOnly: Boolean = false) {
         test = instrumentation
         var activity: Activity? = null
         try {
@@ -59,6 +60,13 @@ internal object UiReviewCheck {
             expectText("连接你的电脑")
 
             onMain { seedMain(online = true) }
+            if (composerOnly) {
+                verifyRunningComposer()
+                test.finish(Activity.RESULT_OK, Bundle().apply {
+                    putString("stream", "PASS: compact running composer; screenshots=${output.absolutePath}\n")
+                })
+                return
+            }
             if (workspaceOnly) {
                 verifyWorkspacePicker()
                 test.finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "PASS: workspace directory picker\n") })
@@ -66,7 +74,8 @@ internal object UiReviewCheck {
             }
             capture("02-home-online")
             expectText("工作目录")
-            expectText("默认模型")
+            expectText("选择模型")
+            expectAbsent("默认模型")
             expectAbsent("开始输入")
             expectAbsent("切换工作目录")
             expectAbsent("解释这个项目的结构")
@@ -138,17 +147,19 @@ internal object UiReviewCheck {
             verifyWorkspacePicker()
             clickText("添加文件或图片")
             expectText("拍照")
-            expectText("相册")
+            expectText("照片")
             expectText("文件")
             capture("03h-attachment-sheet")
             goBack()
-            clickText("选择思考强度")
+            clickText("选择模型")
+            expectText("配置")
+            clickText("强度")
             expectText("选择思考强度")
             clickText("取消")
-            clickText("默认模型")
+            clickText("模型")
             capture("04-model-picker")
             expectText("选择模型")
-            expectText("默认模型")
+            expectAbsent("默认模型")
             expectText("GPT-5")
             setSearchText("no-such-model")
             capture("05-model-search-empty")
@@ -157,44 +168,26 @@ internal object UiReviewCheck {
             capture("05a-model-after-clear")
             expectText("GPT-5")
             goBack()
+            clickText("完成")
             onMain {
                 val options = field("models").get(screen) as List<ModelOption>
+                val chosen = options.first { it.model == "gpt-4.1" }
                 screen.javaClass.getDeclaredMethod("chooseModel", ModelOption::class.java).apply { isAccessible = true }
-                    .invoke(screen, options.first())
-                invoke("showModelPicker")
-            }
-            capture("05b-model-before-default")
-            clickText("默认模型")
-            onMain {
-                check(field("selectedModelOption").get(screen) == null) { "Default model did not clear selection" }
+                    .invoke(screen, chosen)
                 val preference = DeviceStore(screen).modelPreference("ui-agent", "/workspace/demo")
-                check(preference.first.isEmpty() && preference.second.isEmpty() && preference.third.isEmpty()) {
-                    "Default model preference was not cleared: $preference"
-                }
-                checks.put(JSONObject().put("defaultModelRestored", true))
+                check(preference.second == "gpt-4.1") { "Recent model was not cached: $preference" }
                 set("currentThread", JSONObject().put("id", "thread-1").put("name", "旧会话").put("model", "gpt-5"))
                 set("currentThreadId", "thread-1")
-                invoke("useDefaultModel")
                 invoke("refreshModelChoices")
                 val restored = field("selectedModelOption").get(screen) as? ModelOption
-                check(restored?.model == "gpt-5") { "Thread refresh did not restore its own model for this check" }
+                check(restored?.model == "gpt-5") { "Old conversation did not keep its model: ${restored?.model}" }
                 screen.javaClass.getDeclaredMethod("newChat", java.lang.Boolean.TYPE).apply { isAccessible = true }
                     .invoke(screen, false)
-                check(field("selectedModelOption").get(screen) == null) { "New chat restored the old thread model after default was chosen" }
-                checks.put(JSONObject().put("defaultSurvivesRefreshAndNewChat", true))
-                set("running", true)
-                (field("composer").get(screen) as EditText).setText("补充当前任务")
-                invoke("updateControls")
-                check((field("effortButton").get(screen) as View).visibility == View.GONE) { "Running toolbar did not release effort width" }
+                val recent = field("selectedModelOption").get(screen) as? ModelOption
+                check(recent?.model == "gpt-4.1") { "New chat did not use the cached model: ${recent?.model}" }
+                checks.put(JSONObject().put("recentModelForNewChat", true).put("threadKeepsOwnModel", true))
             }
-            SystemClock.sleep(7200)
-            capture("05c-running-composer")
-            onMain {
-                set("running", false)
-                (field("composer").get(screen) as EditText).setText("")
-                invoke("updateControls")
-                check((field("effortButton").get(screen) as View).visibility == View.VISIBLE)
-            }
+            verifyRunningComposer()
 
             onMain { invoke("showAppSettings") }
             capture("06-settings")
@@ -292,8 +285,80 @@ internal object UiReviewCheck {
         }
     }
 
+    private fun verifyRunningComposer() {
+        val composer = field("composer").get(screen) as EditText
+        val steer = field("steerButton").get(screen) as View
+        val send = field("sendButton").get(screen) as View
+        val stop = field("stopButton").get(screen) as View
+        val model = field("modelButton").get(screen) as TextView
+        val modelSlot = model.parent as View
+        val toolbar = send.parent as View
+        val info = field("info").get(screen) as JSONObject
+        val previousModel = field("selectedModelOption").get(screen)
+        val previousEffort = field("effortSelection").get(screen)
+        val example = ModelOption("", "gpt-6.2-sol", "gpt-6.2-sol", "high", listOf("high"))
+        fun checkToolbarBounds() {
+            check(steer.parent === stop.parent && steer.parent === send.parent)
+            check(modelSlot.right <= steer.left && steer.right <= stop.left && stop.right <= send.left)
+            check(send.right <= toolbar.width && send.width == Ui.dp(screen, 48)) { "Send button was clipped" }
+            check(steer.height == send.height)
+            check(model.width == minOf(Ui.dp(screen, 80), modelSlot.width)) { "Model slot changed size based on its label" }
+        }
+        onMain {
+            check(steer.visibility == View.GONE && model.visibility == View.VISIBLE)
+            set("selectedModelOption", example)
+            set("effortSelection", "high")
+            invoke("updateModelButton")
+            check(model.text.toString() == "6.2-sol")
+            set("running", true)
+            invoke("updateControls")
+            check(steer.visibility == View.VISIBLE && !steer.isEnabled)
+            composer.setText("补充当前任务")
+            check(steer.isEnabled && send.isEnabled && send.contentDescription == "排队发送")
+        }
+        expectText("立即发送")
+        expectAbsent("发送优先指令")
+        capture("05c-running-composer")
+        val toolbarWidthParam = toolbar.layoutParams.width
+        val narrowWidth = minOf(toolbar.width, Ui.dp(screen, 274)) // 320 dp window minus composer gutters and padding.
+        val originalModelWidth = onMainValue {
+            checkToolbarBounds()
+            set("selectedModelOption", example.copy(displayName = "gpt-custom-provider-with-a-very-long-model-name"))
+            invoke("updateModelButton")
+            model.width
+        }
+        test.waitForIdleSync()
+        onMain {
+            check(model.width == originalModelWidth)
+            toolbar.layoutParams = toolbar.layoutParams.apply { width = narrowWidth }
+        }
+        capture("05d-running-composer-narrow")
+        onMain {
+            check(toolbar.width == narrowWidth)
+            checkToolbarBounds()
+            check(model.layout.getEllipsisCount(0) > 0) { "Long model name was not ellipsized" }
+            toolbar.layoutParams = toolbar.layoutParams.apply { width = toolbarWidthParam }
+            set("selectedModelOption", previousModel)
+            set("effortSelection", previousEffort)
+            invoke("updateModelButton")
+            info.put("messageQueue", false)
+            invoke("updateControls")
+            check(steer.isEnabled && !send.isEnabled)
+            set("sending", true)
+            invoke("updateControls")
+            check(!steer.isEnabled && !send.isEnabled)
+            set("sending", false)
+            info.put("messageQueue", true)
+            set("running", false)
+            composer.setText("")
+            invoke("updateControls")
+            check(steer.visibility == View.GONE && model.visibility == View.VISIBLE)
+        }
+    }
+
     private fun verifyWorkspacePicker() {
-        clickText("选择工作目录，当前目录：/workspace/demo")
+        clickText("选择模型")
+        clickText("工作区")
         expectText("/workspace/docs")
         clickText("浏览其他目录")
         expectText("添加工作区")

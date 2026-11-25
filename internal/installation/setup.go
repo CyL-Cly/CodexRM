@@ -58,6 +58,9 @@ func SetupAction(action, root string, autoStart bool) error {
 		}
 		return stopInstalled(ctx, root)
 	case "register":
+		if err := RegisterPhoneMenu(filepath.Join(root, "bin", "codexrm-agent.exe")); err != nil {
+			return err
+		}
 		if err := clientconfig.WriteJSON(filepath.Join(root, ".state", "installation.json"), map[string]any{
 			"schemaVersion": 2, "installDir": root, "installer": "inno",
 		}); err != nil {
@@ -68,6 +71,9 @@ func SetupAction(action, root string, autoStart bool) error {
 		})
 	case "unregister":
 		if err := stopInstalled(ctx, root); err != nil {
+			return err
+		}
+		if err := unregisterPhoneMenu(filepath.Join(root, "bin", "codexrm-agent.exe")); err != nil {
 			return err
 		}
 		if strings.EqualFold(ResolveDir(), root) {

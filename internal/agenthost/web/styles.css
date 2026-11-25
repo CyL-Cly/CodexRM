@@ -279,6 +279,9 @@ summary { color: var(--text); font-weight: 600; cursor: pointer; }
 .device-info { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .device-icon { border-radius: 5px; flex: none; width: 31px; height: 31px; display: grid; place-items: center; background: var(--raised); }
 .device button { flex-shrink: 0; }
+.transfer-file-name { padding: 0 4px; margin-left: -4px; text-align: left; font-weight: 650; overflow-wrap: anywhere; max-width: 100%; }
+.transfer-cancel, .transfer-error { color: var(--error); }
+#transfer-status { margin-bottom: 10px; }
 .provider-heading, .provider-row { justify-content: space-between; }
 .provider-row span, .provider-row strong, .provider-row s { overflow-wrap: anywhere; }
 .provider-add input { flex: 1; }

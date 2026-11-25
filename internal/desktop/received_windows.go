@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -35,44 +36,65 @@ func MoveReceivedFile(source, target string) error {
 
 var receiveDialogMu sync.Mutex
 
-func ShowReceivedFile(sender, name, path string, size int64) {
+func ShowReceivedFiles(sender string, files []ReceivedFile) {
+	if len(files) == 0 {
+		return
+	}
 	go func() {
 		receiveDialogMu.Lock()
 		defer receiveDialogMu.Unlock()
 		title := windows.StringToUTF16Ptr("CodexRM · 文件接收")
-		heading := windows.StringToUTF16Ptr("收到「" + sender + "」发来的文件")
-		sizeLabel := fmt.Sprintf("%d B", size)
-		if size >= 1<<20 {
-			sizeLabel = fmt.Sprintf("%.1f MB", float64(size)/(1<<20))
-		} else if size >= 1<<10 {
-			sizeLabel = fmt.Sprintf("%.1f KB", float64(size)/(1<<10))
+		single := len(files) == 1
+		path := files[0].Path
+		heading := fmt.Sprintf("收到「%s」发来的 %d 个文件", sender, len(files))
+		var summary strings.Builder
+		for _, file := range files[:min(6, len(files))] {
+			fmt.Fprintf(&summary, "%s · %s\n", file.Name, receivedSizeLabel(file.Size))
 		}
-		content := windows.StringToUTF16Ptr(name + "\n" + sizeLabel + "\n已保存到下载文件夹")
-		buttons := []taskDialogButton{
-			{ID: 100, Text: windows.StringToUTF16Ptr("打开文件夹")},
-			{ID: 101, Text: windows.StringToUTF16Ptr("打开")},
-			{ID: 102, Text: windows.StringToUTF16Ptr("关闭")},
+		if len(files) > 6 {
+			fmt.Fprintf(&summary, "另有 %d 个文件\n", len(files)-6)
 		}
-		selected, displayed := receivedTaskDialog(title, heading, content, buttons)
+		summary.WriteString("已保存到下载文件夹")
+		buttons := []taskDialogButton{{ID: 100, Text: windows.StringToUTF16Ptr("打开文件夹")}}
+		if single {
+			buttons = append(buttons, taskDialogButton{ID: 101, Text: windows.StringToUTF16Ptr("打开")})
+		}
+		buttons = append(buttons, taskDialogButton{ID: 102, Text: windows.StringToUTF16Ptr("关闭")})
+		selected, displayed := receivedTaskDialog(title, windows.StringToUTF16Ptr(heading), windows.StringToUTF16Ptr(summary.String()), buttons)
 		if !displayed {
-			message := windows.StringToUTF16Ptr("收到「" + sender + "」发来的文件\n\n" + name + " · " + sizeLabel +
-				"\n\n是：打开文件夹\n否：打开文件\n取消：关闭")
-			response, _ := windows.MessageBox(0, message, title, windows.MB_YESNOCANCEL|windows.MB_DEFBUTTON3|windows.MB_ICONINFORMATION|windows.MB_SETFOREGROUND|windows.MB_TOPMOST)
-			switch response {
-			case 6:
-				selected = 100
-			case 7:
-				selected = 101
+			message := heading + "\n\n" + summary.String()
+			flags := uint32(windows.MB_ICONINFORMATION | windows.MB_SETFOREGROUND | windows.MB_TOPMOST)
+			if single {
+				response, _ := windows.MessageBox(0, windows.StringToUTF16Ptr(message+"\n\n是：打开文件夹\n否：打开文件\n取消：关闭"), title,
+					flags|windows.MB_YESNOCANCEL|windows.MB_DEFBUTTON3)
+				if response == 6 {
+					selected = 100
+				} else if response == 7 {
+					selected = 101
+				}
+			} else {
+				response, _ := windows.MessageBox(0, windows.StringToUTF16Ptr(message+"\n\n确定：打开文件夹\n取消：关闭"), title,
+					flags|windows.MB_OKCANCEL|windows.MB_DEFBUTTON2)
+				if response == 1 {
+					selected = 100
+				}
 			}
 		}
 		if selected != 100 && selected != 101 {
 			return
 		}
-		if err := openReceivedFile(path, selected == 100); err != nil {
-			target := path
+		target := path
+		var err error
+		if !single {
+			target = filepath.Dir(path)
+			err = openReceivedFile(target, false)
+		} else {
+			err = openReceivedFile(path, selected == 100)
 			if selected == 100 {
 				target = filepath.Dir(path)
 			}
+		}
+		if err != nil {
 			log.Printf("open received file target %q: %v", target, err)
 			_, _ = windows.MessageBox(0, windows.StringToUTF16Ptr("无法打开 "+filepath.Base(target)), title,
 				windows.MB_OK|windows.MB_ICONERROR|windows.MB_SETFOREGROUND|windows.MB_TOPMOST)
@@ -80,11 +102,24 @@ func ShowReceivedFile(sender, name, path string, size int64) {
 	}()
 }
 
+func receivedSizeLabel(size int64) string {
+	switch {
+	case size >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(size)/(1<<20))
+	case size >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(size)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", size)
+	}
+}
+
 var (
 	receiveShell32             = windows.NewLazySystemDLL("shell32.dll")
 	receiveParseDisplayName    = receiveShell32.NewProc("SHParseDisplayName")
 	receiveOpenFolderAndSelect = receiveShell32.NewProc("SHOpenFolderAndSelectItems")
 )
+
+func OpenReceivedFile(path string) error { return openReceivedFile(path, false) }
 
 func openReceivedFile(path string, reveal bool) error {
 	runtime.LockOSThread()

@@ -74,6 +74,46 @@ func TestTurnStartSentWithoutReplyReportsUnknown(t *testing.T) {
 	}
 }
 
+func TestDirectLatencyProbeDoesNotReplayApprovals(t *testing.T) {
+	pending := json.RawMessage(`{"id":"p","method":"item/commandExecution/requestApproval"}`)
+	a := &Agent{approvals: map[string]approval{"p": {Owner: "client", Raw: pending}}}
+	for _, tc := range []struct {
+		name   string
+		direct *directSession
+		params string
+		probe  bool
+	}{
+		{"latency probe", &directSession{}, `{"latencyProbe":true}`, true},
+		{"direct bootstrap", &directSession{}, `{}`, false},
+		{"relay bootstrap", nil, `{"latencyProbe":true}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var frames []protocol.Envelope
+			a.handle(t.Context(), nil, func(reply protocol.Envelope) error {
+				frames = append(frames, reply)
+				return nil
+			}, protocol.Envelope{ClientID: "client", StreamID: "7", Message: json.RawMessage(`{"id":7,"method":"codexrm/info","params":` + tc.params + `}`)}, tc.direct)
+			if len(frames) == 0 || frames[0].ClientID != "client" || frames[0].StreamID != "7" {
+				t.Fatalf("missing or misrouted reply: %+v", frames)
+			}
+			var reply struct {
+				ID     int
+				Result map[string]any
+			}
+			if err := json.Unmarshal(frames[0].Message, &reply); err != nil || reply.ID != 7 || reply.Result == nil {
+				t.Fatalf("invalid reply %s (%v)", frames[0].Message, err)
+			}
+			if tc.probe {
+				if len(reply.Result) != 0 || len(frames) != 1 {
+					t.Fatalf("probe unexpectedly included capability or approval data: %s", frames[0].Message)
+				}
+			} else if reply.Result["workspaces"] != true || len(frames) != 2 || string(frames[1].Message) != string(pending) {
+				t.Fatal("bootstrap must still return capability and approval data")
+			}
+		})
+	}
+}
+
 func TestResolvedRequestsAreNotReplayed(t *testing.T) {
 	a := &Agent{owners: map[string]string{"thread": "client"}, approvals: map[string]approval{}}
 	a.forward(mustJSON(map[string]any{"id": 11, "method": "item/commandExecution/requestApproval", "params": map[string]any{"threadId": "thread", "turnId": "turn"}}))

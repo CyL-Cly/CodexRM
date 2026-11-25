@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CodexRM · Agent 设置</title><link rel="stylesheet" href="/styles.css"><script src="/navigation.js" defer></script><script src="/app.js" defer></script><script src="/providers.js" defer></script><script src="/onebot.js" defer></script><script src="/wx-panel.js" defer></script><script src="/wx-operations.js" defer></script><script src="/wx-contact-actions.js" defer></script></head>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CodexRM · Agent 设置</title><link rel="stylesheet" href="/styles.css"><script src="/navigation.js" defer></script><script src="/app.js" defer></script><script src="/phone-transfers.js" defer></script><script src="/providers.js" defer></script><script src="/onebot.js" defer></script><script src="/wx-panel.js" defer></script><script src="/wx-operations.js" defer></script><script src="/wx-contact-actions.js" defer></script></head>
 <body>
 <header class="topbar">
   <button id="nav-toggle" class="icon-button" type="button" aria-controls="settings-nav" aria-expanded="false" hidden>
@@ -15,6 +15,7 @@
 <a class="nav-link" data-route="overview" href="?view=overview"><span class="nav-icon" aria-hidden="true">◫</span>仪表盘</a>
 <a class="nav-link" data-route="connection" href="?view=connection"><span class="nav-icon" aria-hidden="true">⇄</span>服务器连接</a>
 <a class="nav-link" data-route="devices" href="?view=devices"><span class="nav-icon" aria-hidden="true">▣</span>设备配对</a>
+<a class="nav-link" id="nav-phone-transfers" data-route="phone-transfers" href="?view=phone-transfers" hidden><span class="nav-icon" aria-hidden="true">⇅</span>文件传输助手</a>
 <a class="nav-link" data-route="providers" href="?view=providers"><span class="nav-icon" aria-hidden="true">◇</span>模型供应商</a>
 </div>
   <div class="nav-group" id="nav-onebot" hidden><p class="nav-label">QQ 机器人</p>
@@ -59,6 +60,9 @@
 <label for="key">连接授权密钥</label><div class="secret"><input id="key" name="key" type="password" autocomplete="new-password" placeholder="输入服务器的连接授权密钥"><button id="toggle-key" class="text-button" type="button" aria-label="显示连接授权密钥">显示</button></div><p id="key-hint" class="hint">公共中继无需密钥。自托管服务器按管理员提供的信息填写。</p>
 <label id="clear-key-row" class="inline-field key-clear" hidden><input id="clear-key" type="checkbox">清除已保存的密钥</label>
 <p id="package-settings" class="hint" hidden>此版本由 Windows 管理更新。更换安装磁盘：Windows 设置 → 应用 → 已安装的应用 → CodexRM Agent → 移动。</p>
+<div class="section-title"><h2>远程访问权限</h2></div>
+<label class="inline-field"><input id="allow-file-management" type="checkbox">允许远程管理文件</label>
+<p class="hint">默认关闭。关闭时不能浏览电脑目录或使用「发送到电脑」；P2P 直连后仍可下载 AI 回复明确链接的工作区文件。保存会重新连接 Agent。</p>
 <div class="form-footer"><span id="connection-error" class="hint"></span><button id="save" class="primary" type="submit">保存并连接</button></div>
 <div class="status-details" aria-label="连接详情"><p id="connection-phase" class="hint" hidden></p><p id="last-connected" class="hint" hidden></p><p id="next-retry" class="hint" hidden></p></div></section></form>
 </div>
@@ -331,6 +335,20 @@
     </div>
   </div>
 </section>
+<div data-page="phone-transfers" hidden>
+  <section class="card">
+    <div class="section-title">
+      <div><h2>待发送 <span id="transfer-outbox-count"></span></h2><p class="hint">手机通过 P2P 接收文件。取消只移除发送缓存，不会删除电脑上的原文件，也不能撤回已完整送达的文件。</p></div>
+      <button id="transfer-refresh" class="secondary" type="button">刷新</button>
+    </div>
+    <p id="transfer-status" class="hint" role="status" hidden></p>
+    <div id="transfer-outbox" class="devices"></div>
+  </section>
+  <section class="card">
+    <div class="section-title"><div><h2>已接收 <span id="transfer-inbox-count"></span></h2><p class="hint">文件保存在本机的下载文件夹。点击文件名打开，仅打开可信来源的文件。</p></div></div>
+    <div id="transfer-inbox" class="devices"></div>
+  </section>
+</div>
 <div data-page="providers" hidden>
 <section class="card" id="provider-panel">
 <div class="provider-heading"><h2 id="provider-title">供应商列表</h2><button id="provider-back" class="secondary" type="button" hidden>返回</button></div>

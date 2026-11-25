@@ -47,6 +47,30 @@ type Session struct {
 	preflight        bool
 
 	clientInitiated bool
+
+	stateMu sync.Mutex
+	state   ConnState
+}
+
+// State is the local establishment phase of this session.
+func (s *Session) State() ConnState {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.state == "" {
+		return ConnIdle
+	}
+	return s.state
+}
+
+func (s *Session) setState(next ConnState) {
+	s.stateMu.Lock()
+	s.state = next
+	s.stateMu.Unlock()
+}
+
+func (s *Session) fail(err error) error {
+	s.setState(ConnFailed)
+	return err
 }
 
 func Prepare(ctx context.Context, agent bool, start protocol.P2PSignal) (*Session, *protocol.P2PSignal, error) {
@@ -83,6 +107,7 @@ func PrepareWithSources(ctx context.Context, agent bool, start protocol.P2PSigna
 		return nil, nil, err
 	}
 	s := &Session{agent: agent, id: start.ID, key: key, cert: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}}
+	s.setState(ConnPreparing)
 	s.dualNATPunch, s.ipv6 = start.DualNATPunch, start.IPv6
 	s.disableFullPunch = start.DisableFullPunch
 	s.preflight = !start.DisableFullPunch
@@ -111,10 +136,11 @@ func PrepareWithSources(ctx context.Context, agent bool, start protocol.P2PSigna
 		}
 	}
 	if len(s.sockets) == 0 {
+		s.setState(ConnFailed)
 		return nil, nil, fmt.Errorf("cannot allocate UDP socket: %w", errors.Join(ctx.Err(), listenErr))
 	}
 	fp := sha256.Sum256(der)
-	offer := protocol.P2P("offer", start.ID)
+	offer := protocol.P2P(protocol.P2PKindOffer, start.ID)
 	offer.Pin = hex.EncodeToString(fp[:])
 	add := func(a netip.AddrPort) {
 		if !a.IsValid() || len(offer.Candidates) >= protocol.P2PMaxCandidates {
@@ -227,9 +253,11 @@ func PrepareWithSources(ctx context.Context, agent bool, start protocol.P2PSigna
 		}
 	}
 	if ctx.Err() != nil || (len(offer.Candidates) == 0 && len(offer.Local) == 0 && (s.agent || !s.clientInitiated)) {
+		s.setState(ConnFailed)
 		s.Close()
 		return nil, nil, errors.New("no UDP candidates")
 	}
+	s.setState(ConnOffering)
 	return s, offer, nil
 }
 
@@ -359,6 +387,11 @@ func (s *Session) openSocket() (*net.UDPConn, error) {
 }
 
 func (s *Session) Close() {
+	s.stateMu.Lock()
+	if s.state != ConnFailed && s.state != ConnRelay {
+		s.state = ConnClosed
+	}
+	s.stateMu.Unlock()
 	for _, c := range s.sockets {
 		if c != nil {
 			_ = c.Close()
@@ -377,9 +410,10 @@ func (s *Session) packet(role, kind byte) []byte {
 // Connect keeps the winning UDP socket across the authenticated probe and TLS handshake.
 // ready is the peer's authenticated RM signal. The Agent listens before sending its own.
 func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <-chan struct{}, signalReady func() error) (*Link, error) {
+	s.setState(ConnExchanging)
 	pin, err := hex.DecodeString(offer.Pin)
 	if err != nil || len(pin) != 32 || offer.ID != s.id || len(offer.Candidates) > protocol.P2PMaxCandidates || len(offer.Local) > protocol.P2PMaxCandidates {
-		return nil, errors.New("invalid peer offer")
+		return nil, s.fail(errors.New("invalid peer offer"))
 	}
 	var targets []netip.AddrPort
 	for _, v := range offer.Candidates {
@@ -399,7 +433,7 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 	// Only the Agent can wait for a probe without a verified peer candidate.
 	passive := s.agent && s.clientInitiated && len(offer.Candidates) == 0 && len(offer.Local) == 0
 	if len(targets) == 0 && len(local) == 0 && !passive {
-		return nil, ErrNoPeerCandidate
+		return nil, s.fail(ErrNoPeerCandidate)
 	}
 	remoteMapping, remoteStep := protocol.NormalizeMapping(offer.Mapping, offer.Step)
 	hints := make(map[netip.AddrPort]protocol.P2PMappingHint, len(targets))
@@ -419,7 +453,7 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 		limit := dualNATPunchTimeout
 		if !publicDualPunch {
 			if len(local) == 0 {
-				return nil, ErrDualUnpredictableNAT
+				return nil, s.fail(ErrDualUnpredictableNAT)
 			}
 			targets, hints = nil, nil
 			limit = 3 * time.Second
@@ -428,13 +462,15 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 		punchCtx, cancel = context.WithTimeout(ctx, limit)
 		defer cancel()
 	}
+	s.setState(ConnPunching)
 	i, addr, err := s.punchPaths(punchCtx, targets, local, hints, 0, publicDualPunch)
 	if err != nil {
 		if dualUnpredictable && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-			return nil, ErrDualUnpredictableNAT
+			return nil, s.fail(ErrDualUnpredictableNAT)
 		}
-		return nil, err
+		return nil, s.fail(err)
 	}
+	s.setState(ConnTransport)
 	c := s.sockets[i]
 	for n, other := range s.sockets {
 		if n != i {
@@ -451,10 +487,10 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 		return errors.New("direct peer certificate mismatch")
 	}}
 	tr := &quic.Transport{Conn: c}
-	qc := &quic.Config{HandshakeIdleTimeout: 3 * time.Second, MaxIdleTimeout: 8 * time.Second, KeepAlivePeriod: 2 * time.Second, MaxIncomingStreams: 1, MaxIncomingUniStreams: -1}
+	qc := &quic.Config{HandshakeIdleTimeout: 3 * time.Second, MaxIdleTimeout: 8 * time.Second, KeepAlivePeriod: 2 * time.Second, MaxIncomingStreams: clientIncomingStreams, MaxIncomingUniStreams: -1}
 	if s.agent {
-		// One message stream and one Android-to-desktop file stream.
-		qc.MaxIncomingStreams = 2
+		// Control/RPC stream plus two file streams (e.g. upload and download).
+		qc.MaxIncomingStreams = agentIncomingStreams
 	}
 	link := &Link{trans: tr, udp: c, ipv6: addr.Addr().Is6()}
 	if i < len(s.paths) {
@@ -480,16 +516,16 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 	if s.agent {
 		ln, e := tr.Listen(tlsConfig, qc)
 		if e != nil {
-			return nil, e
+			return nil, s.fail(e)
 		}
 		defer ln.Close()
 		if e = signalReady(); e != nil {
-			return nil, e
+			return nil, s.fail(e)
 		}
 		link.conn, err = ln.Accept(ctx)
 	} else {
 		if err = signalReady(); err != nil {
-			return nil, err
+			return nil, s.fail(err)
 		}
 		tick := time.NewTicker(100 * time.Millisecond)
 		defer tick.Stop()
@@ -498,7 +534,7 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 		for {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, s.fail(ctx.Err())
 			case <-ready:
 				break readyLoop
 			case <-tick.C:
@@ -508,34 +544,35 @@ func (s *Session) Connect(ctx context.Context, offer protocol.P2PSignal, ready <
 		link.conn, err = tr.Dial(ctx, net.UDPAddrFromAddrPort(addr), tlsConfig, qc)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("QUIC: %w", err)
+		return nil, s.fail(fmt.Errorf("QUIC: %w", err))
 	}
+	s.setState(ConnControl)
 	if s.agent {
 		link.stream, err = link.conn.AcceptStream(ctx)
 	} else {
 		link.stream, err = link.conn.OpenStreamSync(ctx)
 	}
 	if err != nil {
-		return nil, err
+		return nil, s.fail(err)
 	}
 	_ = link.stream.SetReadDeadline(time.Now().Add(3 * time.Second))
-	const marker = "codexrm-direct/1"
 	if !s.agent {
-		if err := link.Write([]byte(marker)); err != nil {
-			return nil, err
+		if err := link.Write([]byte(ControlMarker)); err != nil {
+			return nil, s.fail(err)
 		}
 	}
 	buf, err := link.Read()
-	if err != nil || string(buf) != marker {
-		return nil, errors.New("direct stream handshake failed")
+	if err != nil || string(buf) != ControlMarker {
+		return nil, s.fail(errors.New("direct stream handshake failed"))
 	}
 	if s.agent {
-		if err := link.Write([]byte(marker)); err != nil {
-			return nil, err
+		if err := link.Write([]byte(ControlMarker)); err != nil {
+			return nil, s.fail(err)
 		}
 	}
 	_ = link.stream.SetReadDeadline(time.Time{})
 	s.sockets[i] = nil // ownership transferred
 	success = true
+	s.setState(ConnConnected)
 	return link, nil
 }

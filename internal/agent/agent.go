@@ -87,6 +87,7 @@ func connectionAdvice(err error) string {
 }
 
 type Config struct {
+	AllowFileManagement                                                                                             bool
 	OnReady                                                                                                         func()
 	CheckForUpdate                                                                                                  func() (UpdateResult, error)
 	ServerURL, AppServerURL, AppServerToken, Name, DataDir, InstallationID, EnrollmentKey, CodexPath, Cwd, MockAddr string
@@ -115,6 +116,7 @@ type approval struct {
 }
 type Agent struct {
 	cfg            Config
+	mentionedFiles mentionedFileIndex
 	creds          creds
 	credsDirty     bool
 	credsMu        sync.RWMutex
@@ -134,6 +136,8 @@ type Agent struct {
 	requests       int
 	updating       bool
 	attachmentMu   sync.Mutex
+	phoneReads     phoneFileReaders
+	receiveBatches receiveBatchQueue
 	conversationMu sync.Mutex
 	uploads        map[string]*attachmentUpload
 	providerApp    atomic.Pointer[appserver.Client]
@@ -536,7 +540,6 @@ func (a *Agent) forward(raw json.RawMessage) {
 	if json.Unmarshal(raw, &m) != nil {
 		return
 	}
-	a.mu.Lock()
 	owner := ""
 	var method string
 	_ = json.Unmarshal(m["method"], &method)
@@ -551,6 +554,13 @@ func (a *Agent) forward(raw json.RawMessage) {
 		} `json:"turn"`
 	}
 	_ = json.Unmarshal(m["params"], &meta)
+	if method == "item/completed" {
+		var item struct{ Item assistantFileItem }
+		if json.Unmarshal(m["params"], &item) == nil {
+			a.mentionedFiles.addItem(meta.ThreadID, item.Item)
+		}
+	}
+	a.mu.Lock()
 	if method == "serverRequest/resolved" {
 		for key, pending := range a.approvals {
 			if string(pending.ID) == string(meta.RequestID) && pending.ThreadID == meta.ThreadID {
@@ -646,7 +656,7 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	go func() { <-ctx.Done(); _ = conn.Close() }()
 	go a.writeRelayEvents(ctx, events)
 	log.Printf("relay connected as %s (%s)", credentials.AgentID, a.cfg.Name)
-	hello := protocol.P2P("hello", "")
+	hello := protocol.P2P(protocol.P2PKindHello, "")
 	hello.LAN = true
 	hello.DualNATPunch = true
 	hello.ClientInitiated = true
@@ -697,6 +707,9 @@ func (a *Agent) dispatch(ctx context.Context, app *appserver.Client, send sendEn
 }
 
 func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnvelope, env protocol.Envelope, direct *directSession) {
+	if ctx.Err() != nil {
+		return
+	}
 	var probe struct {
 		Method string `json:"method"`
 	}
@@ -804,7 +817,19 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		return
 	}
 	if req.Method == "codexrm/info" {
-		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "conversationTools": true, "providerModels": true, "providerManagement": a.supportsProviderManagement(), "sameModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "", "threadModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "" && a.cfg.DataDir != "", "messageQueue": true, "images": true, "directFiles": a.supportsDirectFiles(), "computerFiles": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize, "relayImages": true}, "desktopShare": desktop.ReceivesFiles, "desktopControl": runtime.GOOS == "windows", "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
+		// Older Agents ignore these params and still return a valid response.
+		// A probe needs no capabilities or approval replay. Use the same RPC
+		// path as interactive traffic, not a separate faster measurement path.
+		if direct != nil {
+			var options struct {
+				LatencyProbe bool `json:"latencyProbe"`
+			}
+			if json.Unmarshal(req.Params, &options) == nil && options.LatencyProbe {
+				a.respond(send, env, json.RawMessage(`{}`), nil)
+				return
+			}
+		}
+		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "conversationTools": true, "providerModels": true, "providerManagement": a.supportsProviderManagement(), "sameModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "", "threadModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "" && a.cfg.DataDir != "", "messageQueue": true, "images": true, "directFiles": a.allowsFileManagement(), "computerFiles": a.allowsFileManagement(), "mentionedFileDownloads": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize, "relayImages": true}, "phoneTransfer": true, "phoneTransferBatches": desktop.ReceivesFiles, "desktopShare": a.cfg.AllowFileManagement && desktop.ReceivesFiles, "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
 		a.mu.Lock()
 		pending := []approval{}
 		for _, p := range a.approvals {
@@ -832,8 +857,19 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		a.handleRobot(ctx, app, send, env, req.Method, params)
 		return
 	}
+	if err := remoteRPCPermission(req.Method, params); err != nil {
+		a.respond(send, env, nil, err)
+		return
+	}
 	if direct == nil && protocol.RequiresDirectFileTransfer(req.Method, env.Message) {
 		a.respond(send, env, nil, errors.New(protocol.FileTransferDirectRequired))
+		return
+	}
+	if strings.HasPrefix(req.Method, protocol.PhoneTransferPrefix) {
+		if len(req.ID) != 0 {
+			result, err := a.phoneTransferRPC(ctx, env.ClientID, req.Method, params, direct)
+			a.respond(send, env, mustJSON(result), err)
+		}
 		return
 	}
 	if strings.HasPrefix(req.Method, protocol.DirectFilePrefix) {
@@ -861,6 +897,9 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 		result, err := a.threadSnapshot(callCtx, app, params)
+		if err == nil {
+			a.mentionedFiles.addThread(result)
+		}
 		a.respond(send, env, result, err)
 		return
 	}
@@ -890,12 +929,7 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 		return
 	}
 	if req.Method == "codexrm/image/read" {
-		result, err := a.readImage(params)
-		a.respond(send, env, mustJSON(result), err)
-		return
-	}
-	if strings.HasPrefix(req.Method, "codexrm/desktop/") {
-		result, err := a.desktopRPC(req.Method)
+		result, err := a.remoteImage(ctx, app, params)
 		a.respond(send, env, mustJSON(result), err)
 		return
 	}
@@ -921,6 +955,9 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 	callCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	result, e := a.callThread(callCtx, app, env.ClientID, req.Method, params)
+	if e == nil {
+		a.mentionedFiles.addHistory(req.Method, params, result)
+	}
 	a.respond(send, env, result, e)
 }
 func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.RawMessage, err error) {

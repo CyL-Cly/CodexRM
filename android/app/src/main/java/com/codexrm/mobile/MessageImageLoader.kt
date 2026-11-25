@@ -22,6 +22,7 @@ internal data class ImageEnvironment(
     val client: CodexClient?,
     val localImages: Boolean,
     val relayImages: Boolean = false,
+    val threadId: String = "",
 )
 
 internal class MessageImageLoader(context: Context, private val environment: () -> ImageEnvironment) {
@@ -137,7 +138,7 @@ internal class MessageImageLoader(context: Context, private val environment: () 
             val method = if (image.attachmentId.isNotEmpty()) {
                 params.put("id", image.attachmentId); attachmentRead
             } else {
-                params.put("path", image.source).put("cwd", env.cwd).put("version", version); "codexrm/image/read"
+                params.put("path", image.source).put("cwd", env.cwd).put("threadId", env.threadId).put("version", version); "codexrm/image/read"
             }
             client.request(method, params) { result, error ->
                 if (closed) return@request

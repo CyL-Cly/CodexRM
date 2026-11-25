@@ -2,6 +2,7 @@ package com.codexrm.mobile
 
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
 import android.text.Spanned
@@ -108,6 +109,13 @@ internal class MessageAdapter(
     }
 
     var showFileCards = false
+        set(value) {
+            if (field == value) return
+            field = value
+            refreshFileCards()
+        }
+
+    var showUnlinkedFileCards = false
         set(value) {
             if (field == value) return
             field = value
@@ -221,6 +229,7 @@ internal class MessageAdapter(
         val files: LinearLayout,
         val diagram: InlineMermaid,
         var answerStatus: String? = null,
+        var boundBubbleOpacity: Int = -1,
         var boundMessage: ChatMessage? = null,
         var boundRow: MessageDisplayRow? = null,
     )
@@ -239,8 +248,11 @@ internal class MessageAdapter(
         val groupHeader = row.groupHeader
         val groupContent = row.groupContent
         val answerStatus = if (groupHeader || message.questions.isEmpty()) null else answerState(message)
-        if (holder.boundRow == row && holder.boundMessage === message && !message.dirty && holder.answerStatus == answerStatus) return holder.root
+        if (holder.boundRow == row && holder.boundMessage === message && !message.dirty &&
+            holder.answerStatus == answerStatus && holder.boundBubbleOpacity == bubbleOpacity
+        ) return holder.root
         holder.answerStatus = answerStatus
+        holder.boundBubbleOpacity = bubbleOpacity
         val sameMessage = holder.boundMessage === message && holder.boundRow?.groupHeader == groupHeader
         val prepared = streamRows[message.id]?.displayed
         if (!sameMessage) holder.diagram.clear()
@@ -258,6 +270,15 @@ internal class MessageAdapter(
         holder.title.text = if (collapsible && !groupContent) "${if (open) "⌄" else "›"}  $arrowTitle" else message.title
         holder.header.visibility = if (message.title.isEmpty() && !groupHeader) View.GONE else View.VISIBLE
         holder.header.isFocusable = collapsible && !groupContent
+        if (collapsible) {
+            Ui.padChatCard(holder.header)
+            holder.header.minimumHeight = 0
+        } else {
+            holder.header.setPadding(Ui.dp(context, 2), Ui.dp(context, 6), Ui.dp(context, 2), Ui.dp(context, 6))
+            holder.header.minimumHeight = Ui.dp(context, 48)
+        }
+        holder.title.typeface = Typeface.create("sans", if (collapsible) Typeface.NORMAL else Typeface.BOLD)
+        holder.title.setPaddingRelative(if (collapsible) 0 else Ui.dp(context, 8), 0, Ui.dp(context, 8), 0)
         holder.iconFrame.visibility = if (message.kind == MessageKind.ASSISTANT) View.VISIBLE else View.GONE
         val status = if (groupHeader) {
             listOf(message.status, "${row.group!!.messages.size} 条操作").filter(String::isNotBlank).joinToString(" · ")
@@ -317,7 +338,7 @@ internal class MessageAdapter(
         holder.files.removeAllViews()
         val fileCards = if (groupHeader) emptyList() else message.files.mapNotNull { file ->
             val saved = isDownloaded(file)
-            if (showFileCards || saved) file to saved else null
+            if (saved || (if (file.linked) showFileCards else showUnlinkedFileCards)) file to saved else null
         }
         holder.files.visibility = if (fileCards.isEmpty()) View.GONE else View.VISIBLE
         for ((file, saved) in fileCards) {
@@ -352,17 +373,23 @@ internal class MessageAdapter(
         holder.body.setTextColor(if (message.kind == MessageKind.ERROR) Ui.DANGER else if (message.kind == MessageKind.TOOL) Ui.MUTED else Ui.TEXT)
         holder.root.gravity = if (user) Gravity.END else Gravity.START
         holder.content.gravity = holder.root.gravity
-        holder.content.background = if (collapsible && fileCards.isEmpty()) Ui.rounded(
-            appearanceOpacity(Ui.SURFACE, bubbleOpacity), Ui.dp(context, 10).toFloat(), appearanceOpacity(Ui.BORDER, bubbleOpacity),
-        ) else null
-        holder.root.setPadding(
-            Ui.dp(context, if (collapsible) 0 else 14),
-            Ui.dp(context, if (collapsible) 0 else 10),
-            Ui.dp(context, if (collapsible) 0 else 14),
-            Ui.dp(context, if (collapsible) 0 else 10),
-        )
-        val padding = Ui.dp(context, if (message.kind == MessageKind.USER) 14 else if (collapsible) 14 else 2)
-        holder.body.setPadding(padding, Ui.dp(context, if (message.kind == MessageKind.ASSISTANT) 2 else 10), padding, padding)
+        holder.content.background = if (collapsible) Ui.chatCardBackground(context, bubbleOpacity) else null
+        val rowGutter = Ui.dp(context, Ui.CHAT_GUTTER) -
+            if (collapsible) Ui.dp(context, Ui.CHAT_LIST_GUTTER) else 0
+        val rowTop = Ui.dp(context, if (groupContent) 4 else if (collapsible) 0 else 10)
+        holder.root.setPadding(rowGutter, rowTop, rowGutter, Ui.dp(context, if (collapsible) 0 else 10))
+        val padding = Ui.dp(context, when {
+            user -> 14
+            collapsible -> Ui.CHAT_CARD_HORIZONTAL_PADDING
+            else -> 2
+        })
+        val bodyTop = Ui.dp(context, when {
+            message.kind == MessageKind.ASSISTANT -> 2
+            collapsible && holder.header.visibility == View.VISIBLE -> 0
+            else -> Ui.CHAT_CARD_VERTICAL_PADDING
+        })
+        val bodyBottom = if (collapsible) Ui.dp(context, Ui.CHAT_CARD_VERTICAL_PADDING) else padding
+        holder.body.setPadding(padding, bodyTop, padding, bodyBottom)
         holder.body.textSize = if (collapsible) 12f else 14f
         holder.body.setLineSpacing(0f, if (collapsible) 1.35f else 1.55f)
         holder.body.typeface = if (collapsible) android.graphics.Typeface.MONOSPACE else android.graphics.Typeface.create("sans", android.graphics.Typeface.NORMAL)
@@ -396,6 +423,7 @@ internal class MessageAdapter(
         holder.answer.isEnabled = answerStatus == null
         holder.answer.setOnClickListener { answerQuestions(message) }
         holder.header.setOnClickListener(null)
+        holder.header.isClickable = collapsible && !groupContent
         holder.header.contentDescription = if (collapsible && !groupContent) {
             (if (open) "收起 " else "展开 ") + arrowTitle
         } else null
@@ -417,16 +445,13 @@ internal class MessageAdapter(
         val content = Ui.column(context)
         val header = Ui.column(context, false).apply {
             gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = Ui.dp(context, 48)
-            isFocusable = true
-            setPadding(Ui.dp(context, 2), Ui.dp(context, 6), Ui.dp(context, 2), Ui.dp(context, 6))
         }
         val iconFrame = FrameLayout(context).apply {
             background = Ui.rounded(Color.TRANSPARENT, Ui.dp(context, 6).toFloat(), Ui.BORDER)
             addView(IconView(context, "terminal", Ui.TEXT), FrameLayout.LayoutParams(Ui.dp(context, 13), Ui.dp(context, 13), Gravity.CENTER))
         }
         header.addView(iconFrame, LinearLayout.LayoutParams(Ui.dp(context, 22), Ui.dp(context, 22)))
-        val title = Ui.text(context, size = 12f, color = Ui.MUTED, bold = true).apply { setPadding(Ui.dp(context, 8), 0, Ui.dp(context, 8), 0) }
+        val title = Ui.text(context, size = 12f, color = Ui.MUTED)
         header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val status = Ui.text(context, size = 12f, color = Ui.MUTED)
         header.addView(status)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,7 +22,7 @@ import (
 
 const attachmentMaxSize = 20 << 20
 const attachmentChunkSize = 256 << 10
-const desktopShareMaxSize = 512 << 20
+const desktopShareMaxSize = protocol.DirectFileMaxSize
 
 type attachment struct {
 	ID       string `json:"id"`
@@ -32,16 +33,20 @@ type attachment struct {
 }
 
 type attachmentUpload struct {
-	File      attachment
-	Owner     string
-	Offset    int64
-	Updated   time.Time
-	Downloads string
-	Sender    string
-	DirectID  string
-	Streamed  bool
-	Receiving bool
-	ChatImage bool
+	File         attachment
+	Owner        string
+	Offset       int64
+	Updated      time.Time
+	Downloads    string
+	Sender       string
+	DirectID     string
+	Streamed     bool
+	Receiving    bool
+	ChatImage    bool
+	TransferID   string
+	BatchID      string
+	AbortReceive func()
+	Aborted      bool
 }
 
 func attachmentName(name string) string {
@@ -152,12 +157,41 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any, direc
 	}
 	if method == "codexrm/attachment/begin" {
 		name, _ := params["name"].(string)
-		downloads, sender := "", ""
+		downloads, sender, transferID, batchID := "", "", "", ""
 		limit := int64(attachmentMaxSize)
 		if params["destination"] == protocol.DesktopShareDestination {
+			if !a.cfg.AllowFileManagement {
+				return nil, errFileManagementDisabled
+			}
 			if direct == nil || direct.ctx.Err() != nil {
 				return nil, errors.New(protocol.DesktopShareDirectRequired)
 			}
+			if batchID, _ = params["batchId"].(string); batchID != "" && !canonicalTransferID(batchID) {
+				return nil, errors.New("无效的文件批次 ID")
+			}
+			if rawID, _ := params["transferId"].(string); rawID != "" {
+				if !canonicalTransferID(rawID) {
+					return nil, errors.New("无效的发送记录 ID")
+				}
+				transferID = rawID
+				raw, err := os.ReadFile(a.phoneReceipt(owner, transferID))
+				if err == nil {
+					var receipt attachment
+					if err := json.Unmarshal(raw, &receipt); err != nil {
+						return nil, err
+					}
+					return map[string]any{"alreadySaved": true, "name": receipt.Name, "size": receipt.Size}, nil
+				}
+				if !errors.Is(err, os.ErrNotExist) {
+					return nil, err
+				}
+				for _, pending := range a.uploads {
+					if pending.Owner == owner && pending.TransferID == transferID {
+						return nil, errors.New("文件仍在发送，请稍后重试")
+					}
+				}
+			}
+
 			downloads, err = desktop.Downloads()
 			if err != nil {
 				return nil, err
@@ -200,13 +234,16 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any, direc
 		if err := f.Close(); err != nil {
 			return nil, err
 		}
-		upload := &attachmentUpload{File: file, Owner: owner, Updated: time.Now(), Downloads: downloads, Sender: sender, ChatImage: chatImage}
+		upload := &attachmentUpload{File: file, Owner: owner, Updated: time.Now(), Downloads: downloads, Sender: sender, ChatImage: chatImage, TransferID: transferID, BatchID: batchID}
 		if downloads != "" {
 			upload.DirectID = direct.id
 			upload.Streamed, _ = params["uploadStream"].(bool)
 			if upload.Streamed {
 				upload.Offset = -1 // Even an empty file must complete the stream.
 			}
+		}
+		if batchID != "" {
+			a.receiveBatches.touch(receiveBatchKey{owner, batchID}, receiveBatchIdle, desktop.ShowReceivedFiles)
 		}
 		a.uploads[file.ID] = upload
 		return map[string]any{"id": file.ID, "chunkSize": attachmentChunkSize, "uploadStream": upload.Streamed}, nil
@@ -262,6 +299,11 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any, direc
 		return nil, errors.New(protocol.DesktopShareDirectRequired)
 	}
 	if upload.Receiving {
+		if method == "codexrm/attachment/abort" && upload.AbortReceive != nil {
+			upload.Aborted = true
+			upload.AbortReceive()
+			return map[string]any{}, nil
+		}
 		return nil, errors.New("desktop file is still transferring")
 	}
 	upload.Updated = time.Now()
@@ -313,7 +355,17 @@ func (a *Agent) attachmentRPC(owner, method string, params map[string]any, direc
 				return nil, err
 			}
 			delete(a.uploads, id)
-			desktop.ShowReceivedFile(upload.Sender, file.Name, file.Path, file.Size)
+			if err := a.recordReceivedPhoneFile(file, upload.Sender); err != nil {
+				log.Printf("保存文件接收记录: %v", err)
+			}
+			if upload.TransferID != "" {
+				if err := a.savePhoneReceipt(owner, upload.TransferID, file); err != nil {
+					return nil, fmt.Errorf("文件仍在发送，请稍后重试????%w", err)
+				}
+			}
+
+			a.receiveBatches.record(receiveBatchKey{owner, upload.BatchID}, upload.Sender,
+				desktop.ReceivedFile{Name: file.Name, Path: file.Path, Size: file.Size}, receiveBatchIdle, desktop.ShowReceivedFiles)
 			file.Path = ""
 			return file, nil
 		}

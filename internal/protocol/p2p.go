@@ -5,25 +5,58 @@ import (
 	"time"
 )
 
+// Signaling for a direct session rides on the existing RM WebSocket
+// (Envelope.Type == TypeP2P). It is not Socket.IO, SDP, or a WebRTC
+// offer/answer/candidate channel. Kind values are listed below.
+//
+// P2PAttempt is the RM deadline for finishing offer exchange, UDP punch,
+// QUIC/TLS, the control-stream marker, and activate/active. P2PLease is
+// the post-active authorization window; the client renews it. The 12s
+// lease is a CodexRM keep-alive, not a post-candidate connect countdown.
 const (
-	TypeP2P          = "p2p"
-	P2PVersion       = 1
-	P2PAttempt       = 20 * time.Second
-	P2PLease         = 12 * time.Second
-	P2PMaxSessions   = 4
-	P2PMaxCandidates = 8
-	P2PMaxVerifiers  = 4
-	P2PMappingStable = "stable"
-	P2PMappingLinear = "linear"
-	P2PMappingVaries = "varies"
-	MaxEnvelopeSize  = 16 << 20
-	DirectFilePrefix = "codexrm/directFile/"
+	TypeP2P             = "p2p"
+	P2PVersion          = 1
+	P2PAttempt          = 20 * time.Second
+	P2PLease            = 12 * time.Second
+	P2PMaxSessions      = 4
+	P2PMaxCandidates    = 8
+	P2PMaxVerifiers     = 4
+	P2PMappingStable    = "stable"
+	P2PMappingLinear    = "linear"
+	P2PMappingVaries    = "varies"
+	MaxEnvelopeSize     = 16 << 20
+	PhoneTransferPrefix = "codexrm/phoneTransfer/"
+	DirectFilePrefix    = "codexrm/directFile/"
+
+	P2PKindHello          = "hello"
+	P2PKindRouting        = "routing"
+	P2PKindAvailable      = "available"
+	P2PKindBegin          = "begin"
+	P2PKindStart          = "start"
+	P2PKindOffer          = "offer"
+	P2PKindReady          = "ready"
+	P2PKindActivate       = "activate"
+	P2PKindActive         = "active"
+	P2PKindLease          = "lease"
+	P2PKindRenew          = "renew"
+	P2PKindStop           = "stop"
+	P2PKindBusy           = "busy"
+	P2PKindDiagnose       = "diagnose"
+	P2PKindDiagnoseStart  = "diagnose_start"
+	P2PKindDiagnoseResult = "diagnose_result"
+	P2PKindDiagnoseError  = "diagnose_error"
+	P2PKindJoin           = "join"
+	P2PKindLeave          = "leave"
 )
 
 const (
-	DirectShareIDSize  = 36 // Canonical UUID of a pending desktop upload.
-	DirectShareOK      = 1
-	DirectShareTimeout = 10 * time.Minute
+	DirectShareIDSize = 36 // Canonical UUID of a pending upload or an authorized read.
+	DirectFileMaxSize = 512 << 20
+	// Old uploads start with a lowercase UUID. Non-ASCII-hex prefixes select downloads.
+	DirectFileDownload byte = 2
+	PhoneFileDownload  byte = 3
+	DirectShareOK           = 1
+	DirectShareTimeout      = 10 * time.Minute
 )
 
 const (
@@ -35,6 +68,7 @@ const FileTransferDirectRequired = "文件传输仅支持 P2P 直连"
 
 func IsFileTransferRPC(method string) bool {
 	return strings.HasPrefix(method, DirectFilePrefix) ||
+		(strings.HasPrefix(method, PhoneTransferPrefix) && method != PhoneTransferPrefix+"list") ||
 		strings.HasPrefix(method, "codexrm/attachment/") || method == "codexrm/image/read"
 }
 

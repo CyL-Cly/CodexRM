@@ -163,8 +163,11 @@ internal object ClaudeUxCheck {
                 test.runOnMainSync {
                     val method = screen.javaClass.getDeclaredMethod("acceptExternalIntent", Intent::class.java).apply { isAccessible = true }
                     method.invoke(screen, search)
-                    check(field("sidebarOpen").getBoolean(screen))
-                    check((field("searchInput").get(screen) as EditText).isFocused)
+                    check(!field("sidebarOpen").getBoolean(screen))
+                    val entry = field("referenceSearch").get(screen) as ReferenceSearch
+                    val query = entry.javaClass.getDeclaredField("input").apply { isAccessible = true }.get(entry) as EditText
+                    check(query.isFocused)
+                    entry.dismiss()
                 }
                 checks.putBoolean("searchEntryRoutes", true)
                 test.runOnMainSync {

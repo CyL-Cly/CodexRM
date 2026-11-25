@@ -26,17 +26,21 @@ internal class DirectTransport private constructor(private val handle: Long) {
 
     fun signal(signal: JSONObject) = NativeP2P.signal(handle, signal.toString().toByteArray(Charsets.UTF_8))
     fun send(message: String) = NativeP2P.send(handle, message.toByteArray(Charsets.UTF_8))
+    fun measureLatency(main: Handler, receive: (Long) -> Unit) {
+        Thread({
+            val elapsedNanos = NativeP2P.measureLatency(handle)
+            main.post { receive(elapsedNanos) }
+        }, "codexrm-latency").start()
+    }
     fun upload(id: String, file: File, size: Long) = NativeP2P.upload(
         handle, id.toByteArray(Charsets.UTF_8), file.absolutePath.toByteArray(Charsets.UTF_8), size,
     )
     fun uploadProgress() = NativeP2P.uploadProgress(handle)
+    fun download(id: String, file: File, size: Long, phoneTransfer: Boolean) = NativeP2P.download(
+        handle, id.toByteArray(Charsets.UTF_8), file.absolutePath.toByteArray(Charsets.UTF_8), size, phoneTransfer,
+    )
+    fun cancelDownload(id: String) = NativeP2P.cancelDownload(handle, id.toByteArray(Charsets.UTF_8))
     fun close() = NativeP2P.close(handle)
-    fun startDesktop() = NativeP2P.available && NativeP2P.startDesktop(handle)
-    fun stopDesktop() { if (NativeP2P.available) NativeP2P.stopDesktop(handle) }
-    fun desktopActive() = NativeP2P.available && NativeP2P.desktopActive(handle)
-    fun desktopBytes() = if (NativeP2P.available) NativeP2P.desktopBytes(handle) else 0L
-    fun pollDesktop() = if (NativeP2P.available) NativeP2P.pollDesktop(handle) else null
-    fun sendDesktop(message: ByteArray) = NativeP2P.available && NativeP2P.sendDesktop(handle, message)
 
     companion object {
         fun open(start: JSONObject): DirectTransport? {

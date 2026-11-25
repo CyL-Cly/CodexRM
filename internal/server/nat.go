@@ -29,12 +29,12 @@ func (s *Server) handleNATDiagnostic(p *peer, env protocol.Envelope) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch sig.Kind {
-	case "diagnose":
+	case protocol.P2PKindDiagnose:
 		if p.role != protocol.RoleClient || s.clients[p.clientID] != p || !diagnosticPeerAlive(p, now) {
 			return
 		}
 		reject := func(reason string, retryAfter time.Duration) {
-			e := protocol.P2P("diagnose_error", sig.ID)
+			e := protocol.P2P(protocol.P2PKindDiagnoseError, sig.ID)
 			e.Reason = reason
 			e.NATRetryAfterMs = retryAfter.Milliseconds()
 			s.sendDirect(p, p, e)
@@ -63,13 +63,13 @@ func (s *Server) handleNATDiagnostic(p *peer, env protocol.Envelope) {
 		}
 		p.lastNATDiagnostic, agent.lastNATDiagnostic = now, now
 		p.natDiagnostic = &natDiagnostic{id: sig.ID, agent: agent, expires: now.Add(protocol.NATDiagnosticWindow)}
-		start := protocol.P2P("diagnose_start", sig.ID)
+		start := protocol.P2P(protocol.P2PKindDiagnoseStart, sig.ID)
 		start.STUN = stun
 		start.NATRetryAfterMs = protocol.NATDiagnosticWindow.Milliseconds()
 		start.NATUsesP2PSTUN = s.cfg.P2PNATSTUN == ""
 		s.sendDirect(agent, p, start)
 		s.sendDirect(p, p, start)
-	case "diagnose_result":
+	case protocol.P2PKindDiagnoseResult:
 		if p.role != protocol.RoleAgent || s.agents[p.agentID] != p || !diagnosticPeerAlive(p, now) || sig.NATResult == nil || !sig.NATResult.Valid() {
 			return
 		}
@@ -78,7 +78,7 @@ func (s *Server) handleNATDiagnostic(p *peer, env protocol.Envelope) {
 			return
 		}
 		c.natDiagnostic = nil
-		result := protocol.P2P("diagnose_result", sig.ID)
+		result := protocol.P2P(protocol.P2PKindDiagnoseResult, sig.ID)
 		result.NATResult = sig.NATResult
 		s.sendDirect(c, c, result)
 	}

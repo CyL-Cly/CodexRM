@@ -33,7 +33,7 @@ func TestWorkspaceFileDownloadBoundaries(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	a := &Agent{cfg: Config{Cwd: root, DataDir: private}}
+	a := &Agent{cfg: Config{Cwd: root, DataDir: private, AllowFileManagement: true}}
 	d := &directSession{}
 	t.Cleanup(d.files.close)
 	ctx := context.Background()
@@ -107,7 +107,7 @@ func TestComputerFileScope(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a := &Agent{cfg: Config{Cwd: workspace, DataDir: private}}
+	a := &Agent{cfg: Config{Cwd: workspace, DataDir: private, AllowFileManagement: true}}
 	d := &directSession{}
 	t.Cleanup(d.files.close)
 	call := func(d *directSession, method string, params map[string]any) (any, error) {

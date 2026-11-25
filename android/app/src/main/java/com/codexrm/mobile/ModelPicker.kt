@@ -15,9 +15,6 @@ internal object ModelPicker {
     fun rows(options: List<ModelOption>, query: String): List<ModelPickerRow> {
         val needle = query.trim().lowercase(Locale.ROOT)
         val result = ArrayList<ModelPickerRow>()
-        if (needle.isEmpty() || "默认模型 default".contains(needle)) {
-            result += ModelPickerRow("默认模型", "新会话使用当前 Codex 配置", defaultChoice = true)
-        }
         val matches = options.filter { option ->
             needle.isEmpty() || listOf(
                 option.model, option.displayName, option.label, option.providerName, option.providerNotes,

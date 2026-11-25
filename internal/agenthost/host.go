@@ -33,6 +33,7 @@ type Host struct {
 	installDir             string
 	active                 *agent.Agent
 	activeCtx              context.Context
+	generationCancel       context.CancelFunc
 	wxLocalServer          string
 	wxLocalEnrollment      string
 	wxRelayMu              sync.Mutex
@@ -78,10 +79,21 @@ func New(path, installDir string, config clientconfig.Connection, base agent.Con
 func (h *Host) StateDir() string { return filepath.Dir(h.path) }
 func (h *Host) Configured() bool { h.mu.Lock(); defer h.mu.Unlock(); return h.config.Server != "" }
 
-func (h *Host) OpenSettings() {
-	url, err := h.SettingsURL()
+func (h *Host) OpenSettings() { h.openSettingsView("") }
+
+func (h *Host) OpenPhoneTransfers() { h.openSettingsView("phone-transfers") }
+
+func (h *Host) openSettingsView(view string) {
+	address, err := h.SettingsURL()
 	if err == nil {
-		err = h.openBrowser(url)
+		var u *url.URL
+		u, err = url.Parse(address)
+		if err == nil {
+			if view != "" {
+				u.RawQuery = url.Values{"view": {view}}.Encode()
+			}
+			err = h.openBrowser(u.String())
+		}
 	}
 	if err != nil {
 		// Headless Linux has no browser; the URL is still needed for an SSH tunnel.
@@ -150,11 +162,12 @@ func (h *Host) Run(ctx context.Context) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for runCtx.Err() == nil {
+		generationCtx, cancel := context.WithCancel(runCtx)
 		h.mu.Lock()
+		h.generationCancel = cancel
 		cfg, version := h.config, h.version
 		wxRelay, wxKey := h.wxLocalServer, h.wxLocalEnrollment
 		h.mu.Unlock()
-		generationCtx, cancel := context.WithCancel(runCtx)
 		finished := make(chan struct{})
 		go func() {
 			defer close(finished)
@@ -447,6 +460,7 @@ func (h *Host) current(ctx context.Context) (*agent.Agent, context.Context, func
 }
 
 func withLocalSettings(base agent.Config, cfg clientconfig.Connection) agent.Config {
+	base.AllowFileManagement = cfg.AllowFileManagement
 	if cfg.Workspace != "" {
 		base.Cwd = cfg.Workspace
 	}

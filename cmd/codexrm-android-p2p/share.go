@@ -13,13 +13,15 @@ import (
 	"os"
 	"unsafe"
 
+	"github.com/codexrm/codexrm/internal/p2p"
+
 	"github.com/codexrm/codexrm/internal/protocol"
 )
 
 //export CRMUpload
 func CRMUpload(h C.int64_t, id unsafe.Pointer, idLen C.int, path unsafe.Pointer, pathLen C.int, size C.int64_t) C.int {
 	s := lookup(h)
-	if s == nil || idLen != protocol.DirectShareIDSize || pathLen <= 0 || pathLen > 4096 || size < 0 {
+	if s == nil || idLen != protocol.DirectShareIDSize || pathLen <= 0 || pathLen > 4096 || size < 0 || size > protocol.DirectFileMaxSize {
 		return 0
 	}
 	link := s.link.Load()
@@ -50,7 +52,7 @@ func CRMUpload(h C.int64_t, id unsafe.Pointer, idLen C.int, path unsafe.Pointer,
 		return 0
 	}
 	reader := &shareReader{file: file, size: int64(size), session: s}
-	if _, err := io.CopyN(stream, reader, int64(size)); err != nil {
+	if err := p2p.CopyFilePayload(stream, reader, int64(size)); err != nil {
 		stream.CancelWrite(1)
 		return 0
 	}

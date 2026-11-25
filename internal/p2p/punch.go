@@ -28,6 +28,20 @@ const (
 	dualNATPunchSockets      = 32
 )
 
+// shouldGrowLocal reports whether this egress should open extra source ports.
+// The primary rule is punchStrategy.GrowLocal (local random-symmetric). A
+// client offer with no mapping hint still grows when some remote IPv4 path
+// is not linear; that fallback is compatibility, not a confirmed NAT type.
+func shouldGrowLocal(localMapping string, full, agent, dualNATPunch, allRemoteLinear bool) bool {
+	if !full || (agent && !dualNATPunch) {
+		return false
+	}
+	if punchStrategyFor(localMapping, protocol.P2PMappingStable, true, true).GrowLocal {
+		return true
+	}
+	return !agent && localMapping == "" && !allRemoteLinear
+}
+
 func exactWindow(local, remote string) time.Duration {
 	switch {
 	case local == protocol.P2PMappingVaries || remote == protocol.P2PMappingVaries:
@@ -299,26 +313,19 @@ func (s *Session) punchPaths(ctx context.Context, targets, local []netip.AddrPor
 		}
 	}
 	for _, i := range order {
-		if !supportsFamily(s.sockets[i], false) || s.disableFullPunch {
+		if !supportsFamily(s.sockets[i], false) {
 			continue
 		}
-		mapping := s.localHint(i)
-		// Grow extra local ports when this egress is (or may be) randomly
-		// symmetric. Linear and cone mappings stay on the sockets already bound.
-		if mapping == protocol.P2PMappingVaries || (!s.agent && mapping == "" && !allLinear) {
+		// Grow extra local ports when the NAT-pair strategy says so.
+		// Linear and cone mappings stay on the sockets already bound.
+		if shouldGrowLocal(s.localHint(i), !s.disableFullPunch, s.agent, s.dualNATPunch, allLinear) {
 			growPaths = append(growPaths, i)
 		}
 	}
 	if s.agent {
 		// Keep unsolicited Agent traffic bounded. Old clients do not reply
 		// to a ping from a new source socket.
-		if !s.dualNATPunch {
-			growPaths = nil
-		}
 		socketLimit = min(socketLimit, dualNATPunchSockets)
-	}
-	if s.disableFullPunch {
-		growPaths = nil
 	}
 	growAfter := publicAfter.Add(exactWindow(s.mapping, ""))
 	if exactFor > 0 {

@@ -60,6 +60,7 @@ function status(data) {
 }
 function apply(data) {
   $("server").value = data.server || "";
+  $("allow-file-management").checked = data.allowFileManagement === true;
   $("overview-server").textContent = data.server || "尚未配置服务器";
   $("update-card").hidden = !["windows-agent", "linux-agent"].includes(data.updateMode);
   $("linux-update-card").hidden = data.updateMode !== "linux-manual";
@@ -84,7 +85,8 @@ async function action(button, work) {
   try { await work(); } catch (error) { notice(error.message, true); } finally { button.disabled = button === $("copy-code") && !pairingExpiresAt; busy = false; }
 }
 function dirty() {
-  return !saved || $("server").value !== saved.server || $("key").value !== "" || $("clear-key")?.checked === true;
+  return !saved || $("server").value !== saved.server || $("key").value !== "" || $("clear-key")?.checked === true ||
+    $("allow-file-management").checked !== (saved.allowFileManagement === true);
 }
 function requireSaved() {
   if (dirty()) throw new Error("请先保存连接配置，再进行配对或设备管理。");
@@ -153,7 +155,10 @@ async function devices() {
 $("settings-form").addEventListener("submit", (event) => {
   event.preventDefault();
   action($("save"), async () => {
-    const input = { server: $("server").value.trim() };
+    const input = {
+      server: $("server").value.trim(),
+      allowFileManagement: $("allow-file-management").checked,
+    };
     if ($("clear-key")?.checked) input.enrollmentKey = "";
     else if ($("key").value) input.enrollmentKey = $("key").value;
     const data = await api("/api/settings", { method: "PUT", body: JSON.stringify(input) });

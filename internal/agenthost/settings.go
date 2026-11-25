@@ -82,6 +82,7 @@ func (h *Host) SettingsURL() (string, error) {
 	mux.HandleFunc("/api/devices", h.devices)
 	mux.HandleFunc("/api/devices/", h.devices)
 	mux.HandleFunc("POST /api/providers/{action}", h.providerSettings)
+	h.registerPhoneTransferRoutes(mux)
 	if oneBotSupported {
 		mux.HandleFunc("/api/onebot", h.oneBotSettings)
 		mux.HandleFunc("POST /api/onebot/test", h.oneBotTest)
@@ -230,6 +231,7 @@ func (h *Host) Status() Status {
 func (h *Host) snapshot() map[string]any {
 	h.mu.Lock()
 	server, keySet := h.config.Server, h.config.EnrollmentKey != ""
+	fileManagement := h.config.AllowFileManagement
 	pending := h.pendingUpdate != nil
 	updaterInstance := h.activeUpdater
 	h.mu.Unlock()
@@ -270,12 +272,14 @@ func (h *Host) snapshot() map[string]any {
 			}
 		}
 	}
-	return map[string]any{"server": server, "enrollmentKeySet": keySet, "updatePending": pending, "updateStatus": updateStatus, "updateMode": h.updateMode(), "status": status, "state": connection.State, "error": connection.Error, "lastConnectedAt": connection.LastConnectedAt, "nextRetryAt": connection.NextRetryAt, "version": release.VersionName, "packaged": installation.IsPackaged(), "wxSupported": wxSupported, "oneBotSupported": oneBotSupported}
+	return map[string]any{"allowFileManagement": fileManagement, "server": server, "enrollmentKeySet": keySet, "updatePending": pending, "updateStatus": updateStatus, "updateMode": h.updateMode(), "status": status, "state": connection.State, "error": connection.Error, "lastConnectedAt": connection.LastConnectedAt, "nextRetryAt": connection.NextRetryAt, "version": release.VersionName, "packaged": installation.IsPackaged(), "wxSupported": wxSupported, "oneBotSupported": oneBotSupported}
 }
 
 func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		respond(w, 200, h.snapshot())
+		data := h.snapshot()
+		data["phoneTransfersSupported"] = localFileTransferSettings(r)
+		respond(w, 200, data)
 		return
 	}
 	if r.Method != http.MethodPut {
@@ -283,8 +287,9 @@ func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		Server        string  `json:"server"`
-		EnrollmentKey *string `json:"enrollmentKey"`
+		Server              string  `json:"server"`
+		EnrollmentKey       *string `json:"enrollmentKey"`
+		AllowFileManagement *bool   `json:"allowFileManagement"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	decoder := json.NewDecoder(r.Body)
@@ -315,6 +320,9 @@ func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 	if input.EnrollmentKey != nil {
 		cfg.EnrollmentKey = *input.EnrollmentKey
 	}
+	if input.AllowFileManagement != nil {
+		cfg.AllowFileManagement = *input.AllowFileManagement
+	}
 	if err := cfg.Normalize(); err != nil {
 		failure(w, err)
 		return
@@ -325,6 +333,9 @@ func (h *Host) settings(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	h.config = cfg
+	if h.generationCancel != nil {
+		h.generationCancel() // Revoke the previous policy and close its direct sessions.
+	}
 	h.version++
 	h.lastError = ""
 	h.connectionState = agent.Connecting

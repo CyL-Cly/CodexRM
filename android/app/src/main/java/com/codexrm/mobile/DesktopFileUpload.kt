@@ -10,15 +10,31 @@ import java.util.concurrent.Executors
 private val desktopUploadWorker = Executors.newSingleThreadExecutor()
 internal const val DESKTOP_SHARE_DIRECT_REQUIRED = "发送到电脑需要 P2P 直连，请重新连接后重试"
 
+internal class DesktopUploadControl(private val onCommit: () -> Unit) {
+    @Volatile var cancelled = false
+        private set
+    var abort: (() -> Unit)? = null
+    fun cancel() {
+        cancelled = true
+        abort?.invoke()
+        abort = null
+    }
+    fun committing() {
+        abort = null
+        onCommit()
+    }
+}
+
 internal fun CodexClient.uploadDesktopFile(metadata: JSONObject, file: File, progress: (Int) -> Unit, complete: RpcCallback) {
     withDesktopShareTransport { transport ->
         if (transport == null) complete.onComplete(null, IOException(DESKTOP_SHARE_DIRECT_REQUIRED))
-        else uploadDesktopFile(transport, metadata, file, progress, complete)
+        else uploadDesktopFile(transport, metadata, file, progress, complete = complete)
     }
 }
 
 internal fun CodexClient.uploadDesktopFile(
-    transport: DirectTransport, metadata: JSONObject, file: File, progress: (Int) -> Unit, complete: RpcCallback,
+    transport: DirectTransport, metadata: JSONObject, file: File, progress: (Int) -> Unit,
+    control: DesktopUploadControl? = null, complete: RpcCallback,
 ) {
     val size = metadata.optLong("size")
     val main = Handler(Looper.getMainLooper())
@@ -29,19 +45,32 @@ internal fun CodexClient.uploadDesktopFile(
             complete.onComplete(null, error ?: IOException("文件上传失败"))
             return@requestDesktopShare
         }
+        if (result.optBoolean("alreadySaved")) {
+            complete.onComplete(result, null)
+            return@requestDesktopShare
+        }
         val id = result.string("id")
         val reference = JSONObject().put("id", id)
+        val abort = { requestDesktopShare(transport, "abort", reference) { _, _ -> } }
         fun fail(failure: Exception) {
-            requestDesktopShare(transport, "abort", reference) { _, _ -> }
+            abort()
+            control?.abort = null
             complete.onComplete(null, failure)
         }
+        if (control?.cancelled == true) {
+            fail(IOException("发送已取消"))
+            return@requestDesktopShare
+        }
+        control?.abort = abort
         if (!result.optBoolean("uploadStream")) {
-            uploadAttachment(metadata, file::inputStream, progress, begun = result, desktopTransport = transport, complete = complete)
+            uploadAttachment(metadata, file::inputStream, progress, begun = result, desktopTransport = transport,
+                desktopControl = control, complete = complete)
             return@requestDesktopShare
         }
         val poll = object : Runnable {
             private var last = 0
             override fun run() {
+                if (control?.cancelled == true) return
                 val percent = transport.uploadProgress()
                 if (percent > last) {
                     last = percent
@@ -52,13 +81,18 @@ internal fun CodexClient.uploadDesktopFile(
         }
         main.postDelayed(poll, 200)
         desktopUploadWorker.execute {
-            val sent = runCatching { transport.upload(id, file, size) }.getOrDefault(false)
+            val sent = control?.cancelled != true && runCatching { transport.upload(id, file, size) }.getOrDefault(false)
             main.post {
                 main.removeCallbacks(poll)
+                if (control?.cancelled == true) {
+                    fail(IOException("发送已取消"))
+                    return@post
+                }
                 if (!sent) {
                     fail(IOException("直连文件上传失败"))
                     return@post
                 }
+                control?.committing()
                 requestDesktopShare(transport, "finish", reference) { finished, failure ->
                     if (finished == null || failure != null) fail(failure ?: IOException("文件保存失败"))
                     else {

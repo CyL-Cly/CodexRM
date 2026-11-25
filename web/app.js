@@ -624,11 +624,11 @@ function historyImageHTML(source, name, itemId) {
   if (/^data:/i.test(safe)) return `<img class="history-image" src="${escapeHTML(safe)}" alt="${label}" loading="lazy" decoding="async" />`;
   return `<img class="history-image" data-history-image="${escapeHTML(safe)}" data-image-item="${escapeHTML(itemId || "")}" alt="${label}" loading="lazy" decoding="async" referrerpolicy="no-referrer" />`;
 }
-function readHistoryImage(source, itemId, cwd) {
+function readHistoryImage(source, itemId, cwd, threadId = state.current?.id || "") {
   const remote = /^https?:\/\//i.test(source);
-  const key = JSON.stringify([imageScope() || state.selected, "history", ...(remote ? [source] : [itemId, cwd, source])]);
+  const key = JSON.stringify([imageScope() || state.selected, "history", ...(remote ? [source] : [threadId, itemId, cwd, source])]);
   return readCachedImage(key, async () => {
-    if (!remote) return readImageChunks("codexrm/image/read", { path: source, cwd });
+    if (!remote) return readImageChunks("codexrm/image/read", { path: source, cwd, threadId });
     const response = await fetch(source, { credentials: "omit", referrerPolicy: "no-referrer" });
     const type = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
     if (!response.ok || !cachedImageTypes.has(type) || Number(response.headers.get("content-length")) > maxHistoryImageBytes)
@@ -825,7 +825,11 @@ async function removeWorkspace(path) {
   await loadThreads();
   toast("已取消固定；有历史会话的文件夹仍会自动显示");
 }
+function canBrowseComputer() {
+  return state.info?.directFiles === true;
+}
 async function browseDirectory(path) {
+  if (!canBrowseComputer()) return;
   const generation = state.generation;
   const version = ++state.directoryVersion;
   $("directory-error").textContent = "";
@@ -892,7 +896,15 @@ function openWorkspacePicker() {
   if (!state.info?.workspaces)
     return toast("请更新本地连接器，以使用多工作区和目录浏览功能");
   state.directory = null;
-  $("directory-device").textContent = `浏览 ${state.info.name} 上的文件夹`;
+  const canBrowse = canBrowseComputer();
+  $("directory-device").textContent = canBrowse ? `浏览 ${state.info.name} 上的文件夹` : "请输入电脑上的工作区绝对路径。";
+  $("browse-directory").hidden = !canBrowse;
+  $("directory-hidden-row").hidden = !canBrowse;
+  $("directory-list").hidden = !canBrowse;
+  $("directory-shortcuts").hidden = !canBrowse;
+  $("directory-error").textContent = "";
+  $("directory-path").value = selectedCwd() || state.info.cwd || "";
+  $("select-directory").disabled = canBrowse || !$("directory-path").value.trim();
   $("directory-list").replaceChildren();
   $("directory-shortcuts").replaceChildren();
   $("directory-hidden").checked = false;
@@ -2178,9 +2190,7 @@ function defaultModelPreference() {
   for (const preference of [workspaceView().lastModel, workspaceModelPreference()]) {
     if (preference?.model && available.some((m) => m.key === preference.model)) return preference;
   }
-  const model = available.find((m) => !m.providerId && m.isDefault) ||
-    available.find((m) => m.isDefault) || available[0];
-  return { model: model?.key || "", effort: model?.defaultReasoningEffort || "" };
+  return { model: "", effort: "" };
 }
 function saveModelPreference() {
   if (!selectedModel()) return;
@@ -2234,7 +2244,7 @@ async function loadModels(refresh = false) {
 }
 function renderModels(preferred = $("model").value) {
   $("model").value = "";
-  $("model").replaceChildren(new Option("默认模型 · 当前 Codex 配置", ""));
+  $("model").replaceChildren(new Option("当前 Codex 配置", ""));
   for (const p of state.providers) {
     const group = document.createElement("optgroup");
     const models = state.models.filter((m) => m.providerId === p.id);
@@ -2286,8 +2296,7 @@ function selectThreadModel(result, preferred = "", effort = result.reasoningEffo
 function renderEfforts(previous = $("effort").value) {
   $("effort").value = "";
   $("effort").replaceChildren(new Option("默认思考", ""));
-  const model =
-    selectedModel() || state.models.find((m) => !m.providerId && m.isDefault);
+  const model = selectedModel();
   // 请勿翻译模型和思考强度名
   for (const r of model?.supportedReasoningEfforts || []) {
     const value = r.reasoningEffort;
@@ -3989,9 +3998,6 @@ function settings() {
   const remoteUpdate = Boolean(d && state.online && state.info?.remoteUpdate);
   $("update-agent").hidden = !remoteUpdate;
   $("update-agent-help").hidden = !remoteUpdate;
-  const desktopControl = Boolean(d && state.online && state.info?.desktopControl);
-  $("close-codex-desktop").hidden = !desktopControl;
-  $("close-codex-desktop-help").hidden = !desktopControl;
   $("settings-dialog").showModal();
 }
 async function updateAgent() {
@@ -4013,21 +4019,6 @@ async function updateAgent() {
   }
 }
 $("update-agent").onclick = updateAgent;
-async function closeCodexDesktop() {
-  if (!state.online) return toast("设备离线，无法关闭 Codex 桌面客户端");
-  if (!window.confirm("确定关闭 Codex 桌面客户端吗？未保存的桌面操作可能丢失。")) return;
-  const button = $("close-codex-desktop");
-  button.disabled = true;
-  try {
-    const result = await rpc("codexrm/desktop/close");
-    toast(result.message || "Codex 桌面客户端已关闭");
-  } catch (e) {
-    showError(e);
-  } finally {
-    button.disabled = false;
-  }
-}
-$("close-codex-desktop").onclick = closeCodexDesktop;
 $("pair-form").onsubmit = async (event) => {
   event.preventDefault();
   $("pair-submit").disabled = true;
@@ -4209,10 +4200,11 @@ $("workspace-select").onchange = () =>
   selectWorkspace($("workspace-select").value).catch(showError);
 $("directory-path-form").onsubmit = (event) => {
   event.preventDefault();
-  browseDirectory($("directory-path").value.trim());
+  if (canBrowseComputer()) browseDirectory($("directory-path").value.trim());
+  else $("select-directory").click();
 };
 $("directory-path").oninput = () => {
-  $("select-directory").disabled = true;
+  $("select-directory").disabled = canBrowseComputer() || !$("directory-path").value.trim();
 };
 $("directory-hidden").onchange = () =>
   browseDirectory($("directory-path").value.trim());
@@ -4221,8 +4213,8 @@ $("workspace-dialog").addEventListener("close", () => {
   state.directory = null;
 });
 $("select-directory").onclick = async () => {
-  if (!state.directory) return;
-  const path = state.directory.path;
+  const path = canBrowseComputer() ? state.directory?.path : $("directory-path").value.trim();
+  if (!path) return;
   const generation = state.generation;
   $("select-directory").disabled = true;
   try {

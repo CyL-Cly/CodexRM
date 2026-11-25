@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -8,10 +9,37 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/codexrm/codexrm/internal/appserver"
 )
 
-// Paired clients can display image files referenced by Codex without exposing a
-// general file-download endpoint. Existing upload reads remain ID-only.
+func (a *Agent) remoteImage(ctx context.Context, app *appserver.Client, params map[string]any) (any, error) {
+	if a.allowsFileManagement() {
+		return a.readImage(params)
+	}
+	base, path, err := a.mentionedFileLocation(ctx, app, params)
+	if err != nil {
+		return nil, err
+	}
+	root, before, err := checkedDirectRoot(base, path, a.directPrivatePath())
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("图片不存在或不是普通文件")
+	}
+	f, err := root.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if actual, err := f.Stat(); err != nil || !os.SameFile(before, actual) {
+		return nil, fmt.Errorf("图片已变化，请重试")
+	}
+	return readImageChunk(f, params)
+}
+
 func (a *Agent) readImage(params map[string]any) (any, error) {
 	path, _ := params["path"].(string)
 	if path == "" || strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//") {
@@ -46,6 +74,10 @@ func (a *Agent) readImage(params map[string]any) (any, error) {
 		return nil, fmt.Errorf("图片不存在或无法读取")
 	}
 	defer f.Close()
+	return readImageChunk(f, params)
+}
+
+func readImageChunk(f *os.File, params map[string]any) (any, error) {
 	stat, err := f.Stat()
 	if err != nil || !stat.Mode().IsRegular() || stat.Size() <= 0 || stat.Size() > attachmentMaxSize {
 		return nil, fmt.Errorf("图片不是普通文件或超过 20 MB")

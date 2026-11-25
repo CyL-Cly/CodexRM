@@ -2,6 +2,7 @@ package com.codexrm.mobile
 
 import android.annotation.TargetApi
 import android.app.PendingIntent
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
@@ -11,6 +12,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import androidx.core.content.FileProvider
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -31,6 +33,7 @@ internal object UpdateChecker {
     const val MANIFEST_URL = "$UPDATE_ORIGIN/android-update.json"
     private const val HISTORY_URL = "$UPDATE_ORIGIN/release-history.json"
     const val MAX_PACKAGE_SIZE = 512L * 1024L * 1024L
+    internal const val SILENT_INSTALL_FALLBACK_MS = 20_000L
     private const val MAX_MANIFEST_SIZE = 1024 * 1024
     private val main by lazy { Handler(Looper.getMainLooper()) }
 
@@ -63,6 +66,24 @@ internal object UpdateChecker {
         context.packageManager.canRequestPackageInstalls()
 
     internal fun shouldUseSilentInstallFlag(sdkInt: Int): Boolean = sdkInt >= 31
+
+    internal fun shouldRetryWithInteractiveInstall(
+        status: Int,
+        silentAttempt: Boolean,
+        interactiveAlreadyStarted: Boolean,
+    ): Boolean {
+        if (!silentAttempt || interactiveAlreadyStarted) return false
+        return when (status) {
+            PackageInstaller.STATUS_FAILURE,
+            PackageInstaller.STATUS_FAILURE_ABORTED,
+            PackageInstaller.STATUS_FAILURE_BLOCKED,
+            PackageInstaller.STATUS_FAILURE_TIMEOUT -> true
+            else -> false
+        }
+    }
+
+    internal fun isUserCancelledInstall(status: Int): Boolean =
+        status == PackageInstaller.STATUS_FAILURE_ABORTED
 
     fun requestInstallPermission(context: Context) {
         context.startActivity(
@@ -272,12 +293,55 @@ internal object UpdateChecker {
     }
 
     @TargetApi(31)
-    private fun configureUserAction31(params: PackageInstaller.SessionParams) {
-        params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+    private fun configureUserAction31(params: PackageInstaller.SessionParams, silent: Boolean) {
+        params.setRequireUserAction(
+            if (silent) {
+                PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED
+            } else {
+                PackageInstaller.SessionParams.USER_ACTION_REQUIRED
+            },
+        )
+    }
+
+    fun abandonMySessions(context: Context) {
+        runCatching {
+            val installer = context.packageManager.packageInstaller
+            for (session in installer.mySessions) {
+                runCatching { installer.abandonSession(session.sessionId) }
+            }
+        }
+    }
+
+    fun launchNormalPackageInstall(context: Context, apk: File): Boolean {
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.downloads", apk)
+        val view = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        view.clipData = ClipData.newRawUri("CodexRM-update", uri)
+        grantPackageUri(context, view, uri)
+        if (runCatching { context.startActivity(view) }.isSuccess) return true
+        view.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return runCatching { context.startActivity(view) }.isSuccess
     }
 
     @Suppress("DEPRECATION")
-    fun install(context: Context, apk: File, expectedVersionCode: Long, requestId: String) {
+    private fun grantPackageUri(context: Context, intent: Intent, uri: Uri) {
+        val matches = if (Build.VERSION.SDK_INT >= 33) {
+            context.packageManager.queryIntentActivities(
+                intent,
+                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong()),
+            )
+        } else {
+            context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+        }
+        for (match in matches) {
+            val packageName = match.activityInfo?.packageName ?: continue
+            runCatching { context.grantUriPermission(packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    fun install(context: Context, apk: File, expectedVersionCode: Long, requestId: String, silent: Boolean) {
         val archive = if (Build.VERSION.SDK_INT >= 33) {
             context.packageManager.getPackageArchiveInfo(apk.absolutePath, PackageManager.PackageInfoFlags.of(0))
         } else {
@@ -286,11 +350,13 @@ internal object UpdateChecker {
         require(archive != null && archive.packageName == context.packageName) { "安装包不是有效的 CodexRM 更新" }
         require(archive.longVersionCode == expectedVersionCode) { "安装包版本与更新清单不一致" }
         val installer = context.packageManager.packageInstaller
+        val useSilent = silent && shouldUseSilentInstallFlag(Build.VERSION.SDK_INT)
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
             setAppPackageName(context.packageName)
-            // Android 12+ allows a permitted installer to update itself without another
-            // confirmation. Older systems use the package installer's confirmation UI.
-            if (shouldUseSilentInstallFlag(Build.VERSION.SDK_INT)) configureUserAction31(this)
+            // Android 12+ can update this app without another confirmation. Keep the
+            // calling activity alive; the system kills the process when it applies the
+            // package. Devices that reject silent install get the normal confirmation UI.
+            if (Build.VERSION.SDK_INT >= 31) configureUserAction31(this, useSilent)
         }
         val sessionId = installer.createSession(params)
         val session = installer.openSession(sessionId)
@@ -303,8 +369,6 @@ internal object UpdateChecker {
                 .setAction(UpdateInstallReceiver.ACTION_INSTALL_STATUS)
                 .putExtra(UpdateInstallReceiver.EXTRA_REQUEST_ID, requestId)
             // PackageInstaller fills in status and user-action extras, so it rejects an immutable callback.
-            // The status broadcast is sent by the system, which exempts the receiver's
-            // install-confirmation launch from Android 14+ background-start restrictions.
             val pendingIntent = PendingIntent.getBroadcast(
                 context,
                 sessionId,
@@ -319,4 +383,5 @@ internal object UpdateChecker {
             session.close()
         }
     }
+
 }

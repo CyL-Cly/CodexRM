@@ -81,7 +81,8 @@ class UxStateTest {
             option("p2", "gamma-image", "Provider Two"),
         )
         val rows = ModelPicker.rows(options, "")
-        assertTrue(rows.first().title == "默认模型")
+        assertTrue(rows.first().header && rows.first().title == "Provider One")
+        assertTrue(rows.none { it.defaultChoice })
         assertEquals(2, rows.count { it.header })
         assertTrue(rows.any { it.header && it.title == "Provider One" })
 

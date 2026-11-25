@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -40,6 +41,9 @@ func TestConnectWithUnpredictableMappings(t *testing.T) {
 			if _, err := s.Connect(ctx, offer, nil, nil); !errors.Is(err, tc.want) {
 				t.Fatalf("Connect returned %v, want %v", err, tc.want)
 			}
+			if s.State() != ConnFailed {
+				t.Fatalf("state %s, want failed", s.State())
+			}
 		})
 	}
 }
@@ -58,6 +62,9 @@ func TestPrepareWithoutLocalUDPCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer session.Close()
+	if session.State() != ConnOffering {
+		t.Fatalf("pin-only client state %s, want offering", session.State())
+	}
 	if len(offer.Pin) != 64 || len(offer.Candidates) != 0 || len(offer.Local) != 0 {
 		t.Fatalf("expected a pin-only offer, got %+v", offer)
 	}
@@ -70,6 +77,8 @@ func TestPrepareWithoutLocalUDPCandidates(t *testing.T) {
 func TestDirectRacesCandidatesAndUsesAlternateSocketForQUIC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
 	defer cancel()
+	const fileID = "12345678-1234-1234-1234-123456789abc"
+	const fileContents = "QUIC stream payload"
 	start := protocol.P2P("start", "test-session-without-peer-candidates")
 	start.Secret, start.ClientInitiated = strings.Repeat("ab", 32), true
 	agent, offerAgent, err := PrepareWithLocalPrefixes(ctx, true, *start, nil)
@@ -104,6 +113,9 @@ func TestDirectRacesCandidatesAndUsesAlternateSocketForQUIC(t *testing.T) {
 				err = link.Write([]byte("alternate path"))
 			}
 			if err == nil {
+				err = sendDownloadTestFile(ctx, link, string(protocol.PhoneFileDownload)+fileID, fileContents)
+			}
+			if err == nil {
 				_, err = link.Read()
 			}
 		}
@@ -118,12 +130,38 @@ func TestDirectRacesCandidatesAndUsesAlternateSocketForQUIC(t *testing.T) {
 	if err != nil || string(message) != "alternate path" {
 		t.Fatalf("read = %q, %v", message, err)
 	}
+	var file strings.Builder
+	if err := link.DownloadFile(ctx, protocol.PhoneFileDownload, fileID, int64(len(fileContents)), &file); err != nil || file.String() != fileContents {
+		t.Fatalf("download = %q, %v", file.String(), err)
+	}
 	if err := link.Write([]byte("received")); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+	if !DirectReady(agent.State()) || !DirectReady(client.State()) {
+		t.Fatalf("agent %s client %s, want connected", agent.State(), client.State())
+	}
+}
+
+func sendDownloadTestFile(ctx context.Context, link *Link, header, payload string) error {
+	stream, err := link.AcceptStream(ctx)
+	if err != nil {
+		return err
+	}
+	deadline, _ := ctx.Deadline()
+	_ = stream.SetDeadline(deadline)
+	got, err := io.ReadAll(io.LimitReader(stream, int64(len(header)+1)))
+	if err != nil || string(got) != header {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+		return errors.New("unexpected direct download request")
+	}
+	if _, err := io.WriteString(stream, payload); err != nil {
+		return err
+	}
+	return stream.Close()
 }
 
 func TestPrepareForceRelay(t *testing.T) {

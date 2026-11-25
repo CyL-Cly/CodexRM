@@ -222,6 +222,51 @@ func TestSettingsSaveFailureDoesNotApplyAndServerChangeClearsOldKey(t *testing.T
 	}
 }
 
+func TestRemotePermissionsPersistIndependentlyAndCancelPreviousGeneration(t *testing.T) {
+	const serverURL = "http://127.0.0.1:1"
+	h, base, token, _ := startHost(t, clientconfig.Connection{Server: serverURL})
+	assertSettings := func(method string, input any, files bool) {
+		t.Helper()
+		code, b := request(t, base, token, method, "/api/settings", input)
+		var data map[string]any
+		if code != 200 || json.Unmarshal(b, &data) != nil || data["allowFileManagement"] != files {
+			t.Fatalf("%s: expected files %v, got %d %s", method, files, code, b)
+		}
+	}
+	assertSettings("GET", nil, false)
+	oldGeneration, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	deadline := time.Now().Add(time.Second)
+	for {
+		h.mu.Lock()
+		originalCancel := h.generationCancel
+		if originalCancel != nil {
+			h.generationCancel = func() { cancel(); originalCancel() }
+			h.mu.Unlock()
+			break
+		}
+		h.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("host did not start a generation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	assertSettings("PUT", map[string]any{"server": serverURL, "allowFileManagement": true}, true)
+	if oldGeneration.Err() == nil {
+		t.Fatal("previous permission generation still active after saving")
+	}
+	assertSettings("PUT", map[string]any{"server": serverURL}, true)
+	cfg, err := clientconfig.Load(h.path)
+	if err != nil || !cfg.AllowFileManagement {
+		t.Fatalf("permission configuration did not round trip: %+v, %v", cfg, err)
+	}
+	applied := withLocalSettings(agent.Config{}, cfg)
+	if !applied.AllowFileManagement {
+		t.Fatalf("host did not apply persisted permissions: %+v", applied)
+	}
+	assertSettings("PUT", map[string]any{"server": serverURL, "allowFileManagement": false}, false)
+}
+
 func manualUpdateFeed(t *testing.T, versionCode int64) *httptest.Server {
 	t.Helper()
 	var archive bytes.Buffer

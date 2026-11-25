@@ -42,6 +42,7 @@ abstract class BuildDirectLibraries @Inject constructor(private val exec: ExecOp
 }
 
 val p2pQa = project.hasProperty("codexrm.p2pQa")
+val fileTransferQa = project.hasProperty("codexrm.fileTransferQa")
 
 android {
     namespace = "com.codexrm.mobile"
@@ -52,22 +53,26 @@ android {
 
     val imageQa = project.hasProperty("codexrm.imageQa")
     val mathQa = project.hasProperty("codexrm.mathQa")
-    require(listOf(imageQa, mathQa, p2pQa).count { it } <= 1) { "Choose only one CodexRM QA variant" }
+    require(listOf(imageQa, mathQa, p2pQa, fileTransferQa).count { it } <= 1) { "Choose only one CodexRM QA variant" }
 
     defaultConfig {
         applicationId = "com.codexrm.mobile"
         minSdk = 28
         targetSdk = 35
         ndk { abiFilters.add("arm64-v8a") }
-        versionCode = 55
-        versionName = "1.6.4"
-        testInstrumentationRunner = if (p2pQa) {
+        versionCode = 60
+        versionName = "1.6.9"
+        testInstrumentationRunner = if (p2pQa || fileTransferQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {
             "com.codexrm.mobile.MathRenderingInstrumentation"
         } else {
             "com.codexrm.mobile.ImageRenderingInstrumentation"
         }
+    }
+
+    signingConfigs.getByName("debug") {
+        storeFile = rootProject.projectDir.parentFile.resolve(".signature/debug.keystore")
     }
 
     buildTypes {
@@ -77,6 +82,7 @@ android {
             if (imageQa) applicationIdSuffix = ".imageqa"
             if (mathQa) applicationIdSuffix = ".mathqa"
             if (p2pQa) applicationIdSuffix = ".p2pqa"
+            if (fileTransferQa) applicationIdSuffix = ".filetransferqa"
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -90,6 +96,7 @@ android {
             if (imageQa) applicationIdSuffix = ".imageqa"
             if (mathQa) applicationIdSuffix = ".mathqa"
             if (p2pQa) applicationIdSuffix = ".p2pqa"
+            if (fileTransferQa) applicationIdSuffix = ".filetransferqa"
         }
     }
 

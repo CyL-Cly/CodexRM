@@ -205,8 +205,13 @@ internal class MiuixDialog private constructor(
                                             onClick = select,
                                             onLongClickLabel = longPress.first,
                                             onLongClick = {
-                                                dismiss()
-                                                longPress.second.onClick(this@MiuixDialog, index)
+                                                val view = host.window?.decorView
+                                                val action = Runnable {
+                                                    if (!host.isShowing) return@Runnable
+                                                    dismiss()
+                                                    longPress.second.onClick(this@MiuixDialog, index)
+                                                }
+                                                if (view == null) action.run() else view.post(action)
                                             },
                                         ),
                                     )

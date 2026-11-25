@@ -29,7 +29,7 @@ Default: bump Android version, run tests, build a signed Release APK,
   -BuildProxy HOST:P  Optional build proxy; also accepts BUILD_PROXY. Use direct to bypass it.
   -Help               Print this help without building or publishing.
 
-Signing uses the existing local debug certificate (-Pcodexrm.testSign),
+Signing uses .signature/debug.keystore in the project root (-Pcodexrm.testSign),
 matching the APKs currently distributed by this project.
 '@
     return

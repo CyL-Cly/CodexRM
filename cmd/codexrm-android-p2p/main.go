@@ -34,8 +34,10 @@ type mobileSession struct {
 	out, incoming chan []byte
 	link          atomic.Pointer[p2p.Link]
 	shareProgress atomic.Int32
-	desktopMu     sync.Mutex
-	desktop       *desktopClient
+	downloads     sync.Map   // read ID -> context.CancelFunc
+	probeMu       sync.Mutex // one button measurement at a time
+	probeSequence uint64
+	probe         atomic.Pointer[latencyProbe]
 }
 
 var registry = struct {
@@ -90,6 +92,7 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 		return
 	}
 	defer prepared.Close()
+	log.Printf("CodexRM P2P prepare state=%s candidates=%d", prepared.State(), len(offer.Candidates))
 	if !s.emit(attempt, offer) {
 		return
 	}
@@ -101,7 +104,7 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 	case remote = <-s.offer:
 	}
 	link, err := prepared.Connect(attempt, remote, s.ready, func() error {
-		if s.emit(attempt, protocol.P2P("ready", s.id)) {
+		if s.emit(attempt, protocol.P2P(protocol.P2PKindReady, s.id)) {
 			return nil
 		}
 		return attempt.Err()
@@ -117,17 +120,26 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 		default:
 			failure = "handshake"
 		}
-		log.Printf("CodexRM P2P negotiate: %v", err)
+		log.Printf("CodexRM P2P negotiate: %v state=%s", err, prepared.State())
+		return
+	}
+	if !p2p.DirectReady(prepared.State()) {
+		failure = "handshake"
+		log.Printf("CodexRM P2P negotiate: control stream not ready, state=%s", prepared.State())
 		return
 	}
 	defer link.Close()
 	path := link.Path()
-	log.Printf("CodexRM P2P: QUIC established (lan=%t ipv6=%t bound=%t channel=%s network=%s adapter=%s)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource(), path.Channel, path.Network, path.Adapter)
-	if link.IsLAN() && !s.emitBytes(attempt, []byte(`{"type":"native_direct_lan"}`)) {
-		return
+	log.Printf("CodexRM P2P: QUIC established state=%s lan=%t ipv6=%t bound=%t channel=%s network=%s adapter=%s", prepared.State(), link.IsLAN(), link.IsIPv6(), link.UsesBoundSource(), path.Channel, path.Network, path.Adapter)
+	if link.IsLAN() {
+		// The Android side checks the network that actually won the QUIC
+		// connection, which can differ from Android's default network.
+		if !s.emitBytes(attempt, []byte(`{"type":"native_direct_lan","network":`+strconv.Quote(path.Network)+`}`)) {
+			return
+		}
 	}
 	s.link.Store(link)
-	if !s.emit(attempt, protocol.P2P("activate", s.id)) {
+	if !s.emit(attempt, protocol.P2P(protocol.P2PKindActivate, s.id)) {
 		return
 	}
 	select {
@@ -154,7 +166,15 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 	}()
 	for {
 		b, err := link.Read()
+		if err == nil && s.consumeLatencyReply(b) {
+			continue
+		}
 		if err != nil || !s.emitBytes(s.ctx, b) {
+			if fb := link.Fallback(); fb.LastReason != "" {
+				failure = fb.LastReason
+				prepared.MarkRelay()
+				log.Printf("CodexRM P2P: fallback to RM relay reason=%s auto=%d manual=%d state=%s", fb.LastReason, fb.AutoRelaySwitches, fb.ManualRelaySwitches, prepared.State())
+			}
 			return
 		}
 	}
@@ -174,7 +194,7 @@ func CRMOpen(ptr unsafe.Pointer, n C.int) C.int64_t {
 			LAN     bool   `json:"lan"`
 		} `json:"localSources"`
 	}
-	if json.Unmarshal(C.GoBytes(ptr, n), &start) != nil || start.Kind != "start" || start.Version != protocol.P2PVersion || len(start.LocalPrefixes) > protocol.P2PMaxCandidates || len(start.LocalSources) > 12 {
+	if json.Unmarshal(C.GoBytes(ptr, n), &start) != nil || start.Kind != protocol.P2PKindStart || start.Version != protocol.P2PVersion || len(start.LocalPrefixes) > protocol.P2PMaxCandidates || len(start.LocalSources) > 12 {
 		return 0
 	}
 	var local []p2p.Source
@@ -238,17 +258,17 @@ func CRMSignal(h C.int64_t, ptr unsafe.Pointer, n C.int) {
 		return
 	}
 	switch sig.Kind {
-	case "offer":
+	case protocol.P2PKindOffer:
 		select {
 		case s.offer <- sig:
 		default:
 		}
-	case "ready":
+	case protocol.P2PKindReady:
 		select {
 		case s.ready <- struct{}{}:
 		default:
 		}
-	case "active":
+	case protocol.P2PKindActive:
 		select {
 		case s.active <- struct{}{}:
 		default:
@@ -262,7 +282,7 @@ func CRMSend(h C.int64_t, ptr unsafe.Pointer, n C.int) C.int {
 	if s == nil || s.ctx.Err() != nil || n <= 0 || n > protocol.MaxEnvelopeSize {
 		return 0
 	}
-	// JNI sends are serialized on Android's main thread.
+	// Fail fast instead of blocking Android's main thread on a congested link.
 	if len(s.out) >= cap(s.out) {
 		s.cancel()
 		return 0
@@ -271,6 +291,9 @@ func CRMSend(h C.int64_t, ptr unsafe.Pointer, n C.int) C.int {
 	case s.out <- C.GoBytes(ptr, n):
 		return 1
 	case <-s.ctx.Done():
+		return 0
+	default:
+		s.cancel()
 		return 0
 	}
 }

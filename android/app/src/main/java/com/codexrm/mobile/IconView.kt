@@ -40,6 +40,10 @@ internal class IconView(context: Context, private var icon: String, color: Int =
                 move(8,12); line(16,12)
                 move(12,8); line(12,16)
             }
+            "menu-minimal" -> { move(4,8); line(20,8); move(4,16); line(14,16) }
+            "transfer" -> { move(4,8); line(20,8); move(16,4); line(20,8); line(16,12); move(20,16); line(4,16); move(8,12); line(4,16); line(8,20) }
+            "chat" -> { move(4,15); line(3,20); line(8,19); quad(22,22,21,10); quad(20,3,12,3); quad(2,3,3,12); line(4,15) }
+            "paperclip" -> { move(8,9); line(8,16); quad(8,21,13,21); quad(18,21,18,16); line(18,6); quad(18,2,14,2); quad(10,2,10,6); line(10,15); quad(10,18,13,18); quad(15,18,15,15); line(15,7) }
             "search" -> { circle(11,11,7); move(16,16); line(21,21) }
             "plus" -> { move(12,5); line(12,19); move(5,12); line(19,12) }
             "minus" -> { move(5,12); line(19,12) }
@@ -111,6 +115,7 @@ internal class IconView(context: Context, private var icon: String, color: Int =
 
     private fun move(x: Number, y: Number) = path.moveTo(x.toFloat(), y.toFloat())
     private fun line(x: Number, y: Number) = path.lineTo(x.toFloat(), y.toFloat())
+    private fun quad(x1: Number, y1: Number, x2: Number, y2: Number) = path.quadTo(x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat())
     private fun cubic(x1: Number, y1: Number, x2: Number, y2: Number, x: Number, y: Number) = path.cubicTo(x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat(), x.toFloat(), y.toFloat())
     private fun close() = path.close()
     private fun circle(x: Number, y: Number, r: Number) {

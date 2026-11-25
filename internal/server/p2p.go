@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -16,6 +17,11 @@ import (
 	"github.com/google/uuid"
 )
 
+// directPair is one RM-side negotiation between a paired Agent and client.
+// The boolean flags are the signal phase: starting -> offering -> exchanging
+// -> ready -> activating -> active (see p2p.SignalPhaseFromFlags). One pair
+// has a single id (the session handle). An Agent may have up to
+// protocol.P2PMaxSessions concurrent pairs.
 type directPair struct {
 	id                                                                  string
 	agent                                                               *peer
@@ -23,6 +29,13 @@ type directPair struct {
 	agentTicket, clientTicket                                           string
 	lan, ipv6, clientInitiated                                          bool
 	agentOffer, clientOffer, agentReady, clientReady, requested, active bool
+}
+
+func (p *directPair) phase() p2p.SignalPhase {
+	if p == nil {
+		return p2p.SignalStarting
+	}
+	return p2p.SignalPhaseFromFlags(p.agentOffer, p.clientOffer, p.agentReady, p.clientReady, p.requested, p.active)
 }
 
 func publicVerifierIP(ip netip.Addr) bool {
@@ -129,7 +142,7 @@ func (s *Server) stopDirect(client *peer) {
 func (s *Server) stopDirectWithReason(client *peer, reason string) {
 	if pair := client.direct; pair != nil {
 		client.direct = nil
-		stop := protocol.P2P("stop", pair.id)
+		stop := protocol.P2P(protocol.P2PKindStop, pair.id)
 		stop.Reason = reason
 		s.sendDirect(pair.agent, client, stop)
 		s.sendDirect(client, client, stop)
@@ -163,14 +176,14 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 	if sig == nil || sig.Version != protocol.P2PVersion {
 		return
 	}
-	if sig.Kind == "diagnose" || sig.Kind == "diagnose_result" {
+	if sig.Kind == protocol.P2PKindDiagnose || sig.Kind == protocol.P2PKindDiagnoseResult {
 		s.handleNATDiagnostic(p, env)
 		return
 	}
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p.role == protocol.RoleAgent && sig.Kind == "hello" && s.agents[p.agentID] == p {
+	if p.role == protocol.RoleAgent && sig.Kind == protocol.P2PKindHello && s.agents[p.agentID] == p {
 		p.natDiagnosticCapable = sig.NATDiagnostic
 	}
 	if (len(s.stun) == 0 && !s.cfg.P2PLAN) || !directAlive(p, now) {
@@ -181,7 +194,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 		if s.agents[p.agentID] != p {
 			return
 		}
-		if sig.Kind == "hello" {
+		if sig.Kind == protocol.P2PKindHello {
 			if p.directCapable {
 				return
 			}
@@ -190,14 +203,14 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			p.clientInitiatedCapable = sig.ClientInitiated
 			p.ipv6Capable = sig.IPv6
 			p.lanCapable = sig.LAN
-			routing := protocol.P2P("routing", "")
+			routing := protocol.P2P(protocol.P2PKindRouting, "")
 			for id := range s.byAgent[p.agentID] {
 				routing.Clients = append(routing.Clients, id)
 			}
 			s.send(p, protocol.Envelope{Type: protocol.TypeP2P, P2P: routing})
 			for _, c := range s.byAgent[p.agentID] {
 				if directAlive(c, now) && s.directAvailable(p, c) {
-					s.sendDirect(c, c, protocol.P2P("available", ""))
+					s.sendDirect(c, c, protocol.P2P(protocol.P2PKindAvailable, ""))
 				}
 			}
 			return
@@ -216,7 +229,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 		s.stopDirect(client)
 	}
 	pair := client.direct
-	if sig.Kind == "begin" && p == client {
+	if sig.Kind == protocol.P2PKindBegin && p == client {
 		lan := sig.LAN && s.lanEligible(agent, client)
 		ipv6 := agent.ipv6Capable && sig.IPv6 && len(s.stun) > 0
 		stun := stunForPair(s.stun, ipv6)
@@ -237,7 +250,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			}
 		}
 		if count >= protocol.P2PMaxSessions {
-			s.sendDirect(client, client, protocol.P2P("busy", ""))
+			s.sendDirect(client, client, protocol.P2P(protocol.P2PKindBusy, ""))
 			return
 		}
 		var key [32]byte
@@ -245,7 +258,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			return
 		}
 		pair = &directPair{id: uuid.NewString(), agent: agent, deadline: now.Add(protocol.P2PAttempt), lan: lan, ipv6: ipv6}
-		start := protocol.P2P("start", pair.id)
+		start := protocol.P2P(protocol.P2PKindStart, pair.id)
 		start.Secret, start.STUN = hex.EncodeToString(key[:]), stun
 		start.LAN, start.IPv6, start.MultiPath = lan, ipv6, lan || len(stun) > 0
 		pair.clientInitiated = agent.clientInitiatedCapable && sig.ClientInitiated
@@ -267,6 +280,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 		client.direct = pair
 		clientStart := *start
 		clientStart.Ticket = pair.clientTicket
+		log.Printf("p2p begin id=%s phase=%s forceRelay=%t disableFullPunch=%t", pair.id, pair.phase(), start.ForceRelay, start.DisableFullPunch)
 		s.sendDirect(agent, client, start)
 		s.sendDirect(client, client, &clientStart)
 		return
@@ -278,16 +292,17 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 	if p == agent {
 		other = client
 	}
+	prevPhase := pair.phase()
 	forward := protocol.P2P(sig.Kind, pair.id)
 	switch sig.Kind {
-	case "stop":
+	case protocol.P2PKindStop:
 		if p == agent && !pair.active && pair.agentOffer && pair.clientOffer && sig.Reason == protocol.P2PReasonDualUnpredictableNAT {
 			s.stopDirectWithReason(client, sig.Reason)
 		} else {
 			s.stopDirect(client)
 		}
 		return
-	case "offer":
+	case protocol.P2PKindOffer:
 		if (p == agent && pair.agentOffer) || (p == client && pair.clientOffer) {
 			return
 		}
@@ -358,7 +373,7 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 		} else {
 			pair.clientOffer = true
 		}
-	case "ready":
+	case protocol.P2PKindReady:
 		if !pair.agentOffer || !pair.clientOffer {
 			return
 		}
@@ -373,29 +388,32 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			}
 			pair.clientReady = true
 		}
-	case "activate":
+	case protocol.P2PKindActivate:
 		if p != client || !pair.agentReady || !pair.clientReady || pair.requested {
 			return
 		}
 		pair.requested = true
-	case "active":
+	case protocol.P2PKindActive:
 		if p != agent || !pair.requested || pair.active {
 			return
 		}
 		pair.active = true
 		pair.deadline = now.Add(protocol.P2PLease)
-		s.sendDirect(agent, client, protocol.P2P("lease", pair.id))
-	case "renew":
+		s.sendDirect(agent, client, protocol.P2P(protocol.P2PKindLease, pair.id))
+	case protocol.P2PKindRenew:
 		if p != client || !pair.active {
 			return
 		}
 		pair.deadline = now.Add(protocol.P2PLease)
-		lease := protocol.P2P("lease", pair.id)
+		lease := protocol.P2P(protocol.P2PKindLease, pair.id)
 		s.sendDirect(agent, client, lease)
 		s.sendDirect(client, client, lease)
 		return
 	default:
 		return
+	}
+	if next := pair.phase(); next != prevPhase {
+		log.Printf("p2p %s id=%s phase %s -> %s", sig.Kind, pair.id, prevPhase, next)
 	}
 	s.sendDirect(other, client, forward)
 }

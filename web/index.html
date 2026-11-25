@@ -13,15 +13,15 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="CodexRM" />
     <title>CodexRM · 远程工作区</title>
-    <link rel="icon" href="/icons/icon.svg?v=20261124-1" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261124-1" />
-    <link rel="manifest" href="/manifest.webmanifest?v=20261124-1" />
-    <link rel="modulepreload" href="/app.js?v=20261124-1" />
-    <script src="/theme.js?v=20261124-1"></script>
-    <link rel="stylesheet" href="/dsh-theme.css?v=20261124-1" />
-    <link rel="stylesheet" href="/styles.css?v=20261124-1" />
-    <script src="/pwa.js?v=20261124-1" defer></script>
-    <script src="/app.js?v=20261124-1" type="module"></script>
+    <link rel="icon" href="/icons/icon.svg?v=20261124-2" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261124-2" />
+    <link rel="manifest" href="/manifest.webmanifest?v=20261124-2" />
+    <link rel="modulepreload" href="/app.js?v=20261124-2" />
+    <script src="/theme.js?v=20261124-2"></script>
+    <link rel="stylesheet" href="/dsh-theme.css?v=20261124-2" />
+    <link rel="stylesheet" href="/styles.css?v=20261124-2" />
+    <script src="/pwa.js?v=20261124-2" defer></script>
+    <script src="/app.js?v=20261124-2" type="module"></script>
   </head>
   <body>
     <div id="app">
@@ -247,7 +247,7 @@
                 <div class="composer-options">
                   <button id="model-trigger" class="model-trigger" type="button" aria-label="选择供应商与模型" aria-haspopup="dialog" aria-controls="model-menu" aria-expanded="false" disabled><span data-icon="spark"></span><span id="model-label">选择模型</span><span id="model-effort-label"></span><span data-icon="chevron"></span></button>
                   <select id="model" aria-label="供应商与模型" title="选择供应商与模型" hidden>
-                    <option value="">默认模型</option></select
+                    <option value="">当前 Codex 配置</option></select
                   ><select id="effort" aria-label="思考强度" hidden>
                     <option value="">默认思考</option>
                   </select>
@@ -401,12 +401,6 @@
         <p class="field-help" id="update-agent-help" hidden>
           更新包将在电脑端校验；进行中的任务和排队消息结束后自动安装并重启 Agent。
         </p>
-        <button class="danger-button" id="close-codex-desktop" type="button" hidden>
-          关闭 Codex 桌面客户端
-        </button>
-        <p class="field-help" id="close-codex-desktop-help" hidden>
-          解决桌面端与 RM 的冲突。仅关闭桌面进程，不停止 RM 连接器；未保存的桌面操作可能丢失。
-        </p>
         <button class="primary-button" type="submit">保存设置</button
         ><button class="danger-button" id="disconnect" type="button" hidden>
           解除当前设备配对
@@ -436,7 +430,7 @@
           autocomplete="off"
           placeholder="输入设备上的绝对目录路径"
           required
-        /><button class="secondary-button" type="submit">前往</button>
+        /><button id="browse-directory" class="secondary-button" type="submit">前往</button>
       </form>
       <div id="directory-shortcuts" class="directory-shortcuts"></div>
       <div id="directory-error" class="form-error" role="alert"></div>
@@ -447,7 +441,7 @@
         aria-label="设备文件夹"
       ></div>
       <div class="directory-footer">
-        <label
+        <label id="directory-hidden-row"
           ><input id="directory-hidden" type="checkbox" />显示隐藏目录</label
         ><button
           id="select-directory"

@@ -42,10 +42,6 @@ class ImageRenderingInstrumentation : Instrumentation() {
             ClaudeUxCheck.run(this)
             return
         }
-        if (args.getString("desktopCloseSend") == "true") {
-            DesktopCloseSendCheck.run(this)
-            return
-        }
         if (args.getString("snapshotCheck") == "true") {
             SnapshotRenderingCheck.run(this)
             return
@@ -60,8 +56,9 @@ class ImageRenderingInstrumentation : Instrumentation() {
         }
         val settingsOnly = args.getString("settingsUi") == "true"
         val workspaceOnly = args.getString("workspacePicker") == "true"
-        if (settingsOnly || workspaceOnly || args.getString("uiReview") == "true") {
-            UiReviewCheck.run(this, settingsOnly, workspaceOnly)
+        val composerOnly = args.getString("composerCheck") == "true"
+        if (settingsOnly || workspaceOnly || composerOnly || args.getString("uiReview") == "true") {
+            UiReviewCheck.run(this, settingsOnly, workspaceOnly, composerOnly)
             return
         }
         var activity: Activity? = null

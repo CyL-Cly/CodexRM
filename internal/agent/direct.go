@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/codexrm/codexrm/internal/appserver"
+	"github.com/codexrm/codexrm/internal/desktop"
 	"github.com/codexrm/codexrm/internal/p2p"
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/gorilla/websocket"
@@ -31,6 +32,7 @@ type directSession struct {
 	ready, activate chan struct{}
 	out             chan []byte
 	files           directFiles
+	phoneFiles      directFiles
 	// Protected by Agent.eventMu, which also serializes publications with switching.
 	active bool
 	lease  time.Time
@@ -138,7 +140,7 @@ func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *w
 	if sig == nil || sig.Version != protocol.P2PVersion {
 		return
 	}
-	if sig.Kind == "diagnose_start" {
+	if sig.Kind == protocol.P2PKindDiagnoseStart {
 		if env.ClientID == "" || len(sig.ID) != 36 || len(sig.STUN) == 0 || len(sig.STUN) > 4 {
 			return
 		}
@@ -150,7 +152,7 @@ func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *w
 				if ctx.Err() != nil {
 					return
 				}
-				result := protocol.P2P("diagnose_result", sig.ID)
+				result := protocol.P2P(protocol.P2PKindDiagnoseResult, sig.ID)
 				result.NATResult = &report
 				_ = a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, ClientID: env.ClientID, P2P: result})
 			}()
@@ -163,18 +165,18 @@ func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *w
 	a.eventMu.Lock()
 	defer a.eventMu.Unlock()
 	switch sig.Kind {
-	case "routing":
+	case protocol.P2PKindRouting:
 		a.eventClients = make(map[string]bool, len(sig.Clients))
 		for _, id := range sig.Clients {
 			a.eventClients[id] = true
 		}
 		return
-	case "join":
+	case protocol.P2PKindJoin:
 		if a.eventClients != nil {
 			a.eventClients[env.ClientID] = true
 		}
 		return
-	case "leave":
+	case protocol.P2PKindLeave:
 		delete(a.eventClients, env.ClientID)
 		return
 	}
@@ -182,13 +184,13 @@ func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *w
 		return
 	}
 	d := a.direct[env.ClientID]
-	if sig.Kind == "start" {
+	if sig.Kind == protocol.P2PKindStart {
 		if d != nil {
 			d.cancel()
 			delete(a.direct, env.ClientID)
 		}
 		if len(a.direct) >= protocol.P2PMaxSessions {
-			_ = a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, ClientID: env.ClientID, P2P: protocol.P2P("stop", sig.ID)})
+			_ = a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, ClientID: env.ClientID, P2P: protocol.P2P(protocol.P2PKindStop, sig.ID)})
 			return
 		}
 		life, cancel := context.WithCancel(ctx)
@@ -204,26 +206,26 @@ func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *w
 		return
 	}
 	switch sig.Kind {
-	case "offer":
+	case protocol.P2PKindOffer:
 		select {
 		case d.offer <- *sig:
 		default:
 		}
-	case "ready":
+	case protocol.P2PKindReady:
 		select {
 		case d.ready <- struct{}{}:
 		default:
 		}
-	case "activate":
+	case protocol.P2PKindActivate:
 		select {
 		case d.activate <- struct{}{}:
 		default:
 		}
-	case "lease":
+	case protocol.P2PKindLease:
 		if d.active && time.Now().Before(d.lease) {
 			d.lease = time.Now().Add(protocol.P2PLease)
 		}
-	case "stop":
+	case protocol.P2PKindStop:
 		delete(a.direct, d.client)
 		d.cancel()
 	}
@@ -233,10 +235,11 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	signal := func(sig *protocol.P2PSignal) error {
 		return a.write(conn, protocol.Envelope{Type: protocol.TypeP2P, ClientID: d.client, P2P: sig})
 	}
-	stop := protocol.P2P("stop", d.id)
+	stop := protocol.P2P(protocol.P2PKindStop, d.id)
 	defer func() {
 		d.cancel()
 		d.files.close()
+		a.closePhoneReader(d)
 		a.clearDirectShares(d)
 		a.eventMu.Lock()
 		defer a.eventMu.Unlock()
@@ -257,6 +260,7 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 		return
 	}
 	defer prepared.Close()
+	log.Printf("p2p prepare state=%s candidates=%d", prepared.State(), len(offer.Candidates))
 	if signal(offer) != nil {
 		return
 	}
@@ -266,12 +270,16 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 		return
 	case remote = <-d.offer:
 	}
-	link, err := prepared.Connect(attempt, remote, d.ready, func() error { return signal(protocol.P2P("ready", d.id)) })
+	link, err := prepared.Connect(attempt, remote, d.ready, func() error { return signal(protocol.P2P(protocol.P2PKindReady, d.id)) })
 	if err != nil {
 		if errors.Is(err, p2p.ErrDualUnpredictableNAT) {
 			stop.Reason = protocol.P2PReasonDualUnpredictableNAT
 		}
-		log.Printf("p2p negotiate: %v", err)
+		log.Printf("p2p negotiate: %v state=%s", err, prepared.State())
+		return
+	}
+	if !p2p.DirectReady(prepared.State()) {
+		log.Printf("p2p negotiate: control stream not ready, state=%s", prepared.State())
 		return
 	}
 	defer link.Close()
@@ -281,15 +289,17 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	case <-d.activate:
 	}
 	a.eventMu.Lock()
-	if a.direct[d.client] != d || attempt.Err() != nil || signal(protocol.P2P("active", d.id)) != nil {
+	if a.direct[d.client] != d || attempt.Err() != nil || signal(protocol.P2P(protocol.P2PKindActive, d.id)) != nil {
 		a.eventMu.Unlock()
 		return
 	}
 	d.active, d.lease = true, time.Now().Add(protocol.P2PLease)
 	a.eventMu.Unlock()
 	cancel()
+	stopTracking := desktop.TrackDirectPeer(d.ctx, a.cfg.DataDir, d.client)
+	defer stopTracking()
 	path := link.Path()
-	log.Printf("p2p direct active (lan=%t ipv6=%t bound=%t channel=%s network=%s adapter=%s)", link.IsLAN(), link.IsIPv6(), link.UsesBoundSource(), path.Channel, path.Network, path.Adapter)
+	log.Printf("p2p direct active state=%s lan=%t ipv6=%t bound=%t channel=%s network=%s adapter=%s", prepared.State(), link.IsLAN(), link.IsIPv6(), link.UsesBoundSource(), path.Channel, path.Network, path.Adapter)
 	go link.WatchQuality(d.ctx)
 	go a.serveDirectShares(d, link)
 	go func() {
@@ -321,6 +331,10 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	for {
 		b, err := link.Read()
 		if err != nil {
+			if fb := link.Fallback(); fb.LastReason != "" {
+				prepared.MarkRelay()
+				log.Printf("p2p direct: fallback to RM relay reason=%s auto=%d manual=%d state=%s", fb.LastReason, fb.AutoRelaySwitches, fb.ManualRelaySwitches, prepared.State())
+			}
 			return
 		}
 		var env protocol.Envelope

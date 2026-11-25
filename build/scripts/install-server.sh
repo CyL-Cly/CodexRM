@@ -16,6 +16,7 @@ elif [[ $# == 3 ]]; then
     binary=$1
     unit=$2
     web=$3
+    package_dir=$(dirname -- "$binary")
 elif [[ $# == 1 && ( "$1" == --help || "$1" == -h ) ]]; then
     usage
     exit 0
@@ -31,6 +32,17 @@ for file in "$binary" "$unit" "$web/index.html"; do
         exit 1
     fi
 done
+updater="$package_dir/codexrm-server-updater"
+update_enabled=false
+if [[ -f "$updater" ]]; then
+    for file in "$package_dir/deploy/"codexrm-server-update.{service,timer,env.example}; do
+        if [[ ! -f "$file" ]]; then
+            printf 'Required updater file missing: %s\n' "$file" >&2
+            exit 1
+        fi
+    done
+    update_enabled=true
+fi
 if [[ $(id -u) != 0 ]]; then
     printf 'Run this installer with sudo.\n' >&2
     exit 1
@@ -44,6 +56,12 @@ exec 9>"$root/.install.lock"
 flock -n 9 || { printf 'Another CodexRM installation is in progress.\n' >&2; exit 1; }
 install -d -o codexrm -g codexrm -m 0700 "$root/data"
 install -d -o codexrm -g codexrm -m 0700 "$root/data/updates"
+# Do not put a root updater's trust source in the relay account's writable data directory.
+if [[ -L "$root/server-updates" ]]; then
+    printf 'The Server manifest directory must not be a symlink.\n' >&2
+    exit 1
+fi
+install -d -o root -g root -m 0755 "$root/server-updates"
 if [ ! -f "$root/server.env" ]; then
     umask 077
     key=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
@@ -117,6 +135,9 @@ trap 'exit 143' TERM
 install -m 0755 "$binary" "$stage/binary.next"
 cp -a -- "$web" "$stage/web.next"
 chmod -R u=rwX,go=rX "$stage/web.next"
+if [[ -L "$web_target/release-history.json" && ! -e "$stage/web.next/release-history.json" && ! -L "$stage/web.next/release-history.json" ]]; then
+    cp -P -- "$web_target/release-history.json" "$stage/web.next/release-history.json"
+fi
 unit_next=$(mktemp "${unit_target}.XXXXXXXX")
 install -m 0644 "$unit" "$unit_next"
 if [[ -e "$binary_target" || -L "$binary_target" ]]; then cp -a -- "$binary_target" "$stage/binary.previous"; fi
@@ -132,20 +153,51 @@ mv -fT -- "$unit_next" "$unit_target"
 systemctl daemon-reload
 restart_attempted=true
 systemctl restart "$service"
+ready=false
 for attempt in {1..20}; do
     if health_response=$(curl -fsS --connect-timeout 2 --max-time 5 -w $'\n%{http_code}' http://127.0.0.1:18080/api/v1/health); then
         health_status=${health_response##*$'\n'}
         health_body=${health_response%$'\n'*}
-        if [[ "$health_status" == 2?? ]] && printf '%s' "$health_body" | grep -Eq '^[[:space:]]*\{[[:space:]]*"ok"[[:space:]]*:[[:space:]]*true[[:space:]]*,[[:space:]]*"service"[[:space:]]*:[[:space:]]*"codexrm"([[:space:]]*,[[:space:]]*"version"[[:space:]]*:[[:space:]]*"[^"]*")?[[:space:]]*\}[[:space:]]*$'; then
+        if [[ "$health_status" == 2?? ]] && printf '%s' "$health_body" | grep -Eq '^[[:space:]]*\{[[:space:]]*"ok"[[:space:]]*:[[:space:]]*true[[:space:]]*,[[:space:]]*"service"[[:space:]]*:[[:space:]]*"codexrm"([[:space:]]*,[[:space:]]*"version"[[:space:]]*:[[:space:]]*"[^"]*")?(,[[:space:]]*"serverVersionCode"[[:space:]]*:[[:space:]]*[0-9]+,[[:space:]]*"serverVersionName"[[:space:]]*:[[:space:]]*"[0-9A-Za-z.+-]+")?[[:space:]]*\}[[:space:]]*$'; then
             if ! $was_enabled; then
                 enable_attempted=true
                 systemctl enable "$service"
             fi
             printf '\nCodexRM ready on 127.0.0.1:18080\n'
-            exit 0
+            ready=true
+            break
         fi
     fi
     sleep 0.25
 done
-systemctl --no-pager --full status "$service" || true
-exit 1
+if ! $ready; then
+    systemctl --no-pager --full status "$service" || true
+    exit 1
+fi
+
+# Commit the working relay before installing the independent root-owned scheduler.
+trap - EXIT INT TERM
+rm -rf -- "$stage"
+if $update_enabled; then
+    updater_unit_dir=$(dirname -- "$unit_target")
+    config_dir=/etc/codexrm
+    updater_timer=codexrm-server-update.timer
+    has_timer=false
+    if [[ -f "$updater_unit_dir/$updater_timer" ]]; then has_timer=true; fi
+    do_updater_install() {
+        install -m 0755 "$updater" "$root/bin/.codexrm-server-updater.next" &&
+            mv -fT -- "$root/bin/.codexrm-server-updater.next" "$root/bin/codexrm-server-updater" &&
+            install -d -m 0755 "$config_dir" &&
+            { [[ -e "$config_dir/server-update.env" ]] ||
+              install -m 0644 "$package_dir/deploy/codexrm-server-update.env.example" "$config_dir/server-update.env"; } &&
+            install -m 0644 "$package_dir/deploy/codexrm-server-update.service" "$updater_unit_dir/codexrm-server-update.service" &&
+            install -m 0644 "$package_dir/deploy/$updater_timer" "$updater_unit_dir/$updater_timer" &&
+            systemctl daemon-reload &&
+            { $has_timer || systemctl enable --now "$updater_timer"; }
+    }
+    if ! do_updater_install; then
+        printf 'Relay is installed, but the Server update scheduler setup failed.\n' >&2
+        exit 1
+    fi
+    printf 'Server update scheduler installed; configure %s/server-update.env\n' "$config_dir"
+fi

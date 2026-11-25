@@ -13,13 +13,7 @@ foreach ($command in @('ssh', 'scp', 'tar')) {
 }
 if (-not $WebDir) { $WebDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'web' }
 $WebDir = [IO.Path]::GetFullPath($WebDir)
-$files = @('index.html', 'app.js', 'styles.css', 'dsh-theme.css', 'dsh-LICENSE.txt', 'pwa.js', 'sw.js', 'theme.js', 'manifest.webmanifest')
-foreach ($file in @($files + @('icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png'))) {
-    if (-not (Test-Path -LiteralPath (Join-Path $WebDir $file) -PathType Leaf)) { throw "Frontend asset missing: $file" }
-}
-$files += @(Get-ChildItem -LiteralPath (Join-Path $WebDir 'icons') -Recurse -File | ForEach-Object {
-    $_.FullName.Substring($WebDir.TrimEnd('\', '/').Length + 1).Replace('\', '/')
-})
+$files = @(& (Join-Path $PSScriptRoot 'get-server-web-files.ps1') -WebDir $WebDir)
 if ($ValidateOnly) { return }
 
 $id = [Guid]::NewGuid().ToString('N')
@@ -53,6 +47,8 @@ tar --extract --gzip --file "$archive" --directory "$stage" --no-same-owner
 test -f "$stage/index.html"
 test -f "$stage/app.js"
 test -f "$stage/sw.js"
+exec 9>"$root/.install.lock"
+flock -x -w 20 9
 if test -L "$target/release-history.json"; then
     cp -P -- "$target/release-history.json" "$stage/release-history.json"
 fi

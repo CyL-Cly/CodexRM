@@ -19,13 +19,14 @@ const (
 
 // Connection retains the field names used by older installations.
 type Connection struct {
-	Server            string `json:"server"`
-	EnrollmentKey     string `json:"enrollmentKey,omitempty"`
-	Workspace         string `json:"workspace,omitempty"`
-	CodexPath         string `json:"codexPath,omitempty"`
-	AutoUpdate        bool   `json:"autoUpdate"`
-	UpdateServer      string `json:"updateServer"`
-	UpdateManifestURL string `json:"updateManifestUrl,omitempty"`
+	AllowFileManagement bool   `json:"allowFileManagement,omitempty"`
+	Server              string `json:"server"`
+	EnrollmentKey       string `json:"enrollmentKey,omitempty"`
+	Workspace           string `json:"workspace,omitempty"`
+	CodexPath           string `json:"codexPath,omitempty"`
+	AutoUpdate          bool   `json:"autoUpdate"`
+	UpdateServer        string `json:"updateServer"`
+	UpdateManifestURL   string `json:"updateManifestUrl,omitempty"`
 }
 
 func Load(path string) (Connection, error) {

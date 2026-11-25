@@ -11,13 +11,20 @@ $state = @{calls=(New-Object Collections.Generic.List[string]);mode='success';ex
 function ssh {
     $command = [string]$args[-1]
     if ($command.Contains('mv -f')) {
-        $destination = "'$($rmConfig.updateDir)/$($state.expectedName)'"
+        $directory = if ($state.expectedName -eq 'server-update.json') { '/opt/codexrm/server-updates' } else { $rmConfig.updateDir }
+        $destination = "'$directory/$($state.expectedName)'"
+        if ($state.expectedName -eq 'server-update.json' -and (-not $command.Contains('chown root:root') -or -not $command.Contains('chmod 0644'))) {
+            throw 'Server manifest was not activated with administrator-only write permissions.'
+        }
         if (-not $command.EndsWith($destination)) { throw 'Publication activated the wrong filename.' }
         $state.calls.Add('activate')
     } elseif ($command.StartsWith('python3 ')) {
         if (-not $state.seed -and -not $command.Contains("'$($state.expectedName)' '3'")) { throw 'History writer used the wrong manifest or version.' }
         $state.calls.Add('record')
     } else {
+        if ($state.expectedName -eq 'server-update.json' -and -not $command.Contains("install -d -o root -g root -m 0755 '/opt/codexrm/server-updates'")) {
+            throw 'Server manifest directory is not separated from relay state and client manifests.'
+        }
         $state.calls.Add('prepare')
     }
     $global:LASTEXITCODE = 0
@@ -50,6 +57,21 @@ try {
     & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'linux-update.json' -RM $rmConfig
     if (($state.calls -join ',') -cne 'prepare,upload,activate,verify,stage history writer,record') { throw 'Linux Agent manifest was not published independently.' }
     Write-Host 'PASS: Linux Agent manifest uses its own remote filename and public endpoint.'
+    $state.calls.Clear()
+    $state.expectedName = 'server-update.json'
+    $state.expectedUri = 'https://rm.example/base/server-update.json'
+    & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'server-update.json' -RM $rmConfig
+    if (($state.calls -join ',') -cne 'prepare,upload,activate,verify') { throw 'Server manifest was not published independently.' }
+    Write-Host 'PASS: Server manifest uses a root-owned directory and does not modify client history.'
+    $state.calls.Clear()
+    $fixture.downloadUrl = 'http://cloud.example/server.zip'
+    $fixture | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8
+    $rejected = $false
+    try { & (Join-Path $PSScriptRoot 'publish-manifest.ps1') -Manifest $manifest -Name 'server-update.json' -RM $rmConfig } catch { $rejected = $true }
+    if (-not $rejected -or $state.calls.Count) { throw 'An HTTP Server package URL reached the publisher.' }
+    $fixture.downloadUrl = 'https://cloud.example/client.zip'
+    $fixture | ConvertTo-Json | Set-Content -LiteralPath $manifest -Encoding UTF8
+    Write-Host 'PASS: Server manifest publication rejects insecure download URLs.'
     $state.expectedName = 'update.json'
     $state.expectedUri = 'https://rm.example/base/update.json'
     $state.calls.Clear()

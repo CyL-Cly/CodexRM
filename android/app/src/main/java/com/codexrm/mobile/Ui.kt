@@ -159,6 +159,22 @@ internal object Ui {
         setPadding(dp(context, 12), dp(context, 10), dp(context, 12), dp(context, 10))
     }
 
+    const val CHAT_GUTTER = 14
+    const val CHAT_LIST_GUTTER = 4
+    const val CHAT_CARD_HORIZONTAL_PADDING = 12
+    const val CHAT_CARD_VERTICAL_PADDING = 10
+
+    fun padChatCard(view: View) = with(view) {
+        val horizontal = dp(context, CHAT_CARD_HORIZONTAL_PADDING)
+        val vertical = dp(context, CHAT_CARD_VERTICAL_PADDING)
+        setPadding(horizontal, vertical, horizontal, vertical)
+    }
+
+    fun chatCardBackground(context: Context, opacity: Int = 100, error: Boolean = false): GradientDrawable = rounded(
+        appearanceOpacity(SURFACE, opacity), dp(context, 12).toFloat(),
+        appearanceOpacity(if (error) DANGER else BORDER, opacity),
+    )
+
     fun rounded(color: Int, radius: Float, stroke: Int = Color.TRANSPARENT): GradientDrawable = GradientDrawable().apply {
         setColor(color); cornerRadius = radius
         if (stroke != Color.TRANSPARENT) setStroke(1, stroke)

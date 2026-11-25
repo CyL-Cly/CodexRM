@@ -90,6 +90,7 @@
       byId("overview-wx").hidden = data.wxSupported !== true;
       byId("nav-onebot").hidden = data.oneBotSupported !== true;
       byId("overview-onebot").hidden = data.oneBotSupported !== true;
+      byId("nav-phone-transfers").hidden = data.phoneTransfersSupported !== true;
       byId("nav-updates").hidden = !["windows-agent", "linux-agent", "linux-manual"].includes(data.updateMode);
       nav.hidden = menu.hidden = false;
       document.body.classList.add("has-settings");

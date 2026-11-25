@@ -52,7 +52,7 @@ internal object InteractionCopy {
         )
     }
 
-    fun sendBlockReason(state: SendUiState): String? = when {
+    fun sendBlockReason(state: SendUiState, steer: Boolean = false): String? = when {
         state.readOnly -> "此会话为只读，请新建会话后继续。"
         state.sending -> "正在等待设备确认发送，请稍候。"
         state.loading -> "正在打开或同步会话，请稍候。"
@@ -60,8 +60,8 @@ internal object InteractionCopy {
         !state.online -> "设备离线，重新连接后可发送。"
         !state.loaded -> "正在同步设备信息，请稍候。"
         state.editingQueuedMessage -> "正在恢复待发送消息，请稍候。"
-        state.running && !state.messageQueue -> "当前版本不支持运行中排队，请停止任务后发送。"
         state.hasAttachments && !state.attachmentsSupported -> "当前电脑 Agent 不支持附件，请更新后重试。"
+        state.running && !steer && !state.messageQueue -> "当前 Agent 不支持排队。可立即发送，或停止任务后发送。"
         !state.hasPayload -> "输入消息或添加附件后即可发送。"
         else -> null
     }
@@ -79,6 +79,12 @@ internal object InteractionCopy {
         message?.contains("未知的供应商设置操作") == true ->
             "电脑 Agent 版本过旧，不支持批量保存模型改动。请先在“工作区设置”中检查并更新电脑 Agent，再重试。改动已保留。"
         else -> message ?: "保存模型改动失败"
+    }
+
+    fun composerModelLabel(displayName: String?): String {
+        val name = displayName.orEmpty().trim()
+        val shortName = if (name.startsWith("gpt-", ignoreCase = true)) name.drop(4) else name
+        return shortName.ifBlank { "选择模型" }
     }
 
     // 请勿翻译模型和思考强度名

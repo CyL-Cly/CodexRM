@@ -4,11 +4,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"github.com/codexrm/codexrm/internal/p2p"
-	"github.com/codexrm/codexrm/internal/protocol"
-	"github.com/codexrm/codexrm/internal/store"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	"io"
 	"log"
 	"net"
@@ -21,10 +16,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/codexrm/codexrm/internal/p2p"
+	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/codexrm/codexrm/internal/release"
+	"github.com/codexrm/codexrm/internal/store"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 type Config struct {
 	Addr, DataDir, WebDir, AdminToken, UpdateDir          string
+	ServerUpdateDir                                       string
 	PublicEnrollment                                      bool
 	P2PSTUN, P2PNATSTUN, P2PVerifyListen, P2PVerifyPublic string
 	P2PVerifyMore, P2PVerifyKeyFile                       string
@@ -189,9 +192,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /update.json", s.updateManifest)
 	mux.HandleFunc("GET /android-update.json", s.androidUpdateManifest)
 	mux.HandleFunc("GET /linux-update.json", s.linuxUpdateManifest)
+	mux.HandleFunc("GET /"+release.ServerManifestName, s.serverUpdateManifest)
 	mux.HandleFunc("GET /updates/{file}", s.updatePackage)
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true, "service": "codexrm", "version": protocol.Version})
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, release.ServerHealth{
+			OK: true, Service: "codexrm", ProtocolVersion: protocol.Version,
+			VersionCode: release.ServerVersionCode, VersionName: release.ServerVersionName,
+		})
 	})
 	mux.HandleFunc("POST /api/v1/agent/enroll", enroll)
 	mux.HandleFunc("POST /api/v1/agent/pair", pair)
@@ -586,9 +594,9 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.R
 		s.byAgent[agentID][clientID] = p
 		if p.deviceType != protocol.DeviceTypeRobot {
 			if a := s.agents[agentID]; a != nil && a.directCapable {
-				s.sendDirect(a, p, protocol.P2P("join", ""))
+				s.sendDirect(a, p, protocol.P2P(protocol.P2PKindJoin, ""))
 				if s.directAvailable(a, p) {
-					s.sendDirect(p, p, protocol.P2P("available", ""))
+					s.sendDirect(p, p, protocol.P2P(protocol.P2PKindAvailable, ""))
 				}
 			}
 		}
@@ -681,7 +689,7 @@ func (s *Server) readPump(p *peer) {
 			if s.clients[p.clientID] == p {
 				s.stopDirect(p)
 				if a := s.agents[p.agentID]; a != nil && a.directCapable {
-					s.sendDirect(a, p, protocol.P2P("leave", ""))
+					s.sendDirect(a, p, protocol.P2P(protocol.P2PKindLeave, ""))
 				}
 				delete(s.clients, p.clientID)
 				delete(s.byAgent[p.agentID], p.clientID)

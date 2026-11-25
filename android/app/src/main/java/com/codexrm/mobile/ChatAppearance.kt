@@ -25,7 +25,12 @@ import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 internal enum class AppearanceArea(val key: String, val title: String, val defaultMask: Int) {
     CHAT("chat", "聊天背景", 78), SIDEBAR("sidebar", "侧边栏图片", 85), SETTINGS("settings", "设置背景", 86);
 
-    fun baseColor(): Int = if (this == SIDEBAR) Ui.SIDEBAR else Ui.BACKGROUND
+    fun baseColor(): Int = when {
+        this == CHAT && Ui.dark -> android.graphics.Color.BLACK
+        this == SIDEBAR && Ui.dark -> 0xff212121.toInt()
+        this == SIDEBAR -> Ui.SIDEBAR
+        else -> Ui.BACKGROUND
+    }
 }
 
 internal enum class BackgroundSource(val title: String) {

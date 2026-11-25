@@ -62,6 +62,9 @@ func directoryPath(path string) (string, error) {
 func (a *Agent) workspaceRPC(method string, params map[string]any) (any, error) {
 	path, _ := params["path"].(string)
 	if method == "codexrm/fs/list" {
+		if !a.allowsFileManagement() {
+			return nil, errFileManagementDisabled
+		}
 		if path == "" {
 			path = a.cfg.Cwd
 		}

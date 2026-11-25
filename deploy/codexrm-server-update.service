@@ -1,0 +1,16 @@
+[Unit]
+Description=Check and install CodexRM Server releases on the configured cron schedule
+ConditionPathExists=/opt/codexrm/bin/codexrm-server-updater
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/codexrm/server-update.env
+ExecStart=/opt/codexrm/bin/codexrm-server-updater
+TimeoutStartSec=20min
+TimeoutStopSec=130s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/codexrm
+ReadOnlyPaths=-/opt/codexrm/data -/opt/codexrm/server.env -/opt/codexrm/server-updates

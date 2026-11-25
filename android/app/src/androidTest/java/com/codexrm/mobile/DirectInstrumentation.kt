@@ -1,5 +1,6 @@
 package com.codexrm.mobile
 
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.app.Instrumentation
 import android.app.KeyguardManager
@@ -9,7 +10,9 @@ import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
 import android.view.View
+import android.view.accessibility.AccessibilityNodeInfo
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -27,9 +30,16 @@ class DirectInstrumentation : Instrumentation() {
         val result = Bundle()
         var activity: Activity? = null
         try {
-            check(targetContext.packageName.endsWith(".p2pqa"))
+            check(targetContext.packageName.endsWith(".p2pqa") || targetContext.packageName.endsWith(".filetransferqa"))
             if (args.getString("conversation") == "true") {
                 result.putString("stream", "\n" + ConversationFeaturesCheck.run(this, args) + "\n")
+                finish(Activity.RESULT_OK, result)
+                return
+            }
+            val transferMode = args.getString("phoneTransfer")
+            if (transferMode == "relay" || transferMode == "direct" || transferMode == "cancel") {
+                val payload = args.getString("payload") ?: "fixture-from-Android"
+                result.putString("stream", "\n" + PhoneTransferCheck.run(this, transferMode, payload) + "\n")
                 finish(Activity.RESULT_OK, result)
                 return
             }
@@ -46,7 +56,7 @@ class DirectInstrumentation : Instrumentation() {
                 val transport = if (verifyLan) NetworkCapabilities.TRANSPORT_WIFI else NetworkCapabilities.TRANSPORT_CELLULAR
                 return caps.hasTransport(transport) && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
             }
-            check(verifyFiles || verifyImageReference || onExpectedNetwork()) { "Default network does not match the test" }
+            check(transferMode == "seed" || verifyFiles || verifyImageReference || onExpectedNetwork()) { "Default network does not match the test" }
             val url = requireNotNull(args.getString("rm"))
             val code = requireNotNull(args.getString("pair"))
             val rounds = (args.getString("rounds")?.toIntOrNull() ?: 20).coerceIn(1, 200)
@@ -60,6 +70,15 @@ class DirectInstrumentation : Instrumentation() {
             }
             val agent = claim.getJSONObject("agent")
             val device = Device(claim.getString("clientId"), claim.getString("token"), url, agent.getString("agentId"), agent.optString("serverName", "P2P QA"))
+            if (transferMode == "seed") {
+                DeviceStore(targetContext).apply { save(listOf(device)); selectedId = device.agentId; legacySystemWarningShown = true }
+                for (pref in listOf("secure_devices", "ui_state")) {
+                    check(targetContext.getSharedPreferences(pref, 0).edit().putBoolean("file_transfer_qa_seed", true).commit())
+                }
+                result.putString("stream", "\nclientId=${device.clientId}\n")
+                finish(Activity.RESULT_OK, result)
+                return
+            }
             args.getString("shareSpeed")?.let { mode ->
                 val mib = (args.getString("mib")?.toIntOrNull() ?: 128).coerceIn(0, 512)
                 val screen = startActivitySync(Intent().setClassName(targetContext.packageName,
@@ -69,6 +88,24 @@ class DirectInstrumentation : Instrumentation() {
                 runOnMainSync { screen.finish() }
                 result.putString("stream", "\n$summary\n")
                 finish(Activity.RESULT_OK, result)
+                return
+            }
+            if (args.getString("latency") == "true") {
+                check(verifyLan)
+                val screen = startActivitySync(Intent().setClassName(targetContext.packageName,
+                    "com.codexrm.mobile.MainActivity").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                activity = screen
+                val samples = DirectLatencyCheck.run(this, device, rounds,
+                    args.getString("gapMs")?.toLongOrNull()?.coerceIn(0, 10_000) ?: 3_000,
+                    args.getString("latencyInfo") == "true")
+                val summary = "lan=true " + latencySummary(samples)
+                Log.i("CodexRM-P2P-QA", summary)
+                check(onExpectedNetwork()) { "Default network changed during latency test" }
+                args.getString("maxMs")?.toLongOrNull()?.let { limit ->
+                    check(samples.all { it <= limit }) { "Latency exceeded ${limit}ms: $summary" }
+                }
+                runOnMainSync { screen.finish() }
+                finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "\n$summary\n") })
                 return
             }
             val natMode = args.getString("nat")
@@ -103,8 +140,27 @@ class DirectInstrumentation : Instrumentation() {
                     return
                 }
                 if (verifyIndicator) {
-                    val detail = checkIndicator(screen, expectedDirect, verifyLan)
-                    result.putString("stream", "\nconnectionIndicator=$detail\n")
+                    uiAutomation.serviceInfo = uiAutomation.serviceInfo.apply {
+                        flags = flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                    }
+                    val count = (args.getString("indicatorRounds")?.toIntOrNull() ?: 1).coerceIn(1, 100)
+                    val gap = (args.getString("gapMs")?.toLongOrNull() ?: 2_600).coerceIn(0, 10_000)
+                    val details = List(count) { index ->
+                        if (index > 0) {
+                            sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+                            SystemClock.sleep(gap)
+                        }
+                        checkIndicator(screen, expectedDirect, verifyLan)
+                    }
+                    val samples = details.mapNotNull { indicatorLatency.find(it)?.groupValues?.get(1)?.toLong() }
+                    val summary = if (expectedDirect) {
+                        "connectionIndicator=${details.last()}\n" + latencySummary(samples)
+                    } else "connectionIndicator=${details.last()}"
+                    Log.i("CodexRM-P2P-QA", summary)
+                    args.getString("maxMs")?.toLongOrNull()?.let { limit ->
+                        check(samples.all { it <= limit }) { "Button latency exceeded ${limit}ms: $summary" }
+                    }
+                    result.putString("stream", "\n$summary\n")
                     runOnMainSync { screen.finish() }
                     finish(Activity.RESULT_OK, result)
                     return
@@ -195,6 +251,19 @@ class DirectInstrumentation : Instrumentation() {
         }
     }
 
+    private val indicatorLatency = Regex("往返延迟：([1-9][0-9]*) ms")
+
+    private fun latencySummary(samples: List<Long>): String {
+        val p95 = samples.sorted()[(samples.size * 95 + 99) / 100 - 1]
+        return "samplesMs=${samples.joinToString(",")} p95Ms=$p95 maxMs=${samples.max()}"
+    }
+
+    private fun nodeTexts(node: AccessibilityNodeInfo): Sequence<String> = sequence {
+        node.text?.toString()?.let { yield(it) }
+        node.contentDescription?.toString()?.let { yield(it) }
+        for (i in 0 until node.childCount) node.getChild(i)?.let { yieldAll(nodeTexts(it)) }
+    }
+
     private fun checkIndicator(screen: Activity, direct: Boolean, lan: Boolean): String {
         val label = when {
             !direct -> "RM 中继，查看直连状态"
@@ -215,9 +284,11 @@ class DirectInstrumentation : Instrumentation() {
         val text = if (direct) "往返延迟：" else "未收到 RM 的 P2P 能力通知"
         val dialogDeadline = SystemClock.elapsedRealtime() + 6_000
         while (SystemClock.elapsedRealtime() < dialogDeadline) {
-            val root = uiAutomation.rootInActiveWindow
-            val detail = root?.findAccessibilityNodeInfosByText(text)?.firstOrNull()?.text?.toString()
-            if (detail != null && (!direct || Regex("往返延迟：[1-9][0-9]* ms").matches(detail))) return detail
+            val roots = listOfNotNull(uiAutomation.rootInActiveWindow) + uiAutomation.windows.mapNotNull { it.root }
+            val detail = roots.asSequence().flatMap(::nodeTexts).firstOrNull {
+                it.contains(text) && (!direct || indicatorLatency.containsMatchIn(it))
+            }
+            if (detail != null) return detail
             SystemClock.sleep(100)
         }
         error("Connection detail dialog did not show the expected result")

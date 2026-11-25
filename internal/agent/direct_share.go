@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/codexrm/codexrm/internal/desktop"
 	"github.com/codexrm/codexrm/internal/p2p"
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/quic-go/quic-go"
@@ -19,21 +18,25 @@ func (a *Agent) serveDirectShares(d *directSession, link *p2p.Link) {
 		if err != nil {
 			return
 		}
-		_ = stream.SetReadDeadline(time.Now().Add(15 * time.Second))
-		var first [1]byte
-		if _, err := io.ReadFull(stream, first[:]); err != nil {
-			stream.CancelRead(0)
-			stream.CancelWrite(1)
-			if d.ctx.Err() != nil {
-				return
-			}
-			continue
-		}
-		if first[0] == desktop.StreamMagic {
-			_ = stream.SetDeadline(time.Time{})
-			go a.serveDesktopControl(d, stream)
-			continue
-		}
+		go a.serveFileStream(d, stream)
+	}
+}
+
+// The connection's incoming-stream limit bounds concurrent file streams.
+func (a *Agent) serveFileStream(d *directSession, stream *quic.Stream) {
+	_ = stream.SetReadDeadline(time.Now().Add(15 * time.Second))
+	var first [1]byte
+	if _, err := io.ReadFull(stream, first[:]); err != nil {
+		stream.CancelRead(0)
+		stream.CancelWrite(1)
+		return
+	}
+	switch first[0] {
+	case protocol.DirectFileDownload:
+		a.serveFileDownload(d, &d.files, stream)
+	case protocol.PhoneFileDownload:
+		a.serveFileDownload(d, &d.phoneFiles, stream)
+	default:
 		a.finishDirectShare(d, stream, first[0])
 	}
 }
@@ -68,11 +71,18 @@ func (a *Agent) receiveDirectShare(d *directSession, id string, source io.Reader
 		return errors.New("unknown direct desktop upload")
 	}
 	upload.Receiving = true
+	if stream, ok := source.(interface{ CancelRead(quic.StreamErrorCode) }); ok {
+		upload.AbortReceive = func() { stream.CancelRead(1) }
+	}
 	a.attachmentMu.Unlock()
 	defer func() {
 		a.attachmentMu.Lock()
 		defer a.attachmentMu.Unlock()
 		upload.Receiving = false
+		upload.AbortReceive = nil
+		if upload.Aborted && err == nil {
+			err = errors.New("desktop upload cancelled")
+		}
 		if err != nil || d.ctx.Err() != nil {
 			a.removeDirectShare(id, upload)
 			return
@@ -85,13 +95,8 @@ func (a *Agent) receiveDirectShare(d *directSession, id string, source io.Reader
 		return err
 	}
 	defer func() { err = errors.Join(err, file.Close()) }()
-	if _, err := io.CopyN(file, source, upload.File.Size); err != nil {
+	if err := p2p.ReceiveFilePayload(file, source, upload.File.Size); err != nil {
 		return err
-	}
-	// Confirm the stream ended at the declared size before allowing finish.
-	var extra [1]byte
-	if _, err := io.ReadFull(source, extra[:]); err != io.EOF {
-		return errors.New("desktop upload stream exceeds declared size or was interrupted")
 	}
 	return d.ctx.Err()
 }

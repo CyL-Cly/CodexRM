@@ -37,6 +37,10 @@ JNIEXPORT jboolean JNICALL Java_com_codexrm_mobile_NativeP2P_send(JNIEnv *env, j
     return sent;
 }
 
+JNIEXPORT jlong JNICALL Java_com_codexrm_mobile_NativeP2P_measureLatency(JNIEnv *env, jobject self, jlong h) {
+    return CRMMeasureLatency(h);
+}
+
 JNIEXPORT jboolean JNICALL Java_com_codexrm_mobile_NativeP2P_upload(JNIEnv *env, jobject self, jlong h, jbyteArray id, jbyteArray path, jlong size) {
     jbyte *id_bytes = (*env)->GetByteArrayElements(env, id, NULL);
     if (!id_bytes) return JNI_FALSE;
@@ -52,6 +56,25 @@ JNIEXPORT jboolean JNICALL Java_com_codexrm_mobile_NativeP2P_upload(JNIEnv *env,
 
 JNIEXPORT jint JNICALL Java_com_codexrm_mobile_NativeP2P_uploadProgress(JNIEnv *env, jobject self, jlong h) {
     return CRMUploadProgress(h);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_codexrm_mobile_NativeP2P_download(JNIEnv *env, jobject self, jlong h, jbyteArray id, jbyteArray path, jlong size, jboolean phone) {
+    jsize id_len = (*env)->GetArrayLength(env, id);
+    jsize path_len = (*env)->GetArrayLength(env, path);
+    jbyte id_bytes[36], path_bytes[4096];
+    if (id_len != sizeof(id_bytes) || path_len <= 0 || path_len > sizeof(path_bytes)) return JNI_FALSE;
+    (*env)->GetByteArrayRegion(env, id, 0, id_len, id_bytes);
+    (*env)->GetByteArrayRegion(env, path, 0, path_len, path_bytes);
+    if ((*env)->ExceptionCheck(env)) return JNI_FALSE;
+    return CRMDownload(h, id_bytes, id_len, path_bytes, path_len, size, phone) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_codexrm_mobile_NativeP2P_cancelDownload(JNIEnv *env, jobject self, jlong h, jbyteArray id) {
+    jsize len = (*env)->GetArrayLength(env, id);
+    jbyte bytes[36];
+    if (len != sizeof(bytes)) return;
+    (*env)->GetByteArrayRegion(env, id, 0, len, bytes);
+    if (!(*env)->ExceptionCheck(env)) CRMCancelDownload(h, bytes, len);
 }
 
 JNIEXPORT void JNICALL Java_com_codexrm_mobile_NativeP2P_close(JNIEnv *env, jobject self, jlong h) {
@@ -71,38 +94,4 @@ JNIEXPORT jbyteArray JNICALL Java_com_codexrm_mobile_NativeP2P_diagnoseNat(JNIEn
     if (out) (*env)->SetByteArrayRegion(env, out, 0, n, result);
     free(result);
     return out;
-}
-
-JNIEXPORT jboolean JNICALL Java_com_codexrm_mobile_NativeP2P_startDesktop(JNIEnv *env, jobject self, jlong h) {
-    return CRMDesktopStart(h) ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT void JNICALL Java_com_codexrm_mobile_NativeP2P_stopDesktop(JNIEnv *env, jobject self, jlong h) {
-    CRMDesktopStop(h);
-}
-
-JNIEXPORT jboolean JNICALL Java_com_codexrm_mobile_NativeP2P_desktopActive(JNIEnv *env, jobject self, jlong h) {
-    return CRMDesktopActive(h) ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jlong JNICALL Java_com_codexrm_mobile_NativeP2P_desktopBytes(JNIEnv *env, jobject self, jlong h) {
-    return (jlong)CRMDesktopBytes(h);
-}
-
-JNIEXPORT jbyteArray JNICALL Java_com_codexrm_mobile_NativeP2P_pollDesktop(JNIEnv *env, jobject self, jlong h) {
-    int n = 0;
-    void *b = CRMDesktopPoll(h, &n);
-    if (!b) return NULL;
-    jbyteArray out = (*env)->NewByteArray(env, n);
-    if (out) (*env)->SetByteArrayRegion(env, out, 0, n, b);
-    free(b);
-    return out;
-}
-
-JNIEXPORT jboolean JNICALL Java_com_codexrm_mobile_NativeP2P_sendDesktop(JNIEnv *env, jobject self, jlong h, jbyteArray data) {
-    jbyte *b = (*env)->GetByteArrayElements(env, data, NULL);
-    if (!b) return JNI_FALSE;
-    jboolean sent = CRMDesktopSend(h, b, (*env)->GetArrayLength(env, data)) ? JNI_TRUE : JNI_FALSE;
-    (*env)->ReleaseByteArrayElements(env, data, b, JNI_ABORT);
-    return sent;
 }

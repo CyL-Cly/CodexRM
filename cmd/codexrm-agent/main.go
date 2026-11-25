@@ -19,6 +19,7 @@ import (
 	"github.com/codexrm/codexrm/internal/clientconfig"
 	"github.com/codexrm/codexrm/internal/desktop"
 	"github.com/codexrm/codexrm/internal/installation"
+	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/tray"
 	"github.com/codexrm/codexrm/internal/updater"
@@ -85,6 +86,7 @@ func main() {
 	uninstall := flag.Bool("uninstall", false, "uninstall this Windows installation")
 	uninstallDir := flag.String("uninstall-dir", "", "internal: uninstall using a temporary helper")
 	wxInstallHelper := flag.Bool("wx-install-helper", false, "install signed Docker Engine and Compose packages on Linux")
+	sendToPhone := flag.String("send-to-phone", "", "stage a local file for a paired Android phone")
 	flag.Parse()
 	if *loopbackSettings && *lanSettings {
 		log.Fatal("--loopback-settings and --lan-settings are mutually exclusive")
@@ -214,7 +216,16 @@ func main() {
 		}
 		return
 	}
-	base := agent.Config{ServerURL: cfg.Server, EnrollmentKey: cfg.EnrollmentKey, AppServerURL: *appServer, AppServerToken: *appToken, Name: *name, DataDir: *dataDir, Mock: *mock, MockAddr: *mockAddr, CodexPath: cfg.CodexPath, Cwd: cfg.Workspace, CCSwitchDB: *ccswitchDB}
+	base := agent.Config{AllowFileManagement: cfg.AllowFileManagement, ServerURL: cfg.Server, EnrollmentKey: cfg.EnrollmentKey, AppServerURL: *appServer, AppServerToken: *appToken, Name: *name, DataDir: *dataDir, Mock: *mock, MockAddr: *mockAddr, CodexPath: cfg.CodexPath, Cwd: cfg.Workspace, CCSwitchDB: *ccswitchDB}
+	if *sendToPhone != "" {
+		if err := sendSelectedFile(base, *sendToPhone); err != nil {
+			log.Print(err)
+			desktop.ShowStartupError(err.Error())
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *doPair || *listDevices || *removeDevice != "" {
 		if *listDevices && *removeDevice != "" {
 			fatal("--list-devices and --remove-device cannot be used together")
@@ -278,6 +289,12 @@ func main() {
 			log.Printf("迁移原生启动入口: %v", err)
 		}
 	}
+	if installDir != "" {
+		if err := installation.RegisterPhoneMenu(filepath.Join(installDir, "bin", "codexrm-agent.exe")); err != nil {
+			log.Printf("注册发送到手机菜单: %v", err)
+		}
+	}
+
 	host, err := agenthost.New(*configPath, installDir, cfg, base)
 	if err != nil {
 		fatal(err)
@@ -293,7 +310,7 @@ func main() {
 	host.OpenOnStart = runtime.GOOS != "linux" && (*settings || !host.Configured())
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := tray.Run(ctx, host.StateDir(), host.OpenSettings, func() string {
+	if err := tray.Run(ctx, host.StateDir(), host.OpenSettings, host.OpenPhoneTransfers, func() string {
 		switch host.Status().State {
 		case agent.Connected:
 			return "CodexRM · 已连接"
@@ -320,4 +337,84 @@ func main() {
 	if err := host.RestartUpdate(ctx); err != nil {
 		fatal(err)
 	}
+}
+
+func sendSelectedFile(base agent.Config, path string) error {
+	if base.ServerURL == "" {
+		return fmt.Errorf("请先配置 CodexRM 并配对 Android 手机")
+	}
+	a, err := agent.NewForServer(base)
+	if err != nil {
+		return err
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 512<<20 {
+		return fmt.Errorf("请选择不超过 512 MB 的普通文件")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	devices, err := a.ListDevices(ctx)
+	if err != nil {
+		return fmt.Errorf("无法读取已配对的手机：%w", err)
+	}
+	targets := pairedPhoneTargets(devices, func(id string) bool {
+		return desktop.IsDirectPeerActive(a.StateDir(), id)
+	})
+	if len(targets) == 0 {
+		return fmt.Errorf("没有已配对的 Android 手机")
+	}
+	names := make([]string, len(targets))
+	for i, target := range targets {
+		names[i] = target.name
+		if target.direct {
+			names[i] = "[P2P 已连接] " + names[i]
+		}
+	}
+	picked, err := installation.ChoosePhoneFileTarget(filepath.Base(absolute), names)
+	if err != nil || picked < 0 {
+		return err
+	}
+	target := targets[picked]
+	file, err := a.QueuePhoneFile(target.id, absolute, target.name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s 已加入发送缓存\n", file.Name)
+	installation.ShowPhoneQueued(file.Name, target.name)
+	return nil
+}
+
+type phoneTarget struct {
+	id, name string
+	direct   bool
+}
+
+func pairedPhoneTargets(devices []protocol.ClientInfo, isDirect func(string) bool) []phoneTarget {
+	var direct, others []phoneTarget
+	for _, d := range devices {
+		if d.DeviceType != "android" {
+			continue
+		}
+		name := strings.TrimSpace(strings.Map(func(r rune) rune {
+			if r < 32 {
+				return ' '
+			}
+			return r
+		}, d.ClientName))
+		if name == "" {
+			name = "Android 手机"
+		}
+		suffix := d.ClientID[max(0, len(d.ClientID)-6):]
+		target := phoneTarget{id: d.ClientID, name: name + " · " + suffix, direct: isDirect(d.ClientID)}
+		if target.direct {
+			direct = append(direct, target)
+		} else {
+			others = append(others, target)
+		}
+	}
+	return append(direct, others...)
 }

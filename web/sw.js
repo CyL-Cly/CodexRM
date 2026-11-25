@@ -1,6 +1,6 @@
 "use strict";
 
-const VERSION = "20261124-1";
+const VERSION = "20261124-2";
 const CACHE_PREFIX = "codexrm";
 const SHELL_CACHE = `${CACHE_PREFIX}-shell-${VERSION}`;
 const PAGE_CACHE = `${CACHE_PREFIX}-pages-${VERSION}`;

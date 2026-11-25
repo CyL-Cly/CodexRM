@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -26,16 +27,18 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.AbstractComposeView
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import top.yukonga.miuix.kmp.basic.BasicComponent
+import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.CircularProgressIndicator
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.preference.CheckboxPreference
 import top.yukonga.miuix.kmp.preference.RadioButtonPreference
@@ -48,8 +51,12 @@ internal fun CodexMiuixTheme(content: @Composable () -> Unit) {
     MiuixTheme(colors = if (Ui.dark) darkColorScheme() else lightColorScheme(), content = content)
 }
 
-internal class MiuixButtonView(context: Context, label: String, private val primary: Boolean = false) :
-    AbstractComposeView(context) {
+internal class MiuixButtonView(
+    context: Context,
+    label: String,
+    private val primary: Boolean = false,
+    private val compact: Boolean = false,
+) : AbstractComposeView(context) {
     var text by mutableStateOf(label)
     private var enabledState by mutableStateOf(true)
 
@@ -60,15 +67,23 @@ internal class MiuixButtonView(context: Context, label: String, private val prim
 
     @Composable
     override fun Content() = CodexMiuixTheme {
-        TextButton(
-            text = text,
+        Button(
             onClick = { performClick() },
+            modifier = if (compact) Modifier.widthIn(max = 96.dp) else Modifier,
             enabled = enabledState,
-            colors = if (primary) ButtonDefaults.textButtonColorsPrimary() else ButtonDefaults.textButtonColors(),
+            colors = if (primary) ButtonDefaults.buttonColorsPrimary() else ButtonDefaults.buttonColors(),
             minWidth = 0.dp,
             minHeight = 48.dp,
-            insideMargin = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-        )
+            insideMargin = PaddingValues(horizontal = if (compact) 8.dp else 10.dp, vertical = 6.dp),
+        ) {
+            val style = MiuixTheme.textStyles.button
+            Text(
+                text = text,
+                style = if (compact) style.copy(fontSize = 14.sp) else style,
+                maxLines = if (compact) 1 else Int.MAX_VALUE,
+                overflow = if (compact) TextOverflow.Ellipsis else TextOverflow.Clip,
+            )
+        }
     }
 }
 

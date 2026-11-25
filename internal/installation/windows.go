@@ -144,6 +144,9 @@ func register(root string, opts Options) error {
 	if os.Getenv("CODEXRM_INSTALL_TEST_ROOT") != "" {
 		return nil
 	}
+	if err := RegisterPhoneMenu(binary); err != nil {
+		return err
+	}
 	run, _, err := registry.CreateKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
 	if err != nil {
 		return err
@@ -191,6 +194,9 @@ func removeLegacyShortcuts() error {
 }
 
 func unregister(root string) error {
+	if err := unregisterPhoneMenu(filepath.Join(root, "bin", "codexrm-agent.exe")); err != nil {
+		return err
+	}
 	if err := removeLegacyShortcuts(); err != nil {
 		return err
 	}

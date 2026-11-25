@@ -6,6 +6,8 @@ import android.net.LinkProperties
 import android.net.Network as AndroidNetwork
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -83,6 +85,9 @@ internal class CodexClient(
     private var directId = ""
     private var directActive = false
     private var directLan = false
+    private var directNetworkHandle = 0L
+    private val appContext = context.applicationContext
+    private var directWifiLock: WifiManager.WifiLock? = null
     internal val usingDirect: Boolean get() = directActive
     internal fun directTransport(): DirectTransport? = activeDirectTransport
     private val activeDirectTransport: DirectTransport? get() = direct.takeIf { directActive }
@@ -475,11 +480,14 @@ internal class CodexClient(
 
     private fun nativeFailure(reason: String): String = when (reason) {
         "prepare" -> "手机无法准备 UDP 直连候选地址。"
+        "force_relay" -> "已跳过直连打洞，改用 RM 中继。"
         "peer_offer_timeout" -> "等待 Agent 的直连候选地址超时。"
         "no_peer_candidate" -> "没有可用的 Agent UDP 直连候选地址。"
         "punch_timeout" -> "UDP 打洞超时，双方未能建立直连路径。"
         "handshake" -> "直连握手失败或超时。"
         "activation_timeout" -> "等待 Agent 确认启用直连超时。"
+        "auto_loss" -> "直连丢包过高，已切换到 RM 中继。"
+        "manual_switch" -> "已按要求切换网络，当前使用 RM 中继。"
         else -> "QUIC 连接已断开。"
     }
 
@@ -502,6 +510,7 @@ internal class CodexClient(
                 cancelDirectTimers()
                 directRetry.started(SystemClock.elapsedRealtime())
                 directLan = false
+                directNetworkHandle = 0L
                 val sources = collectDirectSources()
                 directSources = sources
                 signal.put("localSources", JSONArray(sources.map {
@@ -525,7 +534,10 @@ internal class CodexClient(
                                 if (reason == DUAL_UNPREDICTABLE_NAT) suspendDirectForMapping(signalPeer = true)
                                 else dropDirect(nativeFailure(reason))
                             }
-                            message?.string("type") == "native_direct_lan" -> directLan = true
+                            message?.string("type") == "native_direct_lan" -> {
+                                directLan = true
+                                directNetworkHandle = message.string("network").toLongOrNull() ?: 0L
+                            }
                             !directActive && message?.string("type") == "p2p" && outgoing?.string("id") == id -> {
                                 if (socket?.send(text) != true) dropDirect("无法通过 RM 交换直连信令。")
                             }
@@ -540,6 +552,7 @@ internal class CodexClient(
                 directActive = true
                 directRetry.connected()
                 direct?.signal(signal)
+                acquireDirectWifiLock()
                 reportDirectStatus(DirectStatus.Connected(directLan))
                 Log.i("CodexRM-P2P", "Direct transport active (lan=$directLan)")
             }
@@ -563,6 +576,21 @@ internal class CodexClient(
         }
     }
 
+    private fun acquireDirectWifiLock() {
+        if (!directLan || directWifiLock != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        // Android only applies this mode while the app is foreground and screen on.
+        // Do not hold it for cellular, Ethernet, public P2P, or the RM relay.
+        runCatching {
+            val network = if (directNetworkHandle != 0L) AndroidNetwork.fromNetworkHandle(directNetworkHandle)
+                else connectivity?.activeNetwork
+            if (connectivity?.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                directWifiLock = appContext.getSystemService(WifiManager::class.java)
+                    ?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "CodexRM:LAN")
+                    ?.apply { acquire() }
+            }
+        }.onFailure { Log.w("CodexRM-P2P", "Wi-Fi low latency mode unavailable", it) }
+    }
+
     private fun dropDirect(failure: String? = null, signalPeer: Boolean = true) {
         val previous = direct ?: return
         val wasActive = directActive
@@ -570,6 +598,10 @@ internal class CodexClient(
         directActive = false
         directId = ""
         direct = null
+        directWifiLock?.let { lock ->
+            runCatching { lock.release() }.onFailure { Log.w("CodexRM-P2P", "Wi-Fi lock release failed", it) }
+        }
+        directWifiLock = null
         previous.close()
         if (failure != null) retryAfterDirectFailure(failure, wasActive)
         val ids = pending.filterValues { it.direct }.keys.toList()
@@ -614,15 +646,26 @@ internal class CodexClient(
         request("codexrm/provider/$operation", params, requireDirect, timeoutMs = 35_000, callback)
     }
 
+    fun requestPhoneTransfer(operation: String, params: JSONObject, callback: RpcCallback) {
+        request("codexrm/phoneTransfer/$operation", params, requireDirect = true, timeoutMs = 20_000, callback = callback)
+    }
+
     fun requestDirectFile(operation: String, params: JSONObject, callback: RpcCallback) {
         request("codexrm/directFile/$operation", params, requireDirect = true, timeoutMs = 20_000, callback = callback)
     }
 
     fun measureDirectLatency(callback: (Long?, Exception?) -> Unit) {
-        val started = SystemClock.elapsedRealtimeNanos()
-        request("codexrm/info", JSONObject(), requireDirect = true, timeoutMs = 5_000) { _, error ->
-            val elapsed = if (error == null) ((SystemClock.elapsedRealtimeNanos() - started + 500_000) / 1_000_000).coerceAtLeast(1) else null
-            callback(elapsed, error)
+        val transport = activeDirectTransport
+        if (transport == null) {
+            main.post { callback(null, IOException("P2P 直连已断开。")) }
+            return
+        }
+        transport.measureLatency(main) { elapsedNanos ->
+            when {
+                activeDirectTransport !== transport -> callback(null, IOException("P2P 直连已断开。"))
+                elapsedNanos <= 0L -> callback(null, IOException("延迟测试没有收到有效响应，请重试。"))
+                else -> callback(((elapsedNanos + 500_000) / 1_000_000).coerceAtLeast(1), null)
+            }
         }
     }
 

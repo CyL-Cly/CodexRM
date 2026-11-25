@@ -177,7 +177,7 @@ func testDirectBusinessAndFallback(t *testing.T, h *httptest.Server, dualNAT, ip
 	if err := os.WriteFile(filepath.Join(cwd, "sample.png"), png, 0600); err != nil {
 		t.Fatal(err)
 	}
-	a, err := agent.New(agent.Config{ServerURL: h.URL, DataDir: t.TempDir(), Cwd: cwd, Mock: true, EnrollmentKey: "test-key"})
+	a, err := agent.New(agent.Config{ServerURL: h.URL, DataDir: t.TempDir(), Cwd: cwd, Mock: true, EnrollmentKey: "test-key", AllowFileManagement: true})
 	if err != nil {
 		t.Fatal(err)
 	}

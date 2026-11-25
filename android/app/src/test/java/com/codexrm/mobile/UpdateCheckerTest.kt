@@ -1,5 +1,6 @@
 package com.codexrm.mobile
 
+import android.content.pm.PackageInstaller
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import java.io.File
@@ -97,4 +98,81 @@ class UpdateCheckerTest {
             file.delete()
         }
     }
+    @Test fun silentInstallFailureFallsBackOnce() {
+        assertEquals(
+            true,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_FAILURE,
+                silentAttempt = true,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(
+            true,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_FAILURE_ABORTED,
+                silentAttempt = true,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(
+            true,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_FAILURE_BLOCKED,
+                silentAttempt = true,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(
+            true,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_FAILURE_TIMEOUT,
+                silentAttempt = true,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(
+            false,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_PENDING_USER_ACTION,
+                silentAttempt = true,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(
+            false,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_SUCCESS,
+                silentAttempt = true,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(
+            false,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_FAILURE,
+                silentAttempt = false,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(
+            false,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_FAILURE,
+                silentAttempt = true,
+                interactiveAlreadyStarted = true,
+            ),
+        )
+        assertEquals(
+            false,
+            UpdateChecker.shouldRetryWithInteractiveInstall(
+                PackageInstaller.STATUS_FAILURE_STORAGE,
+                silentAttempt = true,
+                interactiveAlreadyStarted = false,
+            ),
+        )
+        assertEquals(true, UpdateChecker.isUserCancelledInstall(PackageInstaller.STATUS_FAILURE_ABORTED))
+        assertEquals(false, UpdateChecker.isUserCancelledInstall(PackageInstaller.STATUS_FAILURE))
+    }
+
 }

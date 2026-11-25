@@ -5,6 +5,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $moduleRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = Split-Path -Parent (Split-Path -Parent $moduleRoot)
+$debugKeystore = Join-Path $repoRoot '.signature/debug.keystore'
+if (-not (Test-Path -LiteralPath $debugKeystore -PathType Leaf)) { throw "Missing project debug keystore: $debugKeystore" }
 if (-not [IO.Path]::IsPathRooted($Output)) { $Output = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $Output)) }
 New-Item -ItemType Directory -Force -Path $Output, "$Output/classes", "$Output/dex", "$Output/lib/arm64-v8a" | Out-Null
 $buildTools = Join-Path $Sdk 'build-tools/36.0.0'
@@ -26,6 +29,5 @@ $classFiles = @(Get-ChildItem -LiteralPath "$Output/classes" -Recurse -Filter '*
 & "$buildTools/aapt2.exe" link -o "$Output/unsigned.apk" -I $androidJar --manifest "$moduleRoot/android/AndroidManifest.xml" --min-sdk-version 28 --target-sdk-version 35; Check 'aapt2'
 & python "$PSScriptRoot/package-apk.py" "$Output/unsigned.apk" "$Output/dex/classes.dex" "$Output/lib/arm64-v8a/libp2pprobe.so"; Check 'package APK'
 & "$buildTools/zipalign.exe" -f -p 4 "$Output/unsigned.apk" "$Output/aligned.apk"; Check 'zipalign'
-$debugKeystore = Join-Path $env:USERPROFILE '.android/debug.keystore'
 & "$buildTools/apksigner.bat" sign --ks $debugKeystore --ks-pass pass:android --key-pass pass:android --out "$Output/p2p-probe.apk" "$Output/aligned.apk"; Check 'apksigner'
 Get-Item -LiteralPath "$Output/p2p-probe.apk" | Select-Object FullName,Length

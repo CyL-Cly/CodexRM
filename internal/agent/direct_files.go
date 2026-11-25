@@ -19,7 +19,7 @@ import (
 	"github.com/google/uuid"
 )
 
-const directFileMax = 512 << 20
+const directFileMax = protocol.DirectFileMaxSize
 const directFileListLimit = 2000
 
 type directFileEntry struct {
@@ -34,10 +34,12 @@ type directFiles struct {
 }
 
 type directFileRead struct {
-	id     string
-	file   *os.File
-	info   os.FileInfo
-	offset int64
+	id          string
+	file        *os.File
+	info        os.FileInfo
+	offset      int64
+	streamed    bool
+	abortStream func()
 }
 
 func (a *Agent) supportsDirectFiles() bool {
@@ -52,6 +54,9 @@ func (s *directFiles) close() {
 
 func (s *directFiles) closeRead() {
 	if s.read != nil {
+		if s.read.abortStream != nil {
+			s.read.abortStream()
+		}
 		_ = s.read.file.Close()
 		s.read = nil
 	}
@@ -179,77 +184,40 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 	s := &d.files
 	switch method {
 	case protocol.DirectFilePrefix + "roots":
+		if !a.allowsFileManagement() {
+			return nil, errFileManagementDisabled
+		}
 		roots, err := directFileRoots()
 		if err != nil {
 			return nil, errors.New("无法读取电脑盘符")
 		}
 		return map[string]any{"roots": roots}, nil
 	case protocol.DirectFilePrefix + "read", protocol.DirectFilePrefix + "close":
-		s.mu.Lock()
-		defer s.mu.Unlock()
 		id, _ := params["id"].(string)
-		r := s.read
-		if r == nil || r.id != id {
-			return nil, errors.New("下载已结束，请重试")
-		}
-		if method == protocol.DirectFilePrefix+"close" {
-			s.closeRead()
-			return map[string]any{}, nil
-		}
-		next, ok := params["offset"].(float64)
-		if !ok || next != float64(r.offset) {
-			return nil, errors.New("下载分块顺序无效")
-		}
-		offset := r.offset
-		data := make([]byte, min(int64(attachmentChunkSize), r.info.Size()-offset))
-		if len(data) > 0 {
-			if _, err := r.file.ReadAt(data, offset); err != nil {
-				s.closeRead()
-				return nil, errors.New("文件读取失败，可能已被修改")
-			}
-		}
-		info, err := r.file.Stat()
-		if err != nil || info.Size() != r.info.Size() || !info.ModTime().Equal(r.info.ModTime()) {
-			s.closeRead()
-			return nil, errors.New("文件已修改，请重新下载")
-		}
-		r.offset += int64(len(data))
-		if r.offset == info.Size() {
-			s.closeRead()
-		}
-		return map[string]any{"offset": r.offset, "data": base64.StdEncoding.EncodeToString(data)}, nil
+		return s.readChunk(id, params["offset"], method == protocol.DirectFilePrefix+"close")
 	case protocol.DirectFilePrefix + "list", protocol.DirectFilePrefix + "stat", protocol.DirectFilePrefix + "open":
 	default:
 		return nil, errors.New("未知的文件操作")
 	}
-	base, path, err := a.directFileLocation(ctx, app, params)
+	var base, path string
+	var err error
+	if a.allowsFileManagement() {
+		base, path, err = a.directFileLocation(ctx, app, params)
+	} else {
+		if method == protocol.DirectFilePrefix+"list" {
+			return nil, errFileManagementDisabled
+		}
+		base, path, err = a.mentionedFileLocation(ctx, app, params)
+	}
 	if err != nil {
 		return nil, err
 	}
-	private, _ := filepath.EvalSymlinks(a.cfg.DataDir)
-	if private == "" {
-		private = a.cfg.DataDir
-	}
-	protected := func(path string) bool {
-		return filepath.IsAbs(private) && pathInside(private, filepath.Join(base, path))
-	}
-	if protected(path) {
-		return nil, errDirectFilePrivate
-	}
-	root, err := os.OpenRoot(base)
+	private := a.directPrivatePath()
+	root, info, err := checkedDirectRoot(base, path, private)
 	if err != nil {
-		return nil, errors.New("无法打开电脑目录")
+		return nil, err
 	}
 	defer root.Close()
-	// Also compare directory identities, since Windows paths can use short aliases.
-	var privateInfo os.FileInfo
-	if filepath.IsAbs(private) {
-		privateInfo, _ = os.Stat(private)
-	}
-	info, err := directFileInfo(root, path, privateInfo)
-	if err != nil {
-		return nil, err
-	}
 	if method == protocol.DirectFilePrefix+"list" {
 		if !info.IsDir() {
 			return nil, errors.New("不是文件夹")
@@ -271,7 +239,7 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if protected(filepath.Join(path, entry.Name())) {
+			if directPathProtected(private, base, filepath.Join(path, entry.Name())) {
 				continue
 			}
 			item, err := entry.Info()
@@ -305,15 +273,44 @@ func (a *Agent) directFileRPC(ctx context.Context, app *appserver.Client, d *dir
 		_ = f.Close()
 		return nil, errors.New("文件已变更，请重试")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if ctx.Err() != nil {
-		_ = f.Close()
-		return nil, ctx.Err()
+	streamed, _ := params["downloadStream"].(bool)
+	return s.openRead(ctx, f, actual, actual.Name(), streamed)
+}
+
+func (a *Agent) directPrivatePath() string {
+	if !filepath.IsAbs(a.cfg.DataDir) {
+		return ""
 	}
-	s.closeRead()
-	s.read = &directFileRead{id: uuid.NewString(), file: f, info: actual}
-	return map[string]any{"id": s.read.id, "name": actual.Name(), "size": actual.Size()}, nil
+	if path, err := filepath.EvalSymlinks(a.cfg.DataDir); err == nil {
+		return path
+	}
+	return a.cfg.DataDir
+}
+
+func directPathProtected(private, base, path string) bool {
+	return private != "" && pathInside(private, filepath.Join(base, path))
+}
+
+// The caller owns the returned root. Check both the path and the directory
+// identities to catch aliases such as a Windows short path to Agent state.
+func checkedDirectRoot(base, path, private string) (*os.Root, os.FileInfo, error) {
+	if directPathProtected(private, base, path) {
+		return nil, nil, errDirectFilePrivate
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return nil, nil, errors.New("无法打开电脑目录")
+	}
+	var privateInfo os.FileInfo
+	if private != "" {
+		privateInfo, _ = os.Stat(private)
+	}
+	info, err := directFileInfo(root, path, privateInfo)
+	if err != nil {
+		_ = root.Close()
+		return nil, nil, err
+	}
+	return root, info, nil
 }
 
 func (a *Agent) directFileLocation(ctx context.Context, app *appserver.Client, params map[string]any) (string, string, error) {
@@ -333,4 +330,58 @@ func (a *Agent) directFileLocation(ctx context.Context, app *appserver.Client, p
 	}
 	path, err := localDirectFilePath(workspace, requested)
 	return workspace, path, err
+}
+
+func (s *directFiles) openRead(ctx context.Context, f *os.File, info os.FileInfo, name string, streamed bool) (any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx.Err() != nil {
+		_ = f.Close()
+		return nil, ctx.Err()
+	}
+	s.closeRead()
+	s.read = &directFileRead{id: uuid.NewString(), file: f, info: info, streamed: streamed}
+	result := map[string]any{"id": s.read.id, "name": name, "size": info.Size()}
+	if streamed {
+		result["downloadStream"] = true
+	}
+	return result, nil
+}
+
+func (s *directFiles) readChunk(id string, rawOffset any, closeOnly bool) (any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.read
+	if r == nil || r.id != id {
+		return nil, errors.New("下载已结束，请重试")
+	}
+	if closeOnly {
+		s.closeRead()
+		return map[string]any{}, nil
+	}
+	if r.streamed {
+		return nil, errors.New("文件需要通过直连流下载")
+	}
+	next, ok := rawOffset.(float64)
+	if !ok || next != float64(r.offset) {
+		return nil, errors.New("下载分块顺序无效")
+	}
+	offset := r.offset
+	data := make([]byte, min(int64(attachmentChunkSize), r.info.Size()-offset))
+	if len(data) > 0 {
+		if _, err := r.file.ReadAt(data, offset); err != nil {
+			s.closeRead()
+			return nil, errors.New("文件读取失败，可能已被修改")
+		}
+	}
+	info, err := r.file.Stat()
+	if err != nil || info.Size() != r.info.Size() || !info.ModTime().Equal(r.info.ModTime()) {
+		s.closeRead()
+		return nil, errors.New("文件已修改，请重新下载")
+	}
+	r.offset += int64(len(data))
+	if r.offset == info.Size() {
+		s.closeRead()
+	}
+	return map[string]any{"offset": r.offset, "data": base64.StdEncoding.EncodeToString(data)}, nil
 }

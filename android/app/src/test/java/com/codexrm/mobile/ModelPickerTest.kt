@@ -11,10 +11,10 @@ class ModelPickerTest {
         ModelOption("local", "qwen-coder", "Local · Qwen Coder", "", emptyList(), "Qwen Coder", "离线", "Local"),
     )
 
-    @Test fun `models are grouped by provider with a default choice`() {
+    @Test fun `models are grouped by provider without a default model entry`() {
         val rows = ModelPicker.rows(options, "")
-        assertEquals("默认模型", rows.first().title)
-        assertTrue(rows.first().defaultChoice)
+        assertEquals("OpenAI", rows.first().title)
+        assertTrue(rows.none { it.defaultChoice })
         assertEquals(listOf("OpenAI", "Local"), rows.filter { it.header }.map { it.title })
         assertEquals(listOf("gpt-5", "gpt-4.1", "qwen-coder"), rows.mapNotNull { it.option?.model })
     }

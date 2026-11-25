@@ -1,0 +1,26 @@
+[Unit]
+Description=CodexRM paired NAT diagnostic STUN
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+EnvironmentFile=/etc/codexrm/nat-stun-pair.env
+LoadCredential=peer.key:/etc/codexrm/nat-stun-pair.key
+ExecStart=/usr/local/bin/codexrm-nat-stun --key-file=%d/peer.key --primary-port=${NATSTUN_PRIMARY_PORT} --alternate-port=${NATSTUN_ALTERNATE_PORT}
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

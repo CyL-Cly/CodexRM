@@ -6,36 +6,45 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/updater"
 )
 
 func (s *Server) updateManifest(w http.ResponseWriter, r *http.Request) {
-	s.serveUpdateManifest(w, "update.json")
+	serveUpdateManifest(w, s.cfg.UpdateDir, "update.json")
 }
 
 func (s *Server) androidUpdateManifest(w http.ResponseWriter, r *http.Request) {
-	s.serveUpdateManifest(w, "android-update.json")
+	serveUpdateManifest(w, s.cfg.UpdateDir, "android-update.json")
 }
 
 func (s *Server) linuxUpdateManifest(w http.ResponseWriter, r *http.Request) {
-	s.serveUpdateManifest(w, "linux-update.json")
+	serveUpdateManifest(w, s.cfg.UpdateDir, "linux-update.json")
 }
 
-func (s *Server) serveUpdateManifest(w http.ResponseWriter, name string) {
+func (s *Server) serverUpdateManifest(w http.ResponseWriter, r *http.Request) {
+	serveUpdateManifest(w, s.cfg.ServerUpdateDir, release.ServerManifestName)
+}
+
+func serveUpdateManifest(w http.ResponseWriter, directory, name string) {
 	w.Header().Set("Cache-Control", "no-store")
-	f, err := os.Open(filepath.Join(s.cfg.UpdateDir, name))
+	if directory == "" {
+		fail(w, http.StatusNotFound, "no update published")
+		return
+	}
+	f, err := os.Open(filepath.Join(directory, name))
 	if os.IsNotExist(err) {
-		fail(w, http.StatusNotFound, "no client update published")
+		fail(w, http.StatusNotFound, "no update published")
 		return
 	}
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "cannot read client update")
+		fail(w, http.StatusInternalServerError, "cannot read update")
 		return
 	}
 	defer f.Close()
 	m, err := updater.ReadManifest(f)
 	if err != nil {
-		fail(w, http.StatusInternalServerError, "invalid client update manifest")
+		fail(w, http.StatusInternalServerError, "invalid update manifest")
 		return
 	}
 	writeJSON(w, http.StatusOK, m)

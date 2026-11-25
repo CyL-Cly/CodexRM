@@ -41,6 +41,20 @@ class InteractionCopyTest {
         assertNull(InteractionCopy.sendBlockReason(ready.copy(running = true, messageQueue = true)))
     }
 
+    @Test fun `immediate send bypasses only the queue requirement`() {
+        val running = sendState().copy(running = true, messageQueue = false)
+        assertTrue(InteractionCopy.sendBlockReason(running)!!.contains("不支持排队"))
+        assertNull(InteractionCopy.sendBlockReason(running, steer = true))
+        for (blocked in listOf(
+            running.copy(hasPayload = false), running.copy(online = false), running.copy(loaded = false),
+            running.copy(readOnly = true), running.copy(sending = true), running.copy(loading = true),
+            running.copy(preparingAttachments = true), running.copy(editingQueuedMessage = true),
+            running.copy(hasAttachments = true, attachmentsSupported = false),
+        )) {
+            assertTrue(InteractionCopy.sendBlockReason(blocked, steer = true) != null)
+        }
+    }
+
     @Test fun `model blocking reasons are specific`() {
         assertTrue(InteractionCopy.modelBlockReason(false, readOnly = true, running = false, sending = false, loading = false)!!.contains("只读"))
         assertTrue(InteractionCopy.modelBlockReason(false, readOnly = false, running = true, sending = false, loading = false)!!.contains("运行"))
@@ -48,6 +62,16 @@ class InteractionCopyTest {
         assertTrue(InteractionCopy.modelBlockReason(false, readOnly = false, running = false, sending = false, loading = true)!!.contains("同步"))
         assertTrue(InteractionCopy.modelBlockReason(false, readOnly = false, running = false, sending = false, loading = false)!!.contains("离线"))
         assertNull(InteractionCopy.modelBlockReason(true, readOnly = false, running = false, sending = false, loading = false))
+    }
+
+    @Test fun `composer model labels remove only a leading GPT prefix`() {
+        assertEquals("6.2-sol", InteractionCopy.composerModelLabel("gpt-6.2-sol"))
+        assertEquals("5", InteractionCopy.composerModelLabel("GPT-5"))
+        assertEquals("Gpt", InteractionCopy.composerModelLabel("Gpt"))
+        assertEquals("my-gpt-model", InteractionCopy.composerModelLabel("my-gpt-model"))
+        assertEquals("Qwen Coder", InteractionCopy.composerModelLabel("Qwen Coder"))
+        assertEquals("选择模型", InteractionCopy.composerModelLabel(null))
+        assertEquals("选择模型", InteractionCopy.composerModelLabel("gpt-"))
     }
 
     @Test fun `effort labels preserve provider values`() {

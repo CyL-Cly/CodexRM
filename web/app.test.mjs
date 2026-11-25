@@ -103,7 +103,7 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
   return { context, elements, claims, profiles, contextRequests, history, document, documentListeners, windowListeners, timers,
     advance,
     profile: vm.runInContext("({browserClientProfile, syncClientProfile})", context),
-    app: vm.runInContext("({state, workspaceGroups, renderThreads, renderWorkspacePath, setHome, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, closeCodexDesktop, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams, makeOutboxEntry, stageOutbox, bindOutbox, clearOutbox, syncOutbox, keepOutboxDraft, renderPersistentNotice, addAttachments, currentAttachments, userContent, messageInput, readAttachment, itemHTML, groupOperationItems, operationGroupHTML, rememberDisclosure, disclosureOpen, renderMessages, requestThreadDeletion, archiveThread, openThread, olderTurns, scheduleSnapshot, bootstrap, resetView, selectDevice, settings, updateAgent, createDeviceButton})", context) };
+    app: vm.runInContext("({state, workspaceGroups, renderThreads, renderWorkspacePath, setHome, displayedTurnStatus, loadThreads, onEvent, renderApprovals, sandboxPolicy, answerRequest, newChat, selectWorkspace, restoreDraft, resizePrompt, submit, stopTurn, acceptMessageQueue, loadMessageQueue, connect, disconnectSocket, toast, loadModels, selectThreadModel, selectedModel, threadProviderId, modelKey, turnParams, makeOutboxEntry, stageOutbox, bindOutbox, clearOutbox, syncOutbox, keepOutboxDraft, renderPersistentNotice, addAttachments, currentAttachments, userContent, messageInput, readAttachment, itemHTML, groupOperationItems, operationGroupHTML, rememberDisclosure, disclosureOpen, renderMessages, requestThreadDeletion, archiveThread, openThread, olderTurns, scheduleSnapshot, bootstrap, resetView, selectDevice, settings, updateAgent, createDeviceButton})", context) };
 }
 
 const deferred = () => {
@@ -566,13 +566,13 @@ test("opening a conversation with a missing supplier shows history and blocks on
   assert.deepEqual(calls, ["thread/resume", "codexrm/thread/switchProvider", "turn/start"]);
 });
 
-test("new chats select an available default instead of leaving the model empty", async () => {
+test("new chats keep the current Codex model instead of substituting a catalog default", async () => {
   const { app, providers } = providerApp();
-  providers[0].models.push({ model: "configured", isDefault: true });
+  providers[0].models.push({ model: "gpt-6.2-sol", displayName: "6.2 Sol", isDefault: true });
   await app.loadModels();
-  assert.equal(app.selectedModel().model, "configured");
+  assert.equal(app.selectedModel(), undefined);
   app.newChat();
-  assert.equal(app.selectedModel().model, "configured");
+  assert.equal(app.selectedModel(), undefined);
 });
 
 test("new chats reuse the last provider, model and effort across workspaces and reloads", async () => {
@@ -606,7 +606,7 @@ test("the last model wins over older workspace preferences and stays scoped to i
   assert.equal(app.selectedModel().providerId, "ccswitch_b");
   app.state.selected = "another-device";
   app.newChat();
-  assert.equal(app.selectedModel().providerId, "");
+  assert.equal(app.selectedModel(), undefined);
 });
 
 test("removed and unavailable last models fall back without leaking the previous effort", async () => {
@@ -618,7 +618,7 @@ test("removed and unavailable last models fall back without leaking the previous
   elements.get("effort").onchange();
   context.rpc = async () => ({ providers: providers.map((p) => ({ ...p, unavailable: p.id === "ccswitch_b" })) });
   await app.loadModels(true);
-  assert.equal(app.selectedModel().providerId, "");
+  assert.equal(app.selectedModel(), undefined);
   assert.equal(elements.get("effort").value, "");
   context.rpc = async () => ({ providers: [] });
   await app.loadModels(true);
@@ -1603,23 +1603,6 @@ test("nonblocking questions remain answerable after completion until resolved or
   }
 });
 
-test("desktop close requires confirmation and calls only the local control RPC", async () => {
-  const { app, context, elements } = loadApp();
-  const calls = [];
-  app.state.online = true;
-  context.rpc = async (method) => {
-    calls.push(method);
-    return { closed: 2, message: "已关闭 2 个 Codex 桌面进程" };
-  };
-  context.window.confirm = () => false;
-  await app.closeCodexDesktop();
-  assert.equal(calls.length, 0);
-  context.window.confirm = () => true;
-  await app.closeCodexDesktop();
-  assert.deepEqual(calls, ["codexrm/desktop/close"]);
-  assert.equal(elements.get("close-codex-desktop").disabled, false);
-});
-
 test("default turn permissions grant full access", () => {
   const { app } = loadApp();
   assert.equal(app.sandboxPolicy().type, "dangerFullAccess");
@@ -2085,6 +2068,28 @@ test("history images reuse disk bytes and stay scoped to the pairing and message
   await assert.rejects(after.app.readAttachment("image"), /cache miss/);
 });
 
+test("a restricted computer accepts a known workspace path without browsing its directory", async () => {
+  const { app, context, elements } = newThreadApp();
+  app.state.info = { workspaces: true, directFiles: false, cwd: "/root" };
+  app.state.online = true;
+  const calls = [];
+  context.rpc = async (method, params) => {
+    calls.push([method, params?.path]);
+    if (method === "codexrm/workspace/add") throw new Error("fixture stopped after verifying add");
+    throw new Error(`unexpected ${method}`);
+  };
+  elements.get("add-workspace").onclick();
+  assert.equal(elements.get("workspace-dialog").open, true);
+  assert.equal(elements.get("browse-directory").hidden, true);
+  assert.deepEqual(calls, []);
+  const path = elements.get("directory-path");
+  path.value = "/project";
+  path.oninput();
+  assert.equal(elements.get("select-directory").disabled, false);
+  await elements.get("select-directory").onclick();
+  assert.deepEqual(calls, [["codexrm/workspace/add", "/project"]]);
+});
+
 test("local history previews resolve the path and keep separate message cache identities", async () => {
   const { app, context } = newThreadApp();
   const html = app.itemHTML({ id: "old", type: "agentMessage", text: "![图](file:///E:/a%20b.png)" });
@@ -2095,13 +2100,14 @@ test("local history previews resolve the path and keep separate message cache id
   context.rpc = async (method, params) => {
     assert.equal(method, "codexrm/image/read");
     assert.equal(params.path, "E:/a b.png");
+    assert.equal(params.threadId, "thread-a");
     calls++;
     return { file: { mimeType: "image/png", size: 1, version: "v1" }, offset: 1, data: "YQ==" };
   };
-  await readHistoryImage("E:/a b.png", "old", "/project");
-  await readHistoryImage("E:/a b.png", "old", "/project");
+  await readHistoryImage("E:/a b.png", "old", "/project", "thread-a");
+  await readHistoryImage("E:/a b.png", "old", "/project", "thread-a");
   assert.equal(calls, 1);
-  await readHistoryImage("E:/a b.png", "new", "/project");
+  await readHistoryImage("E:/a b.png", "new", "/project", "thread-a");
   assert.equal(calls, 2);
 });
 
@@ -2531,6 +2537,7 @@ test("agenthost polling after the first settings failure applies settings and re
   assert.equal(harness.elements.get("server").value, "");
   await harness.poll();
   assert.equal(harness.elements.get("server").value, harness.settings.server);
+  assert.equal(harness.elements.get("allow-file-management").checked, false);
   assert.equal(harness.elements.get("version").textContent, "1.2.3");
   assert.equal(harness.elements.get("status").textContent, "已连接");
   assert.equal(harness.elements.get("devices").children.length, 1);

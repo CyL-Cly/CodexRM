@@ -15,6 +15,9 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// Header and payload fit together in a normal QUIC packet for interactive messages.
+const smallDirectPayload = 1024
+
 type Link struct {
 	lan    bool
 	ipv6   bool
@@ -24,6 +27,7 @@ type Link struct {
 	udp    *net.UDPConn
 	trans  *quic.Transport
 	once   sync.Once
+	frame  [4 + smallDirectPayload]byte // owned by the serialized writer
 
 	statsMu sync.Mutex
 	stats   FallbackStats
@@ -48,6 +52,8 @@ func (l *Link) Fallback() FallbackStats {
 
 // SwitchEgress records a preferred network for the next direct attempt and
 // closes this link so the owner can fall back to the RM relay and renegotiate.
+// Agent and Android do not call this automatically: a live QUIC path is left
+// on its current network, and a later retry uses the updated source list.
 func (l *Link) SwitchEgress(network string) error {
 	if l.conn == nil {
 		return ErrSwitchUnavailable
@@ -93,10 +99,26 @@ func (l *Link) Write(data []byte) error {
 	if len(data) == 0 || len(data) > protocol.MaxEnvelopeSize {
 		return errors.New("invalid direct frame size")
 	}
-	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(data)))
 	_ = l.stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	_, err := io.Copy(l.stream, io.MultiReader(bytes.NewReader(header[:]), bytes.NewReader(data)))
+	return writeDirectFrame(l.stream, l.frame[:], data)
+}
+
+func writeDirectFrame(w io.Writer, scratch, data []byte) error {
+	header := scratch[:4]
+	binary.BigEndian.PutUint32(header, uint32(len(data)))
+	if len(data) <= len(scratch)-len(header) {
+		// A separate write for just the header can schedule a tiny UDP packet
+		// before the payload is queued, costing an extra packet on both legs.
+		frame := scratch[:len(header)+len(data)]
+		copy(frame[len(header):], data)
+		n, err := w.Write(frame)
+		if err == nil && n != len(frame) {
+			return io.ErrShortWrite
+		}
+		return err
+	}
+	// Avoid copying large history or attachment payloads just for framing.
+	_, err := io.Copy(w, io.MultiReader(bytes.NewReader(header), bytes.NewReader(data)))
 	return err
 }
 

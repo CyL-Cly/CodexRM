@@ -21,7 +21,7 @@ var iconData []byte
 // Run owns the Windows message loop while the connector runs in the background.
 // The tray menu is the interactive shutdown path; closing it gracefully cancels
 // the connector so its app-server is not left behind.
-func Run(ctx context.Context, _ string, openSettings func(), statusText func() string, run func(context.Context) error) error {
+func Run(ctx context.Context, _ string, openSettings, openPhoneTransfers func(), statusText func() string, run func(context.Context) error) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	runErr := make(chan error, 1)
@@ -41,6 +41,7 @@ func Run(ctx context.Context, _ string, openSettings func(), statusText func() s
 		status.Disable()
 		systray.AddSeparator()
 		settings := systray.AddMenuItem("设置", "打开本机 Agent 设置页面")
+		phoneTransfers := systray.AddMenuItem("文件传输助手", "管理待发送和已接收的文件")
 		quitItem := systray.AddMenuItem("退出 CodexRM", "停止连接器并关闭 Codex app-server")
 
 		go func() {
@@ -54,6 +55,8 @@ func Run(ctx context.Context, _ string, openSettings func(), statusText func() s
 					systray.SetTooltip(title)
 				case <-settings.ClickedCh:
 					go openSettings()
+				case <-phoneTransfers.ClickedCh:
+					go openPhoneTransfers()
 				case <-quitItem.ClickedCh:
 					status.SetTitle("CodexRM 正在退出…")
 					quitItem.Disable()

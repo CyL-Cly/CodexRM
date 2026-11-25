@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Instrumentation
 import android.content.Intent
 import android.database.DataSetObserver
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
@@ -86,12 +87,71 @@ internal object SnapshotRenderingCheck {
                 field("readOnly").setBoolean(screen, false)
                 checkReconnectErrors(screen, adapter)
                 checkApprovalQueue(screen)
+                checkToolCardStyle(screen, list, adapter)
             }
-            test.finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "Snapshot rendering, reconnect error and approval queue checks passed\n") })
+            test.finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "Snapshot rendering, reconnect error, approval queue and chat card checks passed\n") })
         } catch (error: Throwable) {
             test.finish(Activity.RESULT_CANCELED, Bundle().apply { putString("stream", error.stackTraceToString()) })
         } finally {
             activity?.let { screen -> test.runOnMainSync { screen.finish() } }
+        }
+    }
+
+    private fun checkToolCardStyle(screen: Activity, list: ChatListView, adapter: MessageAdapter) {
+        val type = screen.javaClass
+        fun field(name: String) = type.getDeclaredField(name).apply { isAccessible = true }
+        val renderBootstrap = type.getDeclaredMethod("renderBootstrapState").apply { isAccessible = true }
+        field("online").setBoolean(screen, true)
+        field("bootstrapping").setBoolean(screen, true)
+        field("bootstrapError").set(screen, "")
+        val area = field("bootstrapArea").get(screen) as LinearLayout
+        val commands = List(3) { ChatMessage("check-$it", MessageKind.TOOL, "运行命令", "command output", "退出码 0") }
+        fun measure(view: View, width: Int) = view.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+        )
+        fun compareRow(row: LinearLayout): LinearLayout {
+            val syncCard = area.getChildAt(0) as LinearLayout
+            val label = syncCard.getChildAt(0) as TextView
+            val toolCard = row.getChildAt(0) as LinearLayout
+            val header = toolCard.getChildAt(0) as LinearLayout
+            val title = header.getChildAt(1) as TextView
+            val syncBackground = syncCard.background as GradientDrawable
+            val toolBackground = toolCard.background as GradientDrawable
+            check(syncBackground.cornerRadius == toolBackground.cornerRadius)
+            check(syncBackground.color?.defaultColor == toolBackground.color?.defaultColor)
+            check(header.paddingLeft == syncCard.paddingLeft && header.paddingTop == syncCard.paddingTop)
+            check(header.paddingRight == syncCard.paddingRight && header.paddingBottom == syncCard.paddingBottom)
+            check(title.currentTextColor == label.currentTextColor && title.textSize == label.textSize && !title.typeface.isBold)
+            val left = row.paddingLeft + list.paddingLeft
+            val right = row.paddingRight + list.paddingRight
+            val composer = area.parent as View
+            check(left == composer.paddingLeft && right == composer.paddingRight)
+            val width = Ui.dp(screen, 360)
+            measure(row, width - list.paddingLeft - list.paddingRight)
+            measure(syncCard, width - left - right)
+            check(toolCard.measuredHeight == syncCard.measuredHeight) { "Collapsed cards must have the same height" }
+            return header
+        }
+        for (dark in listOf(true, false)) {
+            Ui.configure(screen, dark)
+            adapter.bubbleOpacity = 100
+            renderBootstrap.invoke(screen)
+            adapter.replace(commands)
+            val row = adapter.getView(0, null, list) as LinearLayout
+            val header = compareRow(row)
+            check((header.getChildAt(2) as TextView).text == "退出码 0 · 3 条操作")
+            adapter.bubbleOpacity = 65
+            renderBootstrap.invoke(screen)
+            compareRow(adapter.getView(0, row, list) as LinearLayout)
+            check(header.performClick() && adapter.count == 4)
+            val detail = adapter.getView(1, null, list)
+            check(adapter.messageBody(detail)?.text.toString() == "command output")
+            check(header.performClick() && adapter.count == 1)
+            adapter.replace(commands.take(1))
+            val single = compareRow(adapter.getView(0, row, list) as LinearLayout)
+            check(single.performClick())
+            check(adapter.messageBody(adapter.getView(0, row, list))?.visibility == View.VISIBLE)
         }
     }
 

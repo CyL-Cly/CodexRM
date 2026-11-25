@@ -96,8 +96,10 @@ internal object ConversationUpgradeCheck {
             fun state(check: () -> Boolean): Boolean { var value = false; onUi { value = check() }; return value }
             await("main loaded") { state { field("loaded").getBoolean(screen) } }
             onUi {
-                (field("searchInput").get(screen) as EditText).setText(needle)
                 invoke("showAllConversationSearch")
+                val entry = field("referenceSearch").get(screen) as ReferenceSearch
+                val query = entry.javaClass.getDeclaredField("input").apply { isAccessible = true }.get(entry) as EditText
+                query.setText(needle)
             }
             click("$needle original instruction")
             val adapter = field("adapter").get(screen) as MessageAdapter

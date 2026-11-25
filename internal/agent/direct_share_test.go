@@ -3,13 +3,16 @@ package agent
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/google/uuid"
+	"github.com/quic-go/quic-go"
 )
 
 func TestReceiveDirectShare(t *testing.T) {
@@ -65,7 +68,7 @@ func TestReceiveDirectShare(t *testing.T) {
 
 func TestDesktopShareRPCRequiresOriginalDirectSession(t *testing.T) {
 	id := uuid.NewString()
-	a := &Agent{cfg: Config{DataDir: t.TempDir()}, uploads: map[string]*attachmentUpload{
+	a := &Agent{cfg: Config{DataDir: t.TempDir(), AllowFileManagement: true}, uploads: map[string]*attachmentUpload{
 		id: {Owner: "phone", DirectID: "original", Updated: time.Now()},
 	}}
 	denied := func(operation string, params map[string]any, direct *directSession) {
@@ -83,5 +86,67 @@ func TestDesktopShareRPCRequiresOriginalDirectSession(t *testing.T) {
 		denied(operation, params, nil)
 		denied(operation, params, &directSession{id: "replacement", ctx: context.Background()})
 		denied(operation, params, &directSession{id: "original", ctx: ctx})
+	}
+}
+
+type blockedDirectUpload struct {
+	reading   chan struct{}
+	cancelled chan struct{}
+	once      sync.Once
+}
+
+func (r *blockedDirectUpload) Read([]byte) (int, error) {
+	close(r.reading)
+	<-r.cancelled
+	return 0, errors.New("stream cancelled")
+}
+
+func (r *blockedDirectUpload) CancelRead(quic.StreamErrorCode) {
+	r.once.Do(func() { close(r.cancelled) })
+}
+
+func TestAbortStopsActiveDesktopShareAndDeletesPartialFile(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "upload", "file-test")
+	if err := os.Mkdir(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".part", []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.NewString()
+	a := &Agent{cfg: Config{DataDir: t.TempDir()}, uploads: map[string]*attachmentUpload{
+		id: {File: attachment{Path: path, Size: 10}, Owner: "phone", Offset: -1, DirectID: "session", Streamed: true, Updated: time.Now()},
+	}}
+	d := &directSession{id: "session", client: "phone", ctx: ctx}
+	source := &blockedDirectUpload{reading: make(chan struct{}), cancelled: make(chan struct{})}
+	defer source.CancelRead(1)
+	done := make(chan error, 1)
+	go func() { done <- a.receiveDirectShare(d, id, source) }()
+	select {
+	case <-source.reading:
+	case <-time.After(3 * time.Second):
+		t.Fatal("upload never began receiving")
+	}
+	params := map[string]any{"id": id}
+	if _, err := a.attachmentRPC("phone", "codexrm/attachment/abort", params, &directSession{id: "other", client: "phone", ctx: ctx}); err == nil {
+		t.Fatal("another connection cancelled the active upload")
+	}
+	if _, err := a.attachmentRPC("phone", "codexrm/attachment/abort", params, d); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled stream reported success")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("abort did not stop the stream")
+	}
+	if _, err := os.Stat(path + ".part"); !os.IsNotExist(err) || a.uploads[id] != nil {
+		t.Fatalf("cancelled upload still exists: %v", err)
+	}
+	if _, err := a.attachmentRPC("phone", "codexrm/attachment/finish", params, d); err == nil {
+		t.Fatal("cancelled upload could be committed")
 	}
 }

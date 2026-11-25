@@ -11,6 +11,9 @@ import (
 // Public DNS addresses used as a best-effort outbound check. Only a
 // permission error on every probe is treated as a host firewall; refused
 // ports and timeouts are not, so a machine without those routes still punches.
+// The specific addresses are ordinary public resolvers, not part of the
+// punch packet format; the set has not been proven against a particular
+// third-party implementation and may be changed.
 var preflightAddrs = []string{"223.5.5.5:53", "119.29.29.29:53"}
 
 func outboundBlocked(ctx context.Context) bool {

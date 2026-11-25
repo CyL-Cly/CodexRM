@@ -102,10 +102,10 @@ func TestRobotClientCannotCallDesktopOrReceiveBroadcasts(t *testing.T) {
 	robotConn := ws(t, h, "client", robot.Token)
 	_ = read(t, browserConn)
 	_ = read(t, robotConn)
-	rpc(t, robotConn, 1, "codexrm/desktop/close", map[string]any{})
+	rpc(t, robotConn, 1, "command/exec", map[string]any{})
 	denied := until(t, robotConn, func(env protocol.Envelope) bool { return env.Type == protocol.TypeError })
 	if denied.Error != "method not allowed" {
-		t.Fatalf("robot desktop call: %#v", denied)
+		t.Fatalf("robot command call: %#v", denied)
 	}
 	rpc(t, robotConn, 2, "turn/steer", map[string]any{"threadId": "t", "expectedTurnId": "active"})
 	forwarded := until(t, agentConn, func(env protocol.Envelope) bool { return env.Type == protocol.TypeClientMessage })

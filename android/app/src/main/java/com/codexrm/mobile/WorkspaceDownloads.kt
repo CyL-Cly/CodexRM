@@ -76,11 +76,17 @@ internal class WorkspaceDownloads(context: Context) {
             // ExternalStorageProvider rejects deleted tree documents while checking ancestry.
             if (!DocumentsContract.isTreeUri(uri)) throw error
         }
+        forget(key)
+        return null
+    }
+
+    // Remove only the bookmark, not the user's exported file.
+    fun forget(key: String) {
+        val uri = files.getString(key, null)?.let(Uri::parse) ?: return
         files.edit().remove(key).apply()
         if (DocumentsContract.isTreeUri(uri)) {
             releaseUnusedFolder(DocumentsContract.buildTreeDocumentUri(uri.authority, DocumentsContract.getTreeDocumentId(uri)))
         }
-        return null
     }
 
     fun save(key: String, stage: StagedDownload, folder: PhoneFolder?) {
@@ -153,6 +159,9 @@ internal class WorkspaceDownloads(context: Context) {
         private const val DOWNLOAD_FOLDER = "download-tree"
         private const val BROWSER_FOLDER = "tree"
         private const val READ_WRITE = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+
+        fun transferKey(device: Device, id: String): String =
+            JSONArray(listOf("phone-transfer", device.serverUrl, device.agentId, device.clientId, id)).toString()
 
         fun key(device: Device, source: RemoteFile): String {
             // The Agent resolves both absolute artifact links and workspace-relative list paths.
