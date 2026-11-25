@@ -114,7 +114,7 @@ func TestAuthOriginsAndDiskUI(t *testing.T) {
 		t.Fatal(e)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusForbidden {
 		t.Fatal(resp.Status)
 	}
 	resp, e = http.Get(h.URL + "/api/v1/agents")
@@ -242,10 +242,10 @@ func TestDiskWebChangesDoNotRequireServerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := httptest.NewServer(s.Handler())
+	h := httptest.NewTLSServer(s.Handler())
 	t.Cleanup(func() { s.Close(); h.Close() })
 	readIndex := func() string {
-		resp, err := http.Get(h.URL + "/")
+		resp, err := h.Client().Get(h.URL + "/")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -271,9 +271,11 @@ func TestDiskWebChangesDoNotRequireServerRestart(t *testing.T) {
 }
 
 func TestPWAAssetsAndCacheHeaders(t *testing.T) {
-	_, h := newServer(t)
+	s, _ := newServer(t)
+	h := httptest.NewTLSServer(s.Handler())
+	t.Cleanup(h.Close)
 	for _, path := range []string{"/manifest.webmanifest", "/sw.js", "/pwa.js?v=0.6.0", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/maskable-512.png", "/icons/icon.svg"} {
-		resp, err := http.Get(h.URL + path)
+		resp, err := h.Client().Get(h.URL + path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -283,7 +285,7 @@ func TestPWAAssetsAndCacheHeaders(t *testing.T) {
 		}
 	}
 
-	resp, err := http.Get(h.URL + "/manifest.webmanifest")
+	resp, err := h.Client().Get(h.URL + "/manifest.webmanifest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +297,7 @@ func TestPWAAssetsAndCacheHeaders(t *testing.T) {
 		t.Fatalf("manifest Cache-Control: %q", got)
 	}
 
-	resp, err = http.Get(h.URL + "/sw.js")
+	resp, err = h.Client().Get(h.URL + "/sw.js")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +310,7 @@ func TestPWAAssetsAndCacheHeaders(t *testing.T) {
 	}
 
 	for _, path := range []string{"/app.js", "/styles.css", "/dsh-theme.css", "/pwa.js", "/theme.js"} {
-		resp, err = http.Get(h.URL + path + "?v=20261118-1")
+		resp, err = h.Client().Get(h.URL + path + "?v=20261118-1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -320,7 +322,7 @@ func TestPWAAssetsAndCacheHeaders(t *testing.T) {
 			t.Fatalf("%s versioned asset Cache-Control: %q", path, got)
 		}
 	}
-	resp, err = http.Get(h.URL + "/app.js?v=old")
+	resp, err = h.Client().Get(h.URL + "/app.js?v=old")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +330,7 @@ func TestPWAAssetsAndCacheHeaders(t *testing.T) {
 	if got := resp.Header.Get("Cache-Control"); strings.Contains(got, "immutable") {
 		t.Fatalf("old asset URL must not be immutable: %q", got)
 	}
-	resp, err = http.Get(h.URL + "/api/v1/health")
+	resp, err = h.Client().Get(h.URL + "/api/v1/health")
 	if err != nil {
 		t.Fatal(err)
 	}

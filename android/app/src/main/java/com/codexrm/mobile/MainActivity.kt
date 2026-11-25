@@ -99,6 +99,7 @@ internal class MainActivity : ComponentActivity() {
     private var device: Device? = null
     private var client: CodexClient? = null
     private var pairCall: Call? = null
+    private var cancelPairVerification: (() -> Unit)? = null
     private var pairOperation = 0
     private var outboxOwnerAgentId = ""
     private data class DeferredOpen(val agentId: String, val threadId: String, val silent: Boolean, val archived: Boolean)
@@ -448,7 +449,7 @@ internal class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         appearance.close()
         pairOperation++
-        pairCall?.cancel()
+        cancelPairRequest()
         pairCall = null
         transfers.destroy()
         referenceSearch?.dismiss()
@@ -464,7 +465,7 @@ internal class MainActivity : ComponentActivity() {
             SystemBackCompat.unregister(this, backCallback)
         }
         cancelUpdateOperation()
-        pairCall?.cancel()
+        cancelPairRequest()
         pendingUpdate = null
         if (client != null) disconnect()
         handler.removeCallbacksAndMessages(null)
@@ -494,7 +495,7 @@ internal class MainActivity : ComponentActivity() {
         settingsPage?.dismiss()
         settingsPage = null
         pairOperation++
-        pairCall?.cancel()
+        cancelPairRequest()
         pairCall = null
         invalidateBackPreview()
         saveDraft()
@@ -544,7 +545,7 @@ internal class MainActivity : ComponentActivity() {
             startActivityForResult(Intent(this, ScannerActivity::class.java), 42)
         }, matchWidth())
         card.addView(Ui.text(this, "设备配对码 / 完整配对链接", 12f, Ui.MUTED).apply { setPadding(0, Ui.dp(context, 22), 0, Ui.dp(context, 7)) })
-        val code = Ui.boxInput(this, "ABCD-EFGH").apply {
+        val code = Ui.boxInput(this, "rm2.?").apply {
             typeface = android.graphics.Typeface.MONOSPACE
             gravity = Gravity.CENTER
         }
@@ -580,43 +581,66 @@ internal class MainActivity : ComponentActivity() {
         catch (error: Exception) { showPairError(error.message ?: "配对信息无效") }
     }
 
-    private fun pair(data: PairingData) {
-        if (data.requiresCleartextWarning) {
-            styledDialog(MiuixDialog.Builder(this)
-                .setTitle("无加密连接")
-                .setMessage("无加密连接可能会泄露你的数据，自行承担风险")
-                .setNegativeButton("取消连接", null)
-                .setPositiveButton("已知晓风险，仍继续连接") { _, _ -> connectPair(data) })
-            return
-        }
-        connectPair(data)
+    private fun cancelPairRequest() {
+        pairCall?.cancel()
+        cancelPairVerification?.invoke()
+        cancelPairVerification = null
     }
 
-    private fun connectPair(data: PairingData) {
-        pairCall?.cancel()
+    private fun pair(data: PairingData) {
+        val invitation = try { SecureInvitation.parse(data.code) } catch (error: IllegalArgumentException) {
+            showPairError(error.message ?: "?????")
+            return
+        }
+        if (!NativeP2P.available) {
+            showPairError("??????????????? Android App")
+            return
+        }
+        connectPair(data.serverUrl, invitation)
+    }
+
+    private fun connectPair(serverUrl: String, invitation: SecureInvitation) {
+        cancelPairRequest()
         val operation = ++pairOperation
         pairSubmit?.isEnabled = false
-        pairSubmit?.text = "正在连接…"
+        pairSubmit?.text = "?????"
         pairError?.visibility = View.GONE
+        fun finishPairRequest() {
+            pairSubmit?.isEnabled = true
+            pairSubmit?.text = "???????"
+            pairCall = null
+            cancelPairVerification = null
+        }
         val body = JSONObject()
-            .put("code", data.code)
+            .put("route", invitation.route)
             .put("clientName", "${Build.MANUFACTURER} ${Build.MODEL}".trim().take(80))
             .put("deviceType", "android")
-        val call = Network.request(data.serverUrl, "/api/v1/client/claim", body = body) { result, error ->
+        pairCall = Network.request(serverUrl, "/api/v2/client/route", body = body) { result, error ->
             if (isDestroyed || operation != pairOperation) return@request
-            pairSubmit?.isEnabled = true; pairSubmit?.text = "使用配对码连接"
-            pairCall = null
             if (error != null || result == null) {
+                finishPairRequest()
                 showPairError(when (error?.status) {
-                    404 -> "找不到这个配对码，请确认输入正确"
-                    409 -> "配对码已使用，请重新生成"
-                    410 -> "配对码已过期，请在电脑上重新生成"
-                    else -> error?.message ?: "配对失败"
+                    404 -> "????????????????????????"
+                    409 -> "????????????"
+                    410 -> "????????????????"
+                    else -> error?.message ?: "????"
                 })
                 return@request
             }
-            try {
-                val paired = Device.fromClaim(data.serverUrl, result)
+            val routed = try { Device.fromClaim(serverUrl, result) } catch (exception: Exception) {
+                finishPairRequest()
+                showPairError(exception.message ?: "??????")
+                return@request
+            }
+            cancelPairVerification = verifySecurePairing(routed, invitation) { key, failure ->
+                if (isDestroyed || operation != pairOperation) return@verifySecurePairing
+                finishPairRequest()
+                if (key == null) {
+                    Network.request(routed.serverUrl, "/api/v1/client/revoke", routed.token, JSONObject()) { _, _ -> }
+                    showPairError(failure ?: "????")
+                    return@verifySecurePairing
+                }
+                val paired = routed.copy(secureKey = key)
                 expiredAgentIds.remove(paired.agentId)
                 val old = devices.firstOrNull { it.agentId == paired.agentId }
                 devices.removeAll { it.agentId == paired.agentId }; devices.add(0, paired)
@@ -624,13 +648,12 @@ internal class MainActivity : ComponentActivity() {
                 disconnect()
                 device = paired; pairMessage = ""; restoreThreadId = ""
                 if (old != null && old.token != paired.token) Network.request(old.serverUrl, "/api/v1/client/revoke", old.token, JSONObject()) { _, _ -> }
-                toast("已配对 ${paired.serverName}")
+                toast("??? ${paired.serverName}")
                 settingsPage?.dismiss()
                 settingsPage = null
                 showMain(reset = true)
-            } catch (exception: Exception) { showPairError(exception.message ?: "配对响应无效") }
+            }
         }
-        pairCall = call
     }
 
     private fun showPairError(message: String) {

@@ -38,6 +38,7 @@ func main() {
 	verifyKeyFile := flag.String("p2p-verify-key-file", os.Getenv("CODEXRM_P2P_VERIFY_KEY_FILE"), "file with the 32-byte hex key shared by trusted UDP verifiers")
 	verifyOnly := flag.Bool("p2p-verify-only", false, "serve only the UDP verifier using the shared key file")
 	trustProxy := flag.Bool("p2p-trust-loopback-proxy", false, "trust X-Real-IP and X-Forwarded-Proto from a local TLS reverse proxy")
+	trustWebProxy := flag.Bool("web-trust-loopback-proxy", false, "allow the web UI behind a local HTTPS reverse proxy that overwrites X-Forwarded-Proto")
 	flag.Parse()
 	if *version {
 		fmt.Printf("CodexRM Server %s (code %d)\n", release.ServerVersionName, release.ServerVersionCode)
@@ -77,21 +78,23 @@ func main() {
 		log.Fatal(err)
 	}
 	srv, err := server.New(server.Config{
-		Addr:             *addr,
-		DataDir:          *dataDir,
-		WebDir:           absWeb,
-		AdminToken:       *enrollKey,
-		PublicEnrollment: *publicEnrollment,
-		UpdateDir:        *updateDir,
-		ServerUpdateDir:  *serverUpdateDir,
-		P2PSTUN:          *stun,
-		P2PNATSTUN:       *natSTUN,
-		P2PLAN:           *lan,
-		P2PVerifyListen:  *verifyListen,
-		P2PVerifyPublic:  *verifyPublic,
-		P2PVerifyMore:    *verifyMore,
-		P2PVerifyKeyFile: *verifyKeyFile,
-		P2PTrustProxy:    *trustProxy,
+		Addr:                  *addr,
+		DataDir:               *dataDir,
+		WebDir:                absWeb,
+		AdminToken:            *enrollKey,
+		PublicEnrollment:      *publicEnrollment,
+		UpdateDir:             *updateDir,
+		ServerUpdateDir:       *serverUpdateDir,
+		P2PSTUN:               *stun,
+		P2PNATSTUN:            *natSTUN,
+		P2PLAN:                *lan,
+		P2PVerifyListen:       *verifyListen,
+		P2PVerifyPublic:       *verifyPublic,
+		P2PVerifyMore:         *verifyMore,
+		P2PVerifyKeyFile:      *verifyKeyFile,
+		P2PTrustProxy:         *trustProxy,
+		TrustLoopbackWebProxy: *trustWebProxy || *trustProxy,
+		RequireSecureClients:  true,
 	})
 	if err != nil {
 		log.Fatal(err)

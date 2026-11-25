@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -385,15 +384,13 @@ func (h *Host) pair(w http.ResponseWriter, r *http.Request) {
 	if code == "" {
 		code = pair.PairingCode
 	}
-	h.mu.Lock()
-	link := h.config.Server + "/#pair=" + url.QueryEscape(code)
-	h.mu.Unlock()
-	png, err := qrcode.Encode(link, qrcode.Medium, 224)
+	qrLink, webLink := a.PairingLink(code)
+	png, err := qrcode.Encode(qrLink, qrcode.Medium, 224)
 	if err != nil {
 		failure(w, err)
 		return
 	}
-	respond(w, 200, map[string]any{"code": code, "url": link, "expiresAt": pair.ExpiresAt, "qr": "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)})
+	respond(w, 200, map[string]any{"code": code, "url": webLink, "expiresAt": pair.ExpiresAt, "qr": "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)})
 }
 
 func (h *Host) devices(w http.ResponseWriter, r *http.Request) {

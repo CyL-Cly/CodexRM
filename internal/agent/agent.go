@@ -14,6 +14,7 @@ import (
 	"github.com/codexrm/codexrm/internal/desktop"
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/codexrm/codexrm/internal/release"
+	"github.com/codexrm/codexrm/internal/securechannel"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"io"
@@ -95,6 +96,7 @@ type Config struct {
 	ProviderDir                                                                                                     string // Directory for Agent-managed model providers.
 	OneBotSettingsPath                                                                                              string // Optional OneBot 11 configuration; empty disables the local adapter.
 	Mock                                                                                                            bool
+	SecureRelay                                                                                                     bool
 	NoAutoPair                                                                                                      bool
 }
 type creds struct {
@@ -289,7 +291,9 @@ func (a *Agent) requestMethod(ctx context.Context, method, path string, input, o
 	req.Header.Set("Content-Type", "application/json")
 	credentials, _ := a.credentials()
 	req.Header.Set("Authorization", "Bearer "+credentials.Token)
-	req.Header.Set("X-Enrollment-Key", a.cfg.EnrollmentKey)
+	if path == "/api/v1/agent/enroll" {
+		req.Header.Set("X-Enrollment-Key", a.cfg.EnrollmentKey)
+	}
 	resp, e := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if e != nil {
 		return e
@@ -341,8 +345,13 @@ func (a *Agent) Pair(ctx context.Context) (*protocol.PairStartResponse, error) {
 		return nil, e
 	}
 	var out protocol.PairStartResponse
-	if e := a.request(ctx, "/api/v1/agent/pair", protocol.PairStartRequest{ManualCode: true}, &out); e != nil {
+	if e := a.request(ctx, "/api/v1/agent/pair", protocol.PairStartRequest{ManualCode: !a.cfg.SecureRelay, Secure: a.cfg.SecureRelay}, &out); e != nil {
 		return nil, e
+	}
+	if a.cfg.SecureRelay {
+		if err := a.createSecureInvitation(&out); err != nil {
+			return nil, err
+		}
 	}
 	return &out, nil
 }
@@ -362,6 +371,11 @@ func (a *Agent) ListDevices(ctx context.Context) ([]protocol.ClientInfo, error) 
 func (a *Agent) RemoveDevice(ctx context.Context, clientID string) error {
 	if err := a.ensureEnrolled(ctx); err != nil {
 		return err
+	}
+	if a.cfg.SecureRelay {
+		if err := a.removeSecureDevice(clientID); err != nil {
+			return err
+		}
 	}
 	return a.requestMethod(ctx, "DELETE", "/api/v1/agent/clients/"+url.PathEscape(clientID), nil, nil)
 }
@@ -654,7 +668,11 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { <-ctx.Done(); _ = conn.Close() }()
-	go a.writeRelayEvents(ctx, events)
+	var secured *encryptedRelay
+	if a.cfg.SecureRelay {
+		secured = newEncryptedRelay(a, conn)
+	}
+	go a.writeEncryptedRelayEvents(ctx, events, secured)
 	log.Printf("relay connected as %s (%s)", credentials.AgentID, a.cfg.Name)
 	hello := protocol.P2P(protocol.P2PKindHello, "")
 	hello.LAN = true
@@ -678,6 +696,19 @@ func (a *Agent) session(ctx context.Context, app *appserver.Client) error {
 		if env.Type == protocol.TypePing {
 			if err := a.write(conn, protocol.Envelope{Type: protocol.TypePong, PingID: env.PingID}); err != nil {
 				return err
+			}
+			continue
+		}
+		if secured != nil {
+			if env.Type == protocol.TypeSecure {
+				secured.receive(env, func(inner protocol.Envelope, reply sendEnvelope) {
+					a.dispatch(ctx, app, reply, slots, inner, nil)
+				})
+			} else if env.Type == protocol.TypeP2P && env.P2P != nil {
+				key := secured.directKey(env.ClientID)
+				if key != nil || env.P2P.Kind == protocol.P2PKindRouting || env.P2P.Kind == protocol.P2PKindLeave {
+					a.directSignalWithKey(ctx, app, conn, slots, env, key)
+				}
 			}
 			continue
 		}
@@ -975,7 +1006,11 @@ func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.Ra
 		// The request already ran if only the successful reply exceeded the relay limit.
 		tooLarge.Code = protocol.RPCOutcomeUnknownCode
 	}
-	if err == nil && len(result) > maxRPCPayloadBytes {
+	maxPayload := maxRPCPayloadBytes
+	if a.cfg.SecureRelay {
+		maxPayload = securechannel.MaxPlaintext - (64 << 10)
+	}
+	if err == nil && len(result) > maxPayload {
 		err = tooLarge
 	}
 	resp := map[string]any{"id": req.ID}
@@ -997,7 +1032,7 @@ func (a *Agent) respond(send sendEnvelope, env protocol.Envelope, result json.Ra
 		resp["result"] = result
 	}
 	message := mustJSON(resp)
-	if len(message) > maxRPCPayloadBytes {
+	if len(message) > maxPayload {
 		if rpcError != nil {
 			tooLarge.Code = rpcError.Code
 		}

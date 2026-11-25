@@ -8,7 +8,7 @@ DynamicUser=yes
 StateDirectory=codexrm-public
 StateDirectoryMode=0700
 WorkingDirectory=/opt/codexrm-public
-ExecStart=/opt/codexrm-public/bin/codexrm-server --addr 127.0.0.1:18081 --data /var/lib/codexrm-public --web /opt/codexrm-public/web --public-enrollment --p2p-lan=false
+ExecStart=/opt/codexrm-public/bin/codexrm-server --addr 127.0.0.1:18081 --data /var/lib/codexrm-public --web /opt/codexrm-public/web --public-enrollment --p2p-lan=false --web-trust-loopback-proxy
 Environment=GOMEMLIMIT=160MiB
 Restart=on-failure
 RestartSec=3

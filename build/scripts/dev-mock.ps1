@@ -32,7 +32,7 @@ try {
             }
             $pairOutput = Invoke-CodexRMAgentCommand -Binary $agentBinary -Arguments ($agentArgs + '--pair')
             Write-Host $pairOutput.TrimEnd()
-            Write-Host "Open $url and enter the pairing code above. Use the CodexRM tray icon to stop the agent."
+            Write-Host "Scan the QR code in the Android app. The HTTP relay does not serve the web UI. Use the tray icon to stop the agent."
             $agent.WaitForExit()
             if ($agent.ExitCode) { throw "Agent exited: $($agent.ExitCode)" }
         } finally {

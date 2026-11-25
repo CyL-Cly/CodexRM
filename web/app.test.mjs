@@ -4,6 +4,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 // Run the shipped script with a small DOM double; browser QA covers layout.
+const fixtureRoute = "route_01234567-89ab-cdef-0123-456789abcdef";
+const fixtureCode = `rm2.${fixtureRoute}.${"A".repeat(43)}`;
+
 function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null, navigator = {} } = {}) {
   class Element {
     constructor(tagName = "div") {
@@ -78,7 +81,7 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
     history, URL, URLSearchParams, console, navigator, Blob, Uint8Array, TextEncoder, btoa, atob,
     matchMedia: () => ({ matches: false }),
     fetch: async (path, options) => {
-      if (path === "/api/v1/client/claim") claims.push(JSON.parse(options.body));
+      if (path === "/api/v2/client/route") claims.push(JSON.parse(options.body));
       if (path === "/api/v1/client/profile") profiles.push({ ...JSON.parse(options.body), authorization: options.headers.Authorization });
       return { ok: true, status: 200, json: async () => ({ token: "token", agent: { agentId: "device", serverName: "Computer" } }) };
     },
@@ -87,7 +90,19 @@ function loadApp(storage = new Map(), hash = "", { hidden = false, webgl = null,
     clearTimeout: (id) => timers.delete(id), setInterval() {}, clearInterval() {},
     requestAnimationFrame() {}, WebSocket: class { static OPEN = 1; close() {} },
   });
-  vm.runInContext(readFileSync(new URL("app.js", import.meta.url), "utf8"), context);
+  context.testSecureRelay = {
+    parsePairingCode(code) {
+      assert.equal(code, fixtureCode);
+      return { route: fixtureRoute };
+    },
+    async verifyPairing() { return "device-key"; },
+    connectSecure() { return {}; },
+  };
+  const appSource = readFileSync(new URL("app.js", import.meta.url), "utf8").replace(
+    /const secureRelayModule = \(\) => import\([^\n]+\);/,
+    "const secureRelayModule = async () => testSecureRelay;",
+  );
+  vm.runInContext(appSource, context);
   const advance = (milliseconds) => {
     const deadline = timerNow + milliseconds;
     while (true) {
@@ -324,7 +339,7 @@ function rendererContext(renderer = gpuRenderer) {
 
 test("pairing uses the complete WebGL GPU renderer and releases the temporary context", async () => {
   const gl = rendererContext();
-  const { claims, profile, contextRequests } = loadApp(new Map(), "#pair=ABCD-EFGH", {
+  const { claims, profile, contextRequests } = loadApp(new Map(), `#pair=${fixtureCode}`, {
     webgl: gl, navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0) Chrome/130.0.0.0" },
   });
   await new Promise(setImmediate);
@@ -350,7 +365,7 @@ test("WebGL 1 devices retain their GPU name and mobile type when WebGL 2 is unav
 
 test("blocked, missing and empty WebGL renderer information still permits pairing with a useful fallback", async () => {
   for (const webgl of [null, () => { throw new Error("WebGL blocked"); }, { getExtension() { return null; } }, rendererContext("  ")]) {
-    const { claims } = loadApp(new Map(), "#pair=ABCD-EFGH", {
+    const { claims } = loadApp(new Map(), `#pair=${fixtureCode}`, {
       webgl, navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0) Firefox/130.0" },
     });
     await new Promise(setImmediate);
@@ -977,10 +992,12 @@ test("a page opened in the background also disconnects after five seconds", () =
 });
 
 test("pairing links claim the code once and remove it from the address", async () => {
-  const { app, claims, history } = loadApp(new Map(), "#view=welcome&pair=ABCD-EFGH");
+  const { app, claims, history } = loadApp(new Map(), `#view=welcome&pair=${fixtureCode}`);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(claims.length, 1);
-  assert.equal(claims[0].code, "ABCD-EFGH");
+  assert.equal(claims[0].route, fixtureRoute);
+  assert.equal(claims[0].code, undefined);
+  assert.equal(app.state.devices[0].secureKey, "device-key");
   assert.equal(app.state.devices[0].token, "token");
   assert.equal(history.url, "/?keep=1#view=welcome");
 });

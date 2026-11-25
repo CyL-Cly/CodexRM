@@ -7,7 +7,7 @@
 > CodexRM 是独立的社区项目，不是 OpenAI 官方产品。使用真实模式前，请安装并登录 Codex 桌面版，或自行安装并配置 Codex CLI。
 
 ```text
-Android / Web ←── HTTPS / WSS ──→ CodexRM 中继 ←── 出站 WSS ──→ 电脑连接器（Agent） ←→ 本地 Codex
+Android / Web ←── 端到端加密 ──→ CodexRM 中继 ←── 出站 WebSocket ──→ 电脑连接器（Agent） ←→ 本地 Codex
 ```
 
 功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复；发送在途记录独立保存，进程或页面中断后标记为“发送状态未确认”，先同步核对，不自动重发。配对失效可直接重新配对，草稿继续保留。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
@@ -60,7 +60,7 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 | 常见问题 | 答案 |
 | --- | --- |
 | **一定要有中继吗？** | **需要能连到同一个 CodexRM 中继，但不必自建。** 电脑连接器默认使用公共中继 `https://codexrm.ooth.tech`。即使手机和电脑在同一局域网，配对、认证和 P2P 握手仍需要中继；P2P 不是免中继配对模式。 |
-| **中继要开 SSE 或 QUIC 吗？** | **都不用。** 自部署的基本要求是 **HTTPS 和 WebSocket（WSS）**：配对走 HTTPS，对话和任务事件可以通过 WebSocket 转发。反向代理必须支持 WebSocket 升级；不需要 SSE，也不需要在中继域名开启 HTTP/3 或 UDP 443。 |
+| **中继要开 SSE 或 QUIC 吗？** | **都不用。** Android 和 Agent 支持 HTTP 或 HTTPS 中继。网页控制要求 HTTPS。配对使用 HTTP API，对话和任务事件使用 WebSocket；反向代理需允许 WebSocket 升级。 |
 | **QUIC 用在哪里？** | QUIC over UDP 用于 **Android 与电脑之间的 P2P 直连**，不是中继的 HTTPS 服务。直连失败时，普通对话仍可走中继；文件传输助手、普通聊天附件和远端工作区文件下载等依赖直连的功能不可用。 |
 
 ### 选择下载包
@@ -79,7 +79,7 @@ Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm6
 
 ### 首次配对和发起任务
 
-1. **在电脑连接器选定中继。** Windows 在系统托盘右键打开 **设置**；Linux 按[无桌面设置](#linux-无桌面设置)打开设置页。进入 **服务器连接 → 远程服务器**。使用默认公共中继时无需修改；使用自托管中继时，在这里填入自己的 HTTPS 地址和管理员提供的连接授权密钥，保存后等待连接成功。不要把连接授权密钥填到手机上。
+1. **在电脑连接器选定中继。** Windows 在系统托盘右键打开 **设置**；Linux 按[无桌面设置](#linux-无桌面设置)打开设置页。进入 **服务器连接 → 远程服务器**。使用默认公共中继时无需修改；使用自托管中继时，在这里填入自己的中继地址和管理员提供的连接授权密钥，保存后等待连接成功。不要把连接授权密钥填到手机上。
 2. 在电脑连接器的 **设备配对** 页点 **生成配对码**。二维码和完整配对链接会带上电脑当前连接的中继地址。配对码有效期 10 分钟，只可用一次；每台手机或浏览器分别生成一个码。
 3. **手机使用电脑选定的中继，不另选服务器。** 在 Android 客户端点 **扫描二维码**，或粘贴完整配对链接，应用会自动读取并保存该电脑的中继地址。只有手动输入短码时才需要填写服务器地址，且必须与电脑连接器一致。使用 Web 时，可打开完整配对链接，或到同一个中继的网页输入短码。电脑改用另一个中继后，请用新中继生成的二维码重新配对。
 4. 连接设备后，在侧栏 **工作区** 旁点击 **+**，浏览或输入被控电脑上的项目路径，选择 **添加此文件夹**，再为该目录新建会话。
@@ -90,7 +90,7 @@ Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm6
 | 现象 | 检查方法 |
 | --- | --- |
 | Agent 无法连接或注册 | 检查 HTTPS 地址、证书及注册密钥，确认反向代理支持 WebSocket |
-| 配对码无效 | 在电脑连接器生成新二维码并重新扫码；手输短码时，确认填写的是电脑当前的中继地址 |
+| 配对码无效 | 在电脑连接器生成新二维码并重新扫码。手动粘贴配对码时，确认填写的是电脑当前的中继地址 |
 | 已配对但设备离线 | 确认被控电脑未休眠、Agent 仍在运行，并检查设置页的连接状态 |
 | 在线但无法开始会话 | 在运行 Agent 的账号下确认 Codex 已登录、项目目录有访问权限，并查看 Agent 日志 |
 | 页面提示发送状态未确认 | 等待重连后同步会话，确认消息是否已经送达，再决定是否重发 |
@@ -230,6 +230,14 @@ npm run build:hiui
 按下方本地演示启动 Server 后访问 `http://127.0.0.1:8080/hiui/`。开发时可用 `npm run dev:hiui` 启动 Vite，健康检查请求会转发到本机的 8080 端口。自建部署可将 `web/hiui/` 随其他静态文件复制到服务器。
 
 
+## 中继加密与 HTTPS 网页入口
+
+Agent 本机生成一次性配对秘密。中继只拿到公开路由标识。客户端与 Agent 使用 Noise 验证配对秘密并建立加密通道。首次配对协商出设备专用密钥，后续每次重连派生新的会话密钥。HTTP 中继可见连接地址、路由令牌、时间和包大小。聊天、任务事件和远程操作使用带认证的密文。
+
+HTTP 网页入口显示「如需使用网页控制需要使用https」。本机 HTTPS 反代需把 Server 监听绑定到回环地址，覆盖 `X-Forwarded-Proto` 并为 Server 启用 `--web-trust-loopback-proxy`。网页端安全依赖提供网页脚本的 HTTPS 服务。
+
+Server、Agent 和客户端升级后，旧客户端配对需重新进行一次。微信机器人继续使用本机专用中继。
+
 ## 本地演示
 
 ```powershell
@@ -243,7 +251,7 @@ npm run build:hiui
 .\build\bin\codexrm-agent.exe --server http://127.0.0.1:8080 --mock --data .state/demo-agent --pair
 ```
 
-访问 http://127.0.0.1:8080 并输入配对码。模拟模式支持流式回复、历史、重命名、归档、停止；发送含“审批”的任务可测试审批回传。模拟会话只保存在内存中，不调用模型或执行命令。也可运行 `build/scripts/dev-mock.ps1` 一键启动。
+在 Android App 中扫描二维码，或填入手机可以访问的中继地址和配对码。模拟模式支持流式回复、历史、重命名、归档、停止；发送含“审批”的任务可测试审批回传。模拟会话只保存在内存中，不调用模型或执行命令。也可运行 `build/scripts/dev-mock.ps1` 一键启动。
 
 ## 连接真实 Codex
 
@@ -362,12 +370,12 @@ build/scripts/       开发构建、发布与服务器安装脚本
 | `GET /linux-update.json` | Linux amd64 Agent 更新清单 |
 | `GET /server-update.json` | Linux x86-64 Server 自动更新清单 |
 | `POST /api/v1/agent/enroll` | 注册/续期，远程注册需 `X-Enrollment-Key` |
-| `POST /api/v1/agent/pair` | Agent 生成配对码 |
+| `POST /api/v1/agent/pair` | 为 Agent 分配公开的配对路由 |
 | `GET /api/v1/agent/pair/status` | 查询配对状态，需 Agent token |
 | `GET /api/v1/agent/clients` | 列出已授权浏览器，需 Agent token |
 | `DELETE /api/v1/agent/clients/{clientId}` | 删除浏览器授权，需 Agent token |
 | `GET /api/v1/agent/ws` | Agent WebSocket |
-| `POST /api/v1/client/claim` | 浏览器认领配对码 |
+| `POST /api/v2/client/route` | 客户端认领公开路由，随后与 Agent 完成端到端握手 |
 | `POST /api/v1/client/profile` | 浏览器凭自身 token 更新设备名称和类型 |
 | `POST /api/v1/client/revoke` | 撤销当前浏览器 token 并断开连接 |
 | `GET /api/v1/client/ws` | 浏览器 WebSocket |
@@ -375,7 +383,7 @@ build/scripts/       开发构建、发布与服务器安装脚本
 
 更新服务器只发布更新清单。客户端按清单中的 `downloadUrl` 从外部存储下载对应平台的 ZIP 或 APK。项目的发布脚本使用 Cloudreve，自托管时也可使用 OSS、EOS 等对象存储。自托管时将清单放在 Server 数据目录的 `updates/` 下，并填写与发布文件对应的版本、下载地址、文件大小和 SHA-256。
 
-普通请求通过 `Authorization: Bearer <token>` 认证。浏览器 WebSocket 使用 `codexrm` 和 `codexrm.token.<token>` 子协议传递凭据，避免 token 出现在 URL 及普通访问日志中。中继的 `message` 包含 Codex JSON-RPC；`codexrm/info` 是 Agent 提供的运行状态接口。请求 ID 在 Agent 内映射，支持多个浏览器各自从相同 ID 开始发送请求。
+普通请求通过 `Authorization: Bearer <token>` 认证。浏览器 WebSocket 使用 `codexrm` 和 `codexrm.token.<token>` 子协议传递凭据，避免 token 出现在 URL 及普通访问日志中。端点使用加密通道交换 Codex JSON-RPC。`codexrm/info` 是 Agent 提供的运行状态接口。请求 ID 在 Agent 内映射，支持多个浏览器各自从相同 ID 开始发送请求。
 
 Agent 还提供 `codexrm/workspace/list`、`codexrm/workspace/add`、`codexrm/workspace/remove` 和 `codexrm/fs/list` RPC，经过已有的设备配对鉴权。添加/移除及浏览使用 `{ path }` 参数；浏览可加 `showHidden`。会话筛选使用 Codex 原生 `thread/list` 的 `cwd` 参数，在分页前按目录筛选。
 

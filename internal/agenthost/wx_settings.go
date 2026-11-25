@@ -197,11 +197,12 @@ func (h *Host) wxConfigure(ctx context.Context, account wxAccount, input wxInput
 	}
 	h.mu.Lock()
 	relay := h.wxLocalServer
-	if relay == "" {
+	if relay == "" && !h.base.SecureRelay {
 		relay = h.config.Server
 	}
+	needsLocalRelay := !wxLocalRelay(relay) || (h.base.SecureRelay && relay == h.config.Server)
 	h.mu.Unlock()
-	if input.Enabled && !before.Paired && !wxLocalRelay(relay) {
+	if input.Enabled && !before.Paired && needsLocalRelay {
 		if err := h.ensureWXRelay(ctx); err != nil {
 			return err
 		}

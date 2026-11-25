@@ -34,6 +34,7 @@ func (h *Host) runWXConnection(ctx context.Context, version uint64, relay, key s
 	cfg.OneBotSettingsPath = "" // The primary Agent owns the local OneBot listener.
 	cfg.CheckForUpdate = nil
 	cfg.NoAutoPair = true
+	cfg.SecureRelay = false // Compatibility with the separate same-host robot relay.
 	a, err := agent.NewForServer(cfg)
 	if err != nil {
 		log.Printf("WeChat relay: %v", err)

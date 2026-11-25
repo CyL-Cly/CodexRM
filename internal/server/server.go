@@ -20,6 +20,7 @@ import (
 	"github.com/codexrm/codexrm/internal/p2p"
 	"github.com/codexrm/codexrm/internal/protocol"
 	"github.com/codexrm/codexrm/internal/release"
+	"github.com/codexrm/codexrm/internal/securechannel"
 	"github.com/codexrm/codexrm/internal/store"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -29,6 +30,8 @@ type Config struct {
 	Addr, DataDir, WebDir, AdminToken, UpdateDir          string
 	ServerUpdateDir                                       string
 	PublicEnrollment                                      bool
+	TrustLoopbackWebProxy                                 bool
+	RequireSecureClients                                  bool
 	P2PSTUN, P2PNATSTUN, P2PVerifyListen, P2PVerifyPublic string
 	P2PVerifyMore, P2PVerifyKeyFile                       string
 	P2PTrustProxy, P2PLocalTest, P2PLAN                   bool
@@ -37,6 +40,7 @@ type peer struct {
 	id, agentID, clientID string
 	role                  protocol.Role
 	deviceType            string
+	secure                bool
 	token                 string
 	conn                  *websocket.Conn
 	send                  chan []byte
@@ -156,7 +160,7 @@ var assetVersionPattern = regexp.MustCompile(`^\d{8}-\d+$`)
 
 func staticResponseHeaders(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
-	versionedAsset := path == "/app.js" || path == "/styles.css" || path == "/dsh-theme.css" || path == "/pwa.js" || path == "/theme.js"
+	versionedAsset := path == "/app.js" || path == "/styles.css" || path == "/dsh-theme.css" || path == "/pwa.js" || path == "/theme.js" || path == "/secure-relay.js"
 	switch {
 	case strings.HasPrefix(path, "/api/"):
 		w.Header().Set("Cache-Control", "no-store")
@@ -182,18 +186,21 @@ func (s *Server) Handler() http.Handler {
 	pair := s.pair
 	enroll := rateLimit(enrollLimiter, s.enroll)
 	claim := rateLimit(claimLimiter, s.claim)
+	claimSecure := rateLimit(claimLimiter, s.claimSecureRoute)
 	if s.cfg.PublicEnrollment {
 		enrollmentBudget := newIPRateLimiter(90, 30)
 		persistenceBudget := newIPRateLimiter(240, 60)
 		enroll = rateLimitKey(enrollmentBudget, func(*http.Request) string { return "global" }, enroll)
 		pair = rateLimitKey(persistenceBudget, func(*http.Request) string { return "global" }, rateLimit(newIPRateLimiter(12, 6), pair))
 		claim = rateLimitKey(persistenceBudget, func(*http.Request) string { return "global" }, claim)
+		claimSecure = rateLimitKey(persistenceBudget, func(*http.Request) string { return "global" }, claimSecure)
 	}
 	mux.HandleFunc("GET /update.json", s.updateManifest)
 	mux.HandleFunc("GET /android-update.json", s.androidUpdateManifest)
 	mux.HandleFunc("GET /linux-update.json", s.linuxUpdateManifest)
 	mux.HandleFunc("GET /"+release.ServerManifestName, s.serverUpdateManifest)
 	mux.HandleFunc("GET /updates/{file}", s.updatePackage)
+	mux.HandleFunc("/updates/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, release.ServerHealth{
@@ -208,12 +215,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/agent/clients/{clientID}", s.deleteClient)
 	mux.HandleFunc("GET /api/v1/agent/ws", s.agentWS)
 	mux.HandleFunc("POST /api/v1/client/claim", claim)
+	mux.HandleFunc("POST /api/v2/client/route", claimSecure)
 	mux.HandleFunc("POST /api/v1/client/profile", s.clientProfile)
 	mux.HandleFunc("POST /api/v1/client/revoke", s.revoke)
 	mux.HandleFunc("GET /api/v1/client/ws", s.clientWS)
 	mux.HandleFunc("GET /api/v1/agents", s.list)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) { fail(w, 404, "API not found") })
-	mux.Handle("/", http.FileServer(http.Dir(s.cfg.WebDir)))
+	mux.Handle("/", s.webHandler())
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
@@ -322,7 +330,26 @@ func (s *Server) pair(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "unauthorized")
 		return
 	}
-	rec, err := s.store.StartPairing(a.AgentID, true)
+	var req protocol.PairStartRequest
+	// Old Agents have always sent JSON; legacy requests without a body still
+	// work for the isolated integration relay.
+	if r.Body != nil && r.Body != http.NoBody {
+		r.Body = http.MaxBytesReader(w, r.Body, 1024)
+		if err := readJSON(w, r, &req); err != nil {
+			fail(w, 400, "invalid pairing request")
+			return
+		}
+	}
+	if !req.Secure && s.cfg.RequireSecureClients {
+		fail(w, http.StatusUpgradeRequired, "secure pairing requires an updated Agent")
+		return
+	}
+	var rec *store.PairingRecord
+	if req.Secure {
+		rec, err = s.store.StartSecurePairing(a.AgentID)
+	} else {
+		rec, err = s.store.StartPairing(a.AgentID, true)
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrCapacity) {
 			fail(w, http.StatusTooManyRequests, err.Error())
@@ -347,6 +374,10 @@ func (s *Server) pairStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"claimed": claimed})
 }
 func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.RequireSecureClients {
+		fail(w, http.StatusUpgradeRequired, "secure pairing requires an updated client")
+		return
+	}
 	if s.cfg.PublicEnrollment {
 		r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	}
@@ -362,6 +393,31 @@ func (s *Server) claim(w http.ResponseWriter, r *http.Request) {
 		req.DeviceType = "browser"
 	}
 	c, a, err := s.store.ClaimPairing(req.Code, req.ClientName, req.DeviceType, clientIP(r))
+	writeClaimResult(w, c, a, err)
+}
+
+func (s *Server) claimSecureRoute(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	var req protocol.SecurePairClaimRequest
+	if readJSON(w, r, &req) != nil || !securechannel.ValidRoute(req.Route) {
+		fail(w, 400, "public pairing route required")
+		return
+	}
+	if req.ClientName == "" {
+		req.ClientName = "CodexRM"
+	}
+	if req.DeviceType == "" {
+		req.DeviceType = "browser"
+	}
+	if req.DeviceType == protocol.DeviceTypeRobot {
+		fail(w, 400, "unsupported secure client type")
+		return
+	}
+	c, a, err := s.store.ClaimSecureRoute(req.Route, req.ClientName, req.DeviceType, clientIP(r))
+	writeClaimResult(w, c, a, err)
+}
+
+func writeClaimResult(w http.ResponseWriter, c *store.ClientRecord, a *store.AgentRecord, err error) {
 	if err != nil {
 		status := 400
 		switch {
@@ -521,7 +577,7 @@ func (s *Server) agentWS(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.SetAgentAppVersion(a.AgentID, r.Header.Get(protocol.AppVersionHeader)); err != nil {
 		log.Printf("update agent version: %v", err)
 	}
-	s.upgrade(w, r, protocol.RoleAgent, a.AgentID, "", a.ExpiresAt, token, "")
+	s.upgrade(w, r, protocol.RoleAgent, a.AgentID, "", a.ExpiresAt, token, "", false)
 }
 func (s *Server) clientWS(w http.ResponseWriter, r *http.Request) {
 	token := bearer(r)
@@ -530,18 +586,22 @@ func (s *Server) clientWS(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "unauthorized")
 		return
 	}
+	if s.cfg.RequireSecureClients && !c.Secure {
+		fail(w, http.StatusUnauthorized, "re-pair with a secure code")
+		return
+	}
 	if s.beforeClientUpgrade != nil {
 		s.beforeClientUpgrade()
 	}
-	s.upgrade(w, r, protocol.RoleClient, c.AgentID, c.ClientID, c.ExpiresAt, token, c.DeviceType)
+	s.upgrade(w, r, protocol.RoleClient, c.AgentID, c.ClientID, c.ExpiresAt, token, c.DeviceType, c.Secure)
 }
-func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.Role, agentID, clientID string, expires time.Time, token, deviceType string) {
+func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, role protocol.Role, agentID, clientID string, expires time.Time, token, deviceType string, secure bool) {
 	up := websocket.Upgrader{CheckOrigin: sameOrigin, Subprotocols: []string{"codexrm"}}
 	conn, err := up.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, deviceType: deviceType, token: token, conn: conn, send: make(chan []byte, 256), closed: make(chan struct{}), expires: expires}
+	p := &peer{id: uuid.NewString(), role: role, agentID: agentID, clientID: clientID, deviceType: deviceType, secure: secure, token: token, conn: conn, send: make(chan []byte, 256), closed: make(chan struct{}), expires: expires}
 	p.ip = clientIP(r)
 	p.directIP = s.directIP(r)
 	s.mu.Lock()
@@ -742,7 +802,14 @@ func (s *Server) readPump(p *peer) {
 			s.handleDirect(p, env)
 			continue
 		}
+		if env.Type == protocol.TypeSecure {
+			s.forwardSecure(p, env)
+			continue
+		}
 		if p.role == protocol.RoleClient {
+			if p.secure {
+				continue
+			}
 			if env.Type != protocol.TypeClientMessage || !json.Valid(env.Message) {
 				s.send(p, protocol.Envelope{Type: protocol.TypeError, Error: "invalid RPC envelope"})
 				continue
@@ -789,12 +856,12 @@ func (s *Server) readPump(p *peer) {
 			}
 			list := []*peer{}
 			if env.ClientID != "" {
-				if c := s.clients[env.ClientID]; c != nil && c.agentID == p.agentID && !skip(c) {
+				if c := s.clients[env.ClientID]; c != nil && c.agentID == p.agentID && !c.secure && !skip(c) {
 					list = append(list, c)
 				}
 			} else {
 				for _, c := range s.byAgent[p.agentID] {
-					if c.deviceType == protocol.DeviceTypeRobot || skip(c) {
+					if c.secure || c.deviceType == protocol.DeviceTypeRobot || skip(c) {
 						continue
 					}
 					list = append(list, c)

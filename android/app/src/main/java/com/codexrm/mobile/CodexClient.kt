@@ -12,7 +12,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -80,6 +79,7 @@ internal class CodexClient(
     private var nextId = 0
     private var reconnectAttempt = 0
     private var reconnect: Runnable? = null
+    private var secureRelay: SecureRelay? = null
     private val welcomeTimeout = Runnable { scheduleReconnect() }
     private var direct: DirectTransport? = null
     private var directId = ""
@@ -191,6 +191,11 @@ internal class CodexClient(
 
     private fun open() {
         if (!active) return
+        if (device.secureKey.isEmpty() && device.serverUrl.startsWith("http://", ignoreCase = true)) {
+            stop()
+            listener.onAuthorizationExpired()
+            return
+        }
         reconnect = null
         directAvailable = false
         directRetry.reset()
@@ -198,12 +203,15 @@ internal class CodexClient(
         rejectPending("连接已中断")
         online = false
         val currentGeneration = ++generation
-        val url = device.serverUrl.trimEnd('/') + "/api/v1/client/ws"
-        val request = Request.Builder()
-            .url(url)
-            // The relay accepts the second value as credentials and negotiates "codexrm".
-            .header("Sec-WebSocket-Protocol", "codexrm, codexrm.token.${device.token}")
-            .build()
+        closeSecureRelay()
+        if (device.secureKey.isNotEmpty()) {
+            secureRelay = SecureRelay(device.clientId, device.secureKey,
+                write = { socket?.send(it) == true },
+                onReady = { handle(JSONObject().put("type", "welcome").put("status", "connected").toString(), authenticated = true) },
+                onMessage = { handle(it.toString(), authenticated = true) },
+                onFailure = { if (active && currentGeneration == generation) scheduleReconnect() })
+        }
+        val request = relaySocketRequest(device)
         socket = Network.webSocketClient.newWebSocket(request, object : WebSocketListener() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 main.post {
@@ -240,9 +248,13 @@ internal class CodexClient(
         main.postDelayed(welcomeTimeout, 15_000)
     }
 
-    private fun handle(text: String, onDirect: Boolean = false) {
+    private fun handle(text: String, onDirect: Boolean = false, authenticated: Boolean = false) {
         val envelope = try { JSONObject(text) } catch (_: Exception) { return }
         val type = envelope.string("type")
+        if (!onDirect && !authenticated && secureRelay != null && type != "p2p") {
+            secureRelay?.receive(envelope)
+            return
+        }
         if (onDirect && (!directActive || type != "server_message")) return
         when (type) {
             "welcome", "agent_status" -> {
@@ -539,14 +551,22 @@ internal class CodexClient(
                                 directNetworkHandle = message.string("network").toLongOrNull() ?: 0L
                             }
                             !directActive && message?.string("type") == "p2p" && outgoing?.string("id") == id -> {
-                                if (socket?.send(text) != true) dropDirect("无法通过 RM 交换直连信令。")
+                                if (device.secureKey.isNotEmpty() && outgoing.string("kind") == "offer") {
+                                    outgoing.put("pinMac", signedDirectPin(device, id, "client", outgoing.string("pin")))
+                                }
+                                if (socket?.send(message.toString()) != true) dropDirect("无法通过 RM 交换直连信令。")
                             }
                             directActive -> handle(text, onDirect = true)
                         }
                     }
                 }, { if (direct === transport) dropDirect(if (directActive) "QUIC 连接已断开。" else "手机端直连协商已结束。") })
             }
-            "offer", "ready" -> if (id == directId) direct?.signal(signal) ?: Unit
+            "offer" -> if (id == directId) {
+                if (device.secureKey.isNotEmpty() && !verifyDirectPin(device, id, signal)) {
+                    dropDirect("??????????")
+                } else direct?.signal(signal) ?: Unit
+            }
+            "ready" -> if (id == directId) direct?.signal(signal) ?: Unit
             "active" -> if (id == directId && direct != null && !directActive) {
                 directLease = SystemClock.elapsedRealtime() + 12_000
                 directActive = true
@@ -618,7 +638,7 @@ internal class CodexClient(
     }
 
     private fun sendBusiness(text: String, onDirect: Boolean): Boolean {
-        if (!onDirect) return socket?.send(text) == true
+        if (!onDirect) return secureRelay?.send(text) ?: (device.secureKey.isEmpty() && socket?.send(text) == true)
         val transport = direct
         if (transport?.send(text) == true) return true
         main.post { if (directActive && direct === transport) dropDirect("QUIC 无法发送数据。") }
@@ -719,6 +739,11 @@ internal class CodexClient(
         return sent
     }
 
+    private fun closeSecureRelay() {
+        secureRelay?.close()
+        secureRelay = null
+    }
+
     private fun scheduleReconnect(networkRestored: Boolean = false) {
         if (!active) return
         main.removeCallbacks(welcomeTimeout)
@@ -726,6 +751,7 @@ internal class CodexClient(
         dropDirect()
         resetDirectStatus()
         generation++
+        closeSecureRelay()
         socket?.cancel()
         socket = null
         rejectPending("服务器连接中断")
@@ -770,6 +796,7 @@ internal class CodexClient(
         reconnect = null
         rejectPending("连接已关闭")
         finishNAT("连接已关闭。")
+        closeSecureRelay()
         socket?.close(1000, "Activity stopped")
         socket = null
     }

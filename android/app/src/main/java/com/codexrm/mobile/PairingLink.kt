@@ -29,7 +29,7 @@ internal object PairingLink {
                 val code = parameter(uri.rawQuery, "code")
                     ?: parameter(uri.rawQuery, "pair")
                     ?: throw IllegalArgumentException("链接中没有配对码")
-                PairingData(normalizeServer(fallbackServer), code)
+                PairingData(normalizeServer(parameter(uri.rawQuery, "server") ?: fallbackServer), code)
             }
             else -> throw IllegalArgumentException("仅支持 http(s) 配对链接")
         }

@@ -220,7 +220,7 @@ func main() {
 		}
 		return
 	}
-	base := agent.Config{AllowFileManagement: cfg.AllowFileManagement, ServerURL: cfg.Server, EnrollmentKey: cfg.EnrollmentKey, AppServerURL: *appServer, AppServerToken: *appToken, Name: *name, DataDir: *dataDir, Mock: *mock, MockAddr: *mockAddr, CodexPath: cfg.CodexPath, Cwd: cfg.Workspace, CCSwitchDB: *ccswitchDB}
+	base := agent.Config{SecureRelay: true, AllowFileManagement: cfg.AllowFileManagement, ServerURL: cfg.Server, EnrollmentKey: cfg.EnrollmentKey, AppServerURL: *appServer, AppServerToken: *appToken, Name: *name, DataDir: *dataDir, Mock: *mock, MockAddr: *mockAddr, CodexPath: cfg.CodexPath, Cwd: cfg.Workspace, CCSwitchDB: *ccswitchDB}
 	if *sendToPhone != "" {
 		if err := sendSelectedFile(base, *sendToPhone); err != nil {
 			log.Print(err)

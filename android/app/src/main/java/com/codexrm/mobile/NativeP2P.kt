@@ -8,6 +8,10 @@ internal object NativeP2P {
         false
     }
 
+    external fun secureOpen(config: ByteArray): Long
+    external fun secureCall(handle: Long, action: Int, input: ByteArray): ByteArray?
+    external fun secureClose(handle: Long)
+
     external fun open(start: ByteArray): Long
     external fun poll(handle: Long): ByteArray?
     external fun signal(handle: Long, signal: ByteArray)

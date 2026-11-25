@@ -37,6 +37,7 @@ type AgentRecord struct {
 }
 
 type ClientRecord struct {
+	Secure          bool      `json:"secure,omitempty"`
 	ClientID        string    `json:"clientId"`
 	Token           string    `json:"token"`
 	EnvironmentID   string    `json:"environmentId"`
@@ -403,6 +404,15 @@ func (s *Store) ListAgents() []protocol.AgentInfo {
 }
 
 func (s *Store) StartPairing(agentID string, manual bool) (*PairingRecord, error) {
+	return s.startPairing(agentID, manual, "pair_")
+}
+
+// StartSecurePairing allocates an opaque route; the invitation secret stays on the Agent.
+func (s *Store) StartSecurePairing(agentID string) (*PairingRecord, error) {
+	return s.startPairing(agentID, false, "route_")
+}
+
+func (s *Store) startPairing(agentID string, manual bool, prefix string) (*PairingRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.agents[agentID]
@@ -411,7 +421,7 @@ func (s *Store) StartPairing(agentID string, manual bool) (*PairingRecord, error
 	}
 	now := time.Now().UTC()
 	rec := &PairingRecord{
-		PairingCode:   "pair_" + uuid.NewString(),
+		PairingCode:   prefix + uuid.NewString(),
 		EnvironmentID: a.EnvironmentID,
 		AgentID:       agentID,
 		ExpiresAt:     now.Add(10 * time.Minute),
@@ -448,11 +458,19 @@ func (s *Store) StartPairing(agentID string, manual bool) (*PairingRecord, error
 }
 
 func (s *Store) ClaimPairing(code, clientName, deviceType string, ip ...string) (*ClientRecord, *AgentRecord, error) {
+	return s.claimPairing(code, clientName, deviceType, false, ip...)
+}
+
+func (s *Store) ClaimSecureRoute(route, clientName, deviceType, ip string) (*ClientRecord, *AgentRecord, error) {
+	return s.claimPairing(route, clientName, deviceType, true, ip)
+}
+
+func (s *Store) claimPairing(code, clientName, deviceType string, secure bool, ip ...string) (*ClientRecord, *AgentRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
 	rec, ok := s.findPairingLocked(code)
-	if !ok {
+	if !ok || strings.HasPrefix(rec.PairingCode, "route_") != secure {
 		return nil, nil, ErrNotFound
 	}
 	if rec.Claimed {
@@ -471,6 +489,7 @@ func (s *Store) ClaimPairing(code, clientName, deviceType string, ip ...string) 
 	claimed := *rec
 	claimed.Claimed = true
 	client := &ClientRecord{
+		Secure:          secure,
 		ClientID:        "cli_" + uuid.NewString(),
 		Token:           randomToken(),
 		EnvironmentID:   rec.EnvironmentID,

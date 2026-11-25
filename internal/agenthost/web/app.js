@@ -181,9 +181,15 @@ $("pair").addEventListener("click", () => action($("pair"), async () => {
   const data = await api("/api/pair", { method: "POST" });
   pairingExpiresAt = Number(data.expiresAt) * 1000;
   $("pair-code").textContent = data.code;
-  $("pair-link").href = data.url;
-  $("pair-link").textContent = "打开远程网页 ↗";
-  $("pair-link").removeAttribute("aria-disabled");
+  if (data.url) {
+    $("pair-link").href = data.url;
+    $("pair-link").textContent = "打开远程网页 ↗";
+    $("pair-link").removeAttribute("aria-disabled");
+  } else {
+    $("pair-link").removeAttribute("href");
+    $("pair-link").textContent = "如需使用网页控制需要使用https";
+    $("pair-link").setAttribute("aria-disabled", "true");
+  }
   $("qr").src = data.qr;
   $("qr").alt = "扫描二维码配对";
   $("qr").hidden = false;

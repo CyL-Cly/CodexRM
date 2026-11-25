@@ -12,6 +12,7 @@ import (
 	"github.com/codexrm/codexrm/internal/desktop"
 	"github.com/codexrm/codexrm/internal/p2p"
 	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/codexrm/codexrm/internal/securechannel"
 	"github.com/gorilla/websocket"
 )
 
@@ -30,6 +31,7 @@ type directSession struct {
 	cancel          context.CancelFunc
 	offer           chan protocol.P2PSignal
 	ready, activate chan struct{}
+	secureKey       *securechannel.Key
 	out             chan []byte
 	files           directFiles
 	phoneFiles      directFiles
@@ -94,12 +96,21 @@ func (q *relayEventQueue) enqueue(env protocol.Envelope) {
 }
 
 func (a *Agent) writeRelayEvents(ctx context.Context, queue *relayEventQueue) {
+	a.writeEncryptedRelayEvents(ctx, queue, nil)
+}
+
+func (a *Agent) writeEncryptedRelayEvents(ctx context.Context, queue *relayEventQueue, secured *encryptedRelay) {
 	for ctx.Err() == nil {
 		select {
 		case <-ctx.Done():
 			return
 		case frame := <-queue.frames:
-			err := a.writeRelayFrame(queue.conn, frame)
+			var err error
+			if secured != nil {
+				secured.publish(frame)
+			} else {
+				err = a.writeRelayFrame(queue.conn, frame)
+			}
 			queue.bytes.Add(-int64(len(frame)))
 			if err != nil {
 				return
@@ -136,6 +147,10 @@ func (a *Agent) publishEvent(env protocol.Envelope) {
 }
 
 func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *websocket.Conn, slots chan struct{}, env protocol.Envelope) {
+	a.directSignalWithKey(ctx, app, conn, slots, env, nil)
+}
+
+func (a *Agent) directSignalWithKey(ctx context.Context, app *appserver.Client, conn *websocket.Conn, slots chan struct{}, env protocol.Envelope, key *securechannel.Key) {
 	sig := env.P2P
 	if sig == nil || sig.Version != protocol.P2PVersion {
 		return
@@ -194,7 +209,7 @@ func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *w
 			return
 		}
 		life, cancel := context.WithCancel(ctx)
-		d = &directSession{id: sig.ID, client: env.ClientID, ctx: life, cancel: cancel, offer: make(chan protocol.P2PSignal, 1), ready: make(chan struct{}, 1), activate: make(chan struct{}, 1), out: make(chan []byte, 8)}
+		d = &directSession{id: sig.ID, client: env.ClientID, secureKey: key, ctx: life, cancel: cancel, offer: make(chan protocol.P2PSignal, 1), ready: make(chan struct{}, 1), activate: make(chan struct{}, 1), out: make(chan []byte, 8)}
 		if a.direct == nil {
 			a.direct = map[string]*directSession{}
 		}
@@ -207,6 +222,10 @@ func (a *Agent) directSignal(ctx context.Context, app *appserver.Client, conn *w
 	}
 	switch sig.Kind {
 	case protocol.P2PKindOffer:
+		if d.secureKey != nil && !securechannel.VerifyDirectPin(*d.secureKey, d.client, d.id, "client", sig.Pin, sig.PinMAC) {
+			d.cancel()
+			return
+		}
 		select {
 		case d.offer <- *sig:
 		default:
@@ -261,6 +280,9 @@ func (a *Agent) runDirect(app *appserver.Client, conn *websocket.Conn, slots cha
 	}
 	defer prepared.Close()
 	log.Printf("p2p prepare state=%s candidates=%d", prepared.State(), len(offer.Candidates))
+	if d.secureKey != nil {
+		offer.PinMAC = securechannel.SignDirectPin(*d.secureKey, d.client, d.id, "agent", offer.Pin)
+	}
 	if signal(offer) != nil {
 		return
 	}

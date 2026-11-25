@@ -1113,6 +1113,7 @@ function disconnectSocket({ preservePairingExpired = false } = {}) {
   state.pingID = null;
   if (!preservePairingExpired) state.pairingExpired = false;
   connectionNotice();
+  state.secureRelay = null;
   if (state.socket) {
     state.socket.onclose = null;
     state.socket.close();
@@ -1133,6 +1134,11 @@ function disconnectSocket({ preservePairingExpired = false } = {}) {
   state.responding.clear();
   renderApprovals();
 }
+function sendRelayRPC(envelope) {
+  if (currentDevice()?.secureKey) return state.secureRelay?.send(envelope) === true;
+  state.socket.send(JSON.stringify(envelope));
+  return true;
+}
 function rpc(method, params = {}, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     if (!state.online || state.socket?.readyState !== WebSocket.OPEN) {
@@ -1147,13 +1153,11 @@ function rpc(method, params = {}, timeoutMs = 120000) {
       reject(error);
     }, timeoutMs);
     state.pending.set(id, { resolve, reject, timer });
-    state.socket.send(
-      JSON.stringify({
-        type: "client_message",
-        streamId: String(id),
-        message: { id, method, params },
-      }),
-    );
+    if (!sendRelayRPC({ type: "client_message", streamId: String(id), message: { id, method, params } })) {
+      clearTimeout(timer);
+      state.pending.delete(id);
+      reject(new Error("???????"));
+    }
   });
 }
 function sendResponse(id, result, error) {
@@ -1161,13 +1165,7 @@ function sendResponse(id, result, error) {
     toast("连接已断开，恢复后可继续审批");
     return false;
   }
-  state.socket.send(
-    JSON.stringify({
-      type: "client_message",
-      message: { id, ...(error ? { error } : { result }) },
-    }),
-  );
-  return true;
+  return sendRelayRPC({ type: "client_message", message: { id, ...(error ? { error } : { result }) } });
 }
 function pingSocket() {
   const socket = state.socket;
@@ -1207,6 +1205,12 @@ function handleVisibilityChange() {
   state.backgroundSuspended = false;
   resumeConnection();
 }
+function clientSocketURL() {
+  const url = new URL("/api/v1/client/ws", location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  return url;
+}
+const secureRelayModule = () => import("./secure-relay.js?v=20261125-2");
 function connect({ reconnect = false } = {}) {
   if (state.backgroundSuspended && document.visibilityState === "hidden") return;
   state.backgroundSuspended = false;
@@ -1217,9 +1221,7 @@ function connect({ reconnect = false } = {}) {
   renderConnection();
   if (!device) return;
   const generation = state.generation;
-  const url = new URL("/api/v1/client/ws", location.href);
-  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(url, [
+  const socket = new WebSocket(clientSocketURL(), [
     "codexrm",
     `codexrm.token.${device.token}`,
   ]);
@@ -1232,14 +1234,9 @@ function connect({ reconnect = false } = {}) {
     state.pingTimer = setInterval(pingSocket, 25000);
     void syncClientProfile(device).catch(() => {});
   };
-  socket.onmessage = (event) => {
-    if (generation !== state.generation) return;
-    let envelope;
-    try {
-      envelope = JSON.parse(event.data);
-    } catch {
-      return;
-    }
+  const isCurrent = () => generation === state.generation && socket === state.socket && socket.readyState === WebSocket.OPEN;
+  const onEnvelope = envelope => {
+    if (!isCurrent()) return;
     if (envelope.type === "welcome" || envelope.type === "agent_status") {
       state.fileTransferDirectOnly = envelope.fileTransferDirectOnly === true;
       clearTimeout(state.connectionTimer);
@@ -1293,6 +1290,23 @@ function connect({ reconnect = false } = {}) {
         p.reject(new Error(envelope.error));
       } else toast(envelope.error);
     }
+  };
+  const secure = device.secureKey ? secureRelayModule().then(({ connectSecure }) => {
+    const channel = connectSecure(socket, device.clientId, device.secureKey, {
+      onReady: () => onEnvelope({ type: "welcome", status: "connected", fileTransferDirectOnly: true }),
+      onMessage: onEnvelope,
+      onFailure: () => { if (isCurrent()) socket.close(); },
+    });
+    if (isCurrent()) state.secureRelay = channel;
+    return channel;
+  }) : null;
+  secure?.catch(() => { if (isCurrent()) socket.close(); });
+  socket.onmessage = event => {
+    if (!isCurrent()) return;
+    let envelope;
+    try { envelope = JSON.parse(event.data); } catch { return; }
+    if (!secure || envelope.type === "pong") onEnvelope(envelope);
+    else void secure.then(channel => { if (isCurrent()) channel.consume(envelope); }).catch(() => {});
   };
   socket.onclose = async () => {
     if (generation !== state.generation) return;
@@ -4025,10 +4039,16 @@ $("pair-form").onsubmit = async (event) => {
   $("pair-submit").textContent = "正在连接…";
   $("pair-error").textContent = "";
   try {
-    const result = await api("/api/v1/client/claim", {
-      code: $("pair-code").value.trim(),
-      ...browserClientProfile(),
-    });
+    const { parsePairingCode, verifyPairing } = await secureRelayModule();
+    const invitation = parsePairingCode($("pair-code").value.trim());
+    const result = await api("/api/v2/client/route", { route: invitation.route, ...browserClientProfile() });
+    try {
+      result.secureKey = await verifyPairing(clientSocketURL(), result, invitation);
+    } catch (error) {
+      void api("/api/v1/client/revoke", {}, result.token).catch(() => {});
+      throw error;
+    }
+    $("pair-code").value = "";
     const old = state.devices.find(
       (d) => d.agent.agentId === result.agent.agentId,
     );

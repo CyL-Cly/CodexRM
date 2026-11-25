@@ -89,6 +89,7 @@ type P2PSignal struct {
 	MultiPath    bool                      `json:"multiPath,omitempty"`    // RM accepts verifier receipts from multiple sockets.
 	LAN          bool                      `json:"lan,omitempty"`
 	Local        []string                  `json:"local,omitempty"`
+	PinMAC       string                    `json:"pinMac,omitempty"`
 	Pin          string                    `json:"pin,omitempty"`
 	Clients      []string                  `json:"clients,omitempty"`
 	VerifyUDP    string                    `json:"verifyUdp,omitempty"`

@@ -24,7 +24,7 @@ func TestPairingInstructionsIncludeScannableLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output, "https://rm.example/base/#pair=ABCD-EFGH") || !strings.Contains(output, "Scan to pair") {
+	if !strings.Contains(output, "https://rm.example/base/#pair=ABCD-EFGH") || !strings.Contains(output, "Scan with the CodexRM app") {
 		t.Fatalf("incomplete pairing instructions: %s", output)
 	}
 }

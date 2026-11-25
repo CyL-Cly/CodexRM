@@ -42,6 +42,7 @@ abstract class BuildDirectLibraries @Inject constructor(private val exec: ExecOp
 }
 
 val p2pQa = project.hasProperty("codexrm.p2pQa")
+val secureRelayQa = project.hasProperty("codexrm.secureRelayQa")
 val fileTransferQa = project.hasProperty("codexrm.fileTransferQa")
 
 android {
@@ -53,7 +54,7 @@ android {
 
     val imageQa = project.hasProperty("codexrm.imageQa")
     val mathQa = project.hasProperty("codexrm.mathQa")
-    require(listOf(imageQa, mathQa, p2pQa, fileTransferQa).count { it } <= 1) { "Choose only one CodexRM QA variant" }
+    require(listOf(imageQa, mathQa, p2pQa, fileTransferQa, secureRelayQa).count { it } <= 1) { "Choose only one CodexRM QA variant" }
 
     defaultConfig {
         applicationId = "com.codexrm.mobile"
@@ -62,7 +63,7 @@ android {
         ndk { abiFilters.add("arm64-v8a") }
         versionCode = 60
         versionName = "1.6.9"
-        testInstrumentationRunner = if (p2pQa || fileTransferQa) {
+        testInstrumentationRunner = if (p2pQa || fileTransferQa || secureRelayQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {
             "com.codexrm.mobile.MathRenderingInstrumentation"
@@ -82,6 +83,7 @@ android {
             if (imageQa) applicationIdSuffix = ".imageqa"
             if (mathQa) applicationIdSuffix = ".mathqa"
             if (p2pQa) applicationIdSuffix = ".p2pqa"
+            if (secureRelayQa) applicationIdSuffix = ".securerelayqa"
             if (fileTransferQa) applicationIdSuffix = ".filetransferqa"
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -93,6 +95,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
+            if (secureRelayQa) applicationIdSuffix = ".securerelayqa"
             if (imageQa) applicationIdSuffix = ".imageqa"
             if (mathQa) applicationIdSuffix = ".mathqa"
             if (p2pQa) applicationIdSuffix = ".p2pqa"
@@ -138,7 +141,8 @@ androidComponents {
         ndk.set(sdkComponents.ndkDirectory)
         repo.set(repoDir)
         sources.from(repoDir.files("go.mod", "go.sum"),
-            repoDir.dir("cmd/codexrm-android-p2p"), repoDir.dir("internal/p2p"), repoDir.dir("internal/protocol"))
+            repoDir.dir("cmd/codexrm-android-p2p"), repoDir.dir("internal/p2p"), repoDir.dir("internal/protocol"),
+            repoDir.dir("internal/securechannel"))
         destination.set(layout.buildDirectory.dir("generated/direct-libs/arm64-v8a"))
     }
     onVariants { variant ->

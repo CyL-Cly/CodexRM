@@ -95,3 +95,31 @@ JNIEXPORT jbyteArray JNICALL Java_com_codexrm_mobile_NativeP2P_diagnoseNat(JNIEn
     free(result);
     return out;
 }
+
+// The Kotlin owner serializes all access to the Noise state on the main thread.
+JNIEXPORT jlong JNICALL Java_com_codexrm_mobile_NativeP2P_secureOpen(JNIEnv *env, jobject self, jbyteArray data) {
+    jsize size = (*env)->GetArrayLength(env, data);
+    jbyte raw[512];
+    if (size <= 0 || size > sizeof(raw)) return 0;
+    (*env)->GetByteArrayRegion(env, data, 0, size, raw);
+    if ((*env)->ExceptionCheck(env)) return 0;
+    return CRMSecureOpen(raw, size);
+}
+
+JNIEXPORT jbyteArray JNICALL Java_com_codexrm_mobile_NativeP2P_secureCall(JNIEnv *env, jobject self, jlong handle, jint action, jbyteArray data) {
+    jsize size = (*env)->GetArrayLength(env, data);
+    jbyte *input = size ? (*env)->GetByteArrayElements(env, data, NULL) : NULL;
+    if (size && !input) return NULL;
+    int length = 0;
+    void *result = CRMSecureCall(handle, action, input, size, &length);
+    if (input) (*env)->ReleaseByteArrayElements(env, data, input, JNI_ABORT);
+    if (!result) return NULL;
+    jbyteArray output = (*env)->NewByteArray(env, length);
+    if (output && length) (*env)->SetByteArrayRegion(env, output, 0, length, result);
+    free(result);
+    return output;
+}
+
+JNIEXPORT void JNICALL Java_com_codexrm_mobile_NativeP2P_secureClose(JNIEnv *env, jobject self, jlong handle) {
+    CRMSecureClose(handle);
+}

@@ -312,6 +312,13 @@ func (s *Server) handleDirect(p *peer, env protocol.Envelope) {
 			return
 		}
 		forward.Pin = sig.Pin
+		if client.secure {
+			if len(sig.PinMAC) != 44 {
+				s.stopDirectWithReason(client, "invalid_offer")
+				return
+			}
+			forward.PinMAC = sig.PinMAC
+		}
 		forward.Mapping, forward.Step = protocol.NormalizeMapping(sig.Mapping, sig.Step)
 		ticket := pair.clientTicket
 		if p == agent {

@@ -65,6 +65,7 @@ type EnrollResponse struct {
 // PairStartRequest asks the server to create a short-lived pairing code.
 type PairStartRequest struct {
 	ManualCode bool `json:"manualCode"`
+	Secure     bool `json:"secure,omitempty"`
 }
 
 // PairStartResponse is returned to the agent / admin UI.
@@ -73,6 +74,12 @@ type PairStartResponse struct {
 	ManualPairingCode string `json:"manualPairingCode,omitempty"`
 	EnvironmentID     string `json:"environmentId"`
 	ExpiresAt         int64  `json:"expiresAt"`
+}
+
+type SecurePairClaimRequest struct {
+	Route      string `json:"route"`
+	ClientName string `json:"clientName,omitempty"`
+	DeviceType string `json:"deviceType,omitempty"`
 }
 
 // PairClaimRequest is used by a web client to claim an agent.
@@ -124,7 +131,8 @@ type Envelope struct {
 	FileTransferDirectOnly bool            `json:"fileTransferDirectOnly,omitempty"`
 	SkipDirect             []string        `json:"skipDirect,omitempty"`
 	// ClientKind is assigned by the relay. Clients cannot choose it.
-	ClientKind string `json:"clientKind,omitempty"`
+	ClientKind string       `json:"clientKind,omitempty"`
+	Secure     *SecureFrame `json:"secure,omitempty"`
 }
 
 const (
@@ -136,6 +144,7 @@ const (
 	TypeError         = "error"
 	TypeHello         = "hello"
 	TypeWelcome       = "welcome"
+	TypeSecure        = "secure"
 )
 
 // JSONRPCMessage is a loosely typed JSON-RPC 2.0 object.

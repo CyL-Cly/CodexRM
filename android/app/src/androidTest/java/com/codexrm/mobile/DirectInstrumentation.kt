@@ -30,7 +30,13 @@ class DirectInstrumentation : Instrumentation() {
         val result = Bundle()
         var activity: Activity? = null
         try {
-            check(targetContext.packageName.endsWith(".p2pqa") || targetContext.packageName.endsWith(".filetransferqa"))
+            check(targetContext.packageName.endsWith(".p2pqa") || targetContext.packageName.endsWith(".filetransferqa") ||
+                targetContext.packageName.endsWith(".securerelayqa"))
+            if (args.getString("secureRelay") == "true") {
+                result.putString("stream", "\n" + SecureRelayCheck.run(this, args) + "\n")
+                finish(Activity.RESULT_OK, result)
+                return
+            }
             if (args.getString("conversation") == "true") {
                 result.putString("stream", "\n" + ConversationFeaturesCheck.run(this, args) + "\n")
                 finish(Activity.RESULT_OK, result)

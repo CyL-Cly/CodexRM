@@ -13,10 +13,12 @@ internal data class Device(
     var appVersion: String = "",
     var online: Boolean = false,
     var pendingAgentUpdateFrom: String = "",
+    val secureKey: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("clientId", clientId)
         .put("token", token)
+        .put("secureKey", secureKey.takeIf { it.isNotEmpty() })
         .put("serverUrl", serverUrl)
         .put("agentId", agentId)
         .put("serverName", serverName)
@@ -40,6 +42,7 @@ internal data class Device(
             os = value.string("os"),
             appVersion = value.string("appVersion"),
             pendingAgentUpdateFrom = value.string("pendingAgentUpdateFrom"),
+            secureKey = value.string("secureKey"),
         )
 
         fun fromClaim(serverUrl: String, value: JSONObject): Device {

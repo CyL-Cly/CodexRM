@@ -121,7 +121,7 @@ function createHarness() {
   };
 }
 
-const VERSION = "20261125-1";
+const VERSION = "20261125-2";
 const SHELL = `codexrm-shell-${VERSION}`;
 const PAGES = `codexrm-pages-${VERSION}`;
 const RUNTIME = `codexrm-runtime-${VERSION}`;
@@ -157,7 +157,7 @@ test("install precaches the shell, waits safely and activation removes only old 
   harness.cache("codexrm-shell-0.5.1");
   harness.cache("unrelated-application");
   await harness.lifecycle("install");
-  assert.equal((await harness.cache(SHELL).keys()).length, 11);
+  assert.equal((await harness.cache(SHELL).keys()).length, 12);
   assert.equal(harness.worker.skipped, false);
   await harness.lifecycle("activate");
   assert.deepEqual([...harness.stores.keys()].sort(), [SHELL, "unrelated-application"].sort());
