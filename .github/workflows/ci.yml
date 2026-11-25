@@ -111,6 +111,7 @@ jobs:
     if: needs.select-commit.outputs.sha != ''
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    environment: android-release-signing
     env:
       TAG: ${{ needs.select-commit.outputs.tag }}
     steps:
@@ -160,38 +161,15 @@ jobs:
           fi
           tar -czf "nightly-dist/CodexRM-$TAG-linux-amd64-server.tar.gz" -C "$server" .
 
-      - name: Check Android signing configuration
-        id: android-signing
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
-        run: |
-          if [[ -z "$KEYSTORE_BASE64" && -z "$KEYSTORE_PASSWORD" ]]; then
-            if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-              echo '::error::Manual Nightly requires Android release signing secrets.'
-              exit 1
-            fi
-            echo '::warning::Android signing secrets are not configured. No APK will be uploaded.'
-            echo 'enabled=false' >> "$GITHUB_OUTPUT"
-          elif [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" ]]; then
-            echo '::error::Configure both Android signing secrets, or remove both to skip Android.'
-            exit 1
-          else
-            echo 'enabled=true' >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/setup-java@v6.3.0
-        if: steps.android-signing.outputs.enabled == 'true'
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
 
       - uses: android-actions/setup-android@v4.0.4
-        if: steps.android-signing.outputs.enabled == 'true'
 
       - name: Build Android arm64-v8a Release
-        if: steps.android-signing.outputs.enabled == 'true'
         run: |
           # Android 17 and newer SDK packages use major.minor IDs.
           sdk=$(awk '$1 == "compileSdk" && $2 == "=" {print $3}' android/app/build.gradle.kts)
@@ -201,25 +179,39 @@ jobs:
           sdkmanager --install "platforms;android-$sdk" "ndk;$ndk" "build-tools;36.0.0"
           (cd android && bash gradlew --no-daemon :app:assembleRelease)
 
+      # The private repository holds only encrypted signing material. Pin the
+      # revision and do not persist the read-only deploy key on the runner.
+      - name: Fetch the encrypted Android signing keystore
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: CyL-Cly/CodexRM-signing
+          ref: 44ba7d772bc3a65992df3b4cd6ba68016590789d
+          ssh-key: ${{ secrets.ANDROID_SIGNING_REPO_SSH_KEY }}
+          ssh-strict: true
+          persist-credentials: false
+          path: .ci-android-signing
+
       - name: Sign and verify Android Release APK
-        if: steps.android-signing.outputs.enabled == 'true'
         shell: bash
         env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
           # Public certificate fingerprint from the already distributed CodexRM APK.
           EXPECTED_SIGNER: a8b22ad8ba654a4b511c3464181913126ac92206ce88887e0fada7fcd481be61
         run: |
           umask 077
           scratch=$(mktemp -d "$RUNNER_TEMP/codexrm-android-signing.XXXXXXXX")
-          trap 'rm -rf -- "$scratch"' EXIT
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$scratch/release.keystore"
-          unset KEYSTORE_BASE64
+          keystore=.ci-android-signing/android-release.p12
+          trap 'rm -f -- "$keystore"; rm -rf -- "$scratch"' EXIT
+          if [[ ! -s "$keystore" || -z "$KEYSTORE_PASSWORD" ]]; then
+            echo '::error::The encrypted Android keystore or its password is missing.'
+            exit 1
+          fi
           apksigner="$ANDROID_HOME/build-tools/36.0.0/apksigner"
           apk="CodexRM-$TAG-android-arm64-v8a-release.apk"
-          "$apksigner" sign --ks "$scratch/release.keystore" --ks-key-alias androiddebugkey \
+          "$apksigner" sign --ks "$keystore" --ks-type PKCS12 --ks-key-alias codexrm-release \
             --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEYSTORE_PASSWORD \
-            --out "$scratch/$apk" android/app/build/outputs/apk/release/app-release-unsigned.apk
+            --v4-signing-enabled false --out "$scratch/$apk" \
+            android/app/build/outputs/apk/release/app-release-unsigned.apk
           unset KEYSTORE_PASSWORD
           certificates=$("$apksigner" verify --print-certs "$scratch/$apk")
           actual=$(awk '/^Signer #[0-9]+ certificate SHA-256 digest:/ {print $NF}' <<< "$certificates")
@@ -264,15 +256,12 @@ jobs:
             "CodexRM-$TAG-linux-amd64-server.tar.gz"
           )
           apk="CodexRM-$TAG-android-arm64-v8a-release.apk"
-          android_note='Android APK omitted: release signing is not configured.'
-          if [[ -f "$apk" ]]; then
-            assets+=("$apk")
-            android_note='The Android arm64-v8a APK is signed and can be installed directly.'
-          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+          if [[ ! -s "$apk" ]]; then
             echo '::error::The required signed Android APK is missing; release not published.'
             exit 1
           fi
-          notes="Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation. $android_note"
+          assets+=("$apk")
+          notes="Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation. The Android arm64-v8a APK is signed and can be installed directly."
           sha256sum "${assets[@]}" > SHA256SUMS.txt
           assets+=(SHA256SUMS.txt)
           if existing=$(gh release view "$TAG" --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv'); then
