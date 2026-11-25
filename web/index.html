@@ -13,15 +13,15 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="CodexRM" />
     <title>CodexRM · 远程工作区</title>
-    <link rel="icon" href="/icons/icon.svg?v=20261124-2" type="image/svg+xml" />
-    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261124-2" />
-    <link rel="manifest" href="/manifest.webmanifest?v=20261124-2" />
-    <link rel="modulepreload" href="/app.js?v=20261124-2" />
-    <script src="/theme.js?v=20261124-2"></script>
-    <link rel="stylesheet" href="/dsh-theme.css?v=20261124-2" />
-    <link rel="stylesheet" href="/styles.css?v=20261124-2" />
-    <script src="/pwa.js?v=20261124-2" defer></script>
-    <script src="/app.js?v=20261124-2" type="module"></script>
+    <link rel="icon" href="/icons/icon.svg?v=20261125-1" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.png?v=20261125-1" />
+    <link rel="manifest" href="/manifest.webmanifest?v=20261125-1" />
+    <link rel="modulepreload" href="/app.js?v=20261125-1" />
+    <script src="/theme.js?v=20261125-1"></script>
+    <link rel="stylesheet" href="/dsh-theme.css?v=20261125-1" />
+    <link rel="stylesheet" href="/styles.css?v=20261125-1" />
+    <script src="/pwa.js?v=20261125-1" defer></script>
+    <script src="/app.js?v=20261125-1" type="module"></script>
   </head>
   <body>
     <div id="app">
@@ -175,12 +175,14 @@
               ><span id="connection-label">连接设备</span
               ><span data-icon="chevron"></span></button
             ><button
-              id="install-app"
+              id="android-download"
               class="icon-button"
-              aria-label="安装 CodexRM 应用"
-              title="安装 CodexRM 应用"
+              type="button"
+              aria-label="下载 Android 客户端"
+              title="下载 Android 客户端"
+              aria-haspopup="dialog"
+              aria-controls="android-download-dialog"
               data-icon="download"
-              hidden
             ></button
             ><button
               id="theme-toggle"
@@ -322,6 +324,14 @@
       <button id="device-pair" class="secondary-button device-pair" type="button">
         <span data-icon="plus"></span>连接新设备
       </button>
+    </dialog>
+    <dialog id="android-download-dialog" class="dialog" aria-labelledby="android-download-title" aria-describedby="android-download-description">
+      <div class="dialog-header">
+        <h2 id="android-download-title">下载 Android 客户端</h2>
+        <button type="button" class="icon-button" data-close="android-download-dialog" aria-label="关闭" data-icon="close"></button>
+      </div>
+      <p id="android-download-description">在 GitHub 发布页打开带 Android 安装包的 Nightly 预发布，展开 Assets，下载已签名的 Android ARM64 APK（文件名以 <code>android-arm64-v8a-release.apk</code> 结尾）。安装后，扫描电脑 Agent 的配对二维码即可连接。</p>
+      <a class="primary-button android-download-link" href="https://github.com/CyL-Cly/CodexRM/releases" target="_blank" rel="noopener noreferrer">前往 GitHub Releases 下载（新标签页）</a>
     </dialog>
     <dialog id="pair-dialog" class="dialog" aria-labelledby="pair-dialog-title">
       <form id="pair-form">

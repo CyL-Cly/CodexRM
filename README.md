@@ -1,15 +1,13 @@
 # CodexRM
 
-自托管的 Codex 远程工作区。电脑上的 Go Agent 启动本地 Codex，通过出站 WebSocket 连接 Go 服务器；浏览器完成配对后即可远程操作。响应式 Web 界面支持深浅主题、手机布局和可安装的 PWA。
+**用 Android 手机远程操作电脑上的 Codex。** 扫码配对后，可以在手机上切换工作区、继续已有会话、发起任务、查看进度和处理审批。代码、命令和 Codex 都在 Windows 或 Linux 电脑上运行；手机不需要安装 Codex，也不是在远程操控整个桌面。Web 是免安装的备用入口，中继可自行部署。
+
+**[下载 Android 客户端](https://github.com/CyL-Cly/CodexRM/releases)** · [下载 Windows / Linux Agent 与 Server](#选择下载包) · [配对指南](#首次配对和发起任务) · [Linux Agent 专有功能](#linux-agent-专有功能)
 
 > CodexRM 是独立的社区项目，不是 OpenAI 官方产品。使用真实模式前，请安装并登录 Codex 桌面版，或自行安装并配置 Codex CLI。
 
 ```text
-浏览器 ── HTTPS / WebSocket ── 中继服务器 :18080
-                                  ↑ 出站 WebSocket
-                              本地 Go Agent
-                                  ↓ stdio / WebSocket
-                            Codex app-server
+Android（主客户端）/ Web ←→ CodexRM 中继 ←── 出站 WebSocket ── 电脑 Agent ←→ 本地 Codex
 ```
 
 功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复；发送在途记录独立保存，进程或页面中断后标记为“发送状态未确认”，先同步核对，不自动重发。配对失效可直接重新配对，草稿继续保留。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
@@ -25,7 +23,19 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 - **远程管理文件**：关闭时不允许浏览电脑目录、按任意路径下载或向电脑的下载目录发送文件。Android 通过 P2P 直连后，仍可下载当前会话中 AI 回复以 Markdown 链接明确引用的工作区内文件（例如 `[报告](./报告.pdf)`）。纯文字路径、工具日志和用户消息不会授权下载。需要时可重新打开会话以重新加载历史链接。
 - 这个开关不改变聊天、普通聊天附件或 Codex 自身的工具审批和沙箱设置。不要将它用作 Codex 工作区的隔离机制。
 
+### Android 客户端
+
+- 扫描 Agent 的配对二维码，或输入一次性配对码；可在多台已配对电脑之间切换。
+- 支持后台任务通知、深色模式、自定义聊天背景和系统分享。下载位置可在设置中调整。
+- **文件传输助手** 通过 P2P 直连在手机与电脑之间发送文件或文字，不需要创建 Codex 会话。在 Windows 上可从 Agent 托盘打开对应的文件传输页。
+
 ## 界面预览
+
+### Android 配对、传输与设置
+
+| 连接电脑 | 文件传输助手 | 应用设置 |
+| :---: | :---: | :---: |
+| <img src="docs/screenshots/android-pairing.jpg" alt="Android 扫码或输入配对码" width="220"> | <img src="docs/screenshots/android-file-transfer.jpg" alt="Android 文件传输助手与 P2P 直连状态" width="220"> | <img src="docs/screenshots/android-settings.jpg" alt="Android 外观、通知、连接与下载设置" width="220"> |
 
 ### Web 工作区
 
@@ -35,25 +45,13 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 
 <img src="docs/screenshots/agent-settings.png" alt="Windows Agent 设置页" width="640">
 
-### Android 客户端
-
-| 设备与工作区 | 模型选择 | P2P 直连 |
-| :---: | :---: | :---: |
-| <img src="docs/screenshots/android-workspaces.jpg" alt="Android 设备和工作区侧栏" width="220"> | <img src="docs/screenshots/android-model-picker.jpg" alt="Android 模型选择菜单" width="220"> | <img src="docs/screenshots/android-p2p.jpg" alt="Android P2P 直连与往返延迟" width="220"> |
-
-## PWA 与加载缓存
-
-页面提供 Web App Manifest、桌面/移动端安装图标和 Service Worker，可通过浏览器“安装应用”使用独立窗口；iOS 提供“分享 → 添加到主屏幕”的引导。首次在线访问后会预缓存应用壳，离线仍可打开界面和恢复本地草稿，并明确区分浏览器断网与远程 Agent 离线；远程设备连接、发送任务和同步会话仍需网络。新版本下载后由用户确认更新，运行中任务或未确认发送不会被强制刷新中断。
-
-静态加载使用三层 Cache Storage：版本化应用壳采用缓存优先，页面采用网络优先并保留离线副本，Manifest 与图标采用运行时缓存和 stale-while-revalidate。版本化 JS/CSS 同时使用浏览器一年 immutable HTTP 缓存；HTML 和 Service Worker 每次检查更新。旧版本缓存会在升级后自动清理。`/api/`、带 Authorization 的请求、非 GET、跨域请求及 WebSocket 不经过 Service Worker 缓存，会话和配对响应不会写入 Cache Storage。
-
 ## 快速开始
 
-先在要连接的电脑上安装并登录 Codex 桌面版，或在同一用户账号下配置 Codex CLI。远程操作的一侧只需要浏览器或 Android 客户端。Agent 需要保持运行，电脑休眠或退出 Agent 后，远程端将显示离线。
+手机安装 CodexRM Android 客户端。电脑安装对应平台的 Agent，使用运行 Agent 的同一用户登录 Codex 桌面版或配置 Codex CLI。电脑休眠或退出 Agent 后，手机会显示设备离线。
 
 ### 选择下载包
 
-从 [GitHub Releases](https://github.com/CyL-Cly/CodexRM/releases) 中打开同一次 Nightly 预发布，按用途选择附件。
+从 [GitHub Releases](https://github.com/CyL-Cly/CodexRM/releases) 打开相应的 Nightly 预发布，在 **Assets** 中按用途选择附件，不要下载源码压缩包。
 
 | 用途 | 附件后缀 | 如何使用 |
 | --- | --- | --- |
@@ -61,15 +59,15 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 | Linux x86-64 被控电脑 | `linux-amd64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux ARM64 被控电脑 | `linux-arm64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux x86-64 中继主机 | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
-| Android ARM64 手机 | `android-arm64-v8a-release-unsigned.apk` | 签名后安装，再扫描配对二维码 |
+| Android ARM64 手机 | `android-arm64-v8a-release.apk` | 下载已签名的 APK，安装后扫描 Agent 的配对二维码 |
 
-Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 只发布签名证书与现有发行版一致、可直接安装的 APK。若当次没有 APK 附件，请选择有签名 Android 安装包的发布。手机也可以直接用浏览器访问。
+Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android 请选择包含已签名 APK 的预发布；文件名带 `unsigned` 的安装包无法直接安装。暂时没有签名 APK 时，也可以直接用手机浏览器连接。
 
 ### 首次配对和发起任务
 
-1. 启动 Windows Agent，在系统托盘右键点击 **设置**。默认使用公共中继 `https://codexrm.ooth.tech`。使用自托管中继时，将服务器改成自己的 HTTPS 地址，填入该中继的注册密钥，保存后等待重连。
-2. 等设置页显示服务器已连接，点击 **生成配对码**。配对码有效期 10 分钟，只可使用一次。每台浏览器或手机分别生成一个码。
-3. 在浏览器打开同一个中继地址，输入配对码，也可扫描二维码打开配对链接。在 Android 客户端中可直接扫码，手动输入短码时同时填写中继地址。
+1. 启动电脑 Agent。Windows 在系统托盘右键打开 **设置**；Linux 按[无桌面设置](#linux-无桌面设置)打开设置页。默认使用公共中继 `https://codexrm.ooth.tech`。使用自托管中继时，将服务器改成自己的 HTTPS 地址，填入该中继的注册密钥，保存后等待重连。
+2. 等设置页显示服务器已连接，在 **设备配对** 页点击 **生成配对码**。配对码有效期 10 分钟，只可使用一次。每台浏览器或手机分别生成一个码。
+3. 在 Android 客户端点 **扫描二维码**；也可以粘贴完整配对链接，或手动输入短码和与电脑相同的中继地址。使用 Web 时，打开同一个中继地址并输入配对码，或用相机扫描二维码打开配对链接。
 4. 连接设备后，在侧栏 **工作区** 旁点击 **+**，浏览或输入被控电脑上的项目路径，选择 **添加此文件夹**，再为该目录新建会话。
 5. 发送“请说明当前项目结构”。收到流式回复即完成验证。运行中遇到审批或用户输入请求时，先查看会话中的请求内容再决定如何处理。
 
@@ -94,13 +92,25 @@ Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm6
 
 在 Windows 系统托盘右键点击 **文件传输助手**，可以直接进入 Agent 设置里的文件传输页；也可从设置左侧进入。这里会列出当前服务器的待发送文件与最近接收记录。取消发送只清除传输缓存，不删除电脑原文件，也不能撤回已完整送达的文件。点击已接收的文件名会打开下载文件夹中的原文件。此页仅可在 Windows Agent 本机打开。电脑和 Android 端均支持新版文件流时，下载使用独立的 P2P 二进制流；与旧版本搭配时仍可按原方式下载。
 
-## Linux 无桌面设置
+## Linux Agent 专有功能
 
-以 `--loopback-settings` 启动 `codexrm-agent` 后，设置页只监听 `127.0.0.1`，端口和登录密码保存在连接配置相邻的 `settings-access.json`，重启时复用。用 `ssh -N -L 127.0.0.1:<port>:127.0.0.1:<port> user@host` 转发设置页，再在浏览器打开 `http://127.0.0.1:<port>/` 并输入密码。未指定设置模式时，Agent 每次启动使用临时回环端口和随机会话凭据。
+以下是 **Linux 电脑端 Agent** 的功能，不是 Android 端功能，也不是手机配对的前提。Windows 和 Linux Agent 都支持用 Android 操作本机 Codex；Windows Agent 不提供下列两种机器人集成。
+
+| 功能 | 适用范围 |
+| --- | --- |
+| **QQ 机器人（OneBot 11）** | Linux Agent。连接已有 OneBot 11 协议端，在授权的 QQ 私聊或群聊中使用 Codex。 |
+| **个人微信机器人** | Linux Agent。设置页可安装或接管本机 Docker 服务，管理扫码登录、通讯录与群聊，并按好友 WxID 授权使用 Codex。内置安装支持 **Debian / Ubuntu amd64**。 |
+| **默认无桌面运行** | Linux Agent 不依赖系统托盘；启动时开启本机密码保护的设置页，可通过 SSH 隧道远程管理。 |
+
+另有面向 **Linux x86-64 / systemd** 主机的[中继 Server 安装和定时更新](#自行部署)。Server 不是 Agent；只用 Android 连接已有中继时，不需要安装 Server。
+
+### Linux 无桌面设置
+
+`codexrm-agent` 默认（也可显式指定 `--loopback-settings`）将设置页监听在 `127.0.0.1`，端口和登录密码保存在连接配置相邻的 `settings-access.json`，重启时复用。用 `ssh -N -L 127.0.0.1:<port>:127.0.0.1:<port> user@host` 转发设置页，再在浏览器打开 `http://127.0.0.1:<port>/` 并输入密码。
 
 确需从可信局域网直接访问时，显式传入 `--lan-settings`。此模式会把端口和随机密码保存到 `connection.json` 同目录的 `settings-access.json`（权限 `0600`），默认位置是 `~/.config/CodexRM/.state/settings-access.json`，如从安装目录的 `bin/` 启动则使用安装目录中的 `.state/`，也可通过 `--config` 指定连接配置路径。启动日志会显示端口和配置文件路径，在浏览器中用 `http://<Agent 的局域网 IP>:<port>/` 打开并输入文件中的 `password`。重启继续使用同一端口和密码，端口被占用时启动会报错。
 
-设置页使用 HTTP；LAN 模式请通过防火墙把端口限制在可信局域网内，并优先使用 SSH 隧道，避免在不可信网络中传输密码、连接密钥和配对码。可用 `--restart` 通知同配置目录的旧实例退出，或 `--settings` 打开已有实例的设置页。
+设置页使用 HTTP；LAN 模式请通过防火墙把端口限制在可信局域网内，并优先使用 SSH 隧道，避免在不可信网络中传输密码、连接密钥和配对码。可用 `--restart` 通知同配置目录的旧实例退出并重启。
 
 从对应架构的 Linux Agent 包解压后，以运行 Codex 的普通用户执行 `./codexrm-agent --loopback-settings`，再按上文访问设置页并配对。Linux amd64 Agent 支持在设置页点击“检查更新”。运行账号需要拥有 Agent 二进制并能写入其所在目录。
 
@@ -128,6 +138,12 @@ Linux Agent 设置页的「QQ 机器人 → OneBot 11」可直接连接 NapCat�
 安装器输出到 `build/dist`。
 
 已安装的 Windows EXE 客户端每次启动立即检查更新，之后每 20 小时检查固定更新服务器的 `update.json`，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。
+
+## PWA 与加载缓存
+
+页面提供 Web App Manifest、桌面/移动端安装图标和 Service Worker，可通过浏览器“安装应用”使用独立窗口；iOS 可在 Safari 中选择“分享 → 添加到主屏幕”。Web 顶栏的下载图标用于打开 Android APK 下载指引，不会安装 PWA。首次在线访问后会预缓存应用壳，离线仍可打开界面和恢复本地草稿，并明确区分浏览器断网与远程 Agent 离线；远程设备连接、发送任务和同步会话仍需网络。新版本下载后由用户确认更新，运行中任务或未确认发送不会被强制刷新中断。
+
+静态加载使用三层 Cache Storage：版本化应用壳采用缓存优先，页面采用网络优先并保留离线副本，Manifest 与图标采用运行时缓存和 stale-while-revalidate。版本化 JS/CSS 同时使用浏览器一年 immutable HTTP 缓存；HTML 和 Service Worker 每次检查更新。旧版本缓存会在升级后自动清理。`/api/`、带 Authorization 的请求、非 GET、跨域请求及 WebSocket 不经过 Service Worker 缓存，会话和配对响应不会写入 Cache Storage。
 
 ## 多工作区
 

@@ -1,8 +1,6 @@
 (() => {
   "use strict";
 
-  const installButton = document.getElementById("install-app");
-  let installPrompt = null;
   let statusUI = null;
 
   function ensureStatusUI() {
@@ -89,57 +87,6 @@
     ui.updateSection.hidden = false;
     ui.syncVisibility();
   }
-
-  const userAgent = navigator.userAgent || "";
-  const isIOS =
-    /iPad|iPhone|iPod/.test(userAgent) ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  const isStandalone =
-    window.matchMedia?.("(display-mode: standalone)")?.matches === true || navigator.standalone === true;
-
-  if (installButton && isIOS && !isStandalone) {
-    installButton.hidden = false;
-    installButton.setAttribute("aria-label", "查看 iOS 安装说明");
-    installButton.title = "安装 CodexRM：分享 → 添加到主屏幕";
-  }
-
-  window.addEventListener("beforeinstallprompt", (event) => {
-    event.preventDefault();
-    installPrompt = event;
-    if (installButton) installButton.hidden = false;
-  });
-
-  installButton?.addEventListener("click", async () => {
-    if (!installPrompt) {
-      if (isIOS && !isStandalone) {
-        showFeedback("轻点浏览器“分享”，选择“添加到主屏幕”；若未看到此选项，请在 Safari 中打开本页。");
-      }
-      return;
-    }
-
-    const promptEvent = installPrompt;
-    installButton.disabled = true;
-    try {
-      await promptEvent.prompt();
-      const choice = await promptEvent.userChoice;
-      if (installPrompt === promptEvent) installPrompt = null;
-      installButton.hidden = true;
-      showFeedback(choice?.outcome === "accepted" ? "安装请求已接受。" : "已取消安装。");
-    } catch (error) {
-      if (installPrompt === promptEvent) installPrompt = null;
-      installButton.hidden = !isIOS;
-      console.warn("CodexRM install prompt failed", error);
-      showFeedback("无法完成安装，请稍后重试或使用浏览器菜单安装。");
-    } finally {
-      installButton.disabled = false;
-    }
-  });
-
-  window.addEventListener("appinstalled", () => {
-    installPrompt = null;
-    if (installButton) installButton.hidden = true;
-    showFeedback("CodexRM 已安装。");
-  });
 
   if (!("serviceWorker" in navigator)) return;
 

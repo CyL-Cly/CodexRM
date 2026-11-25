@@ -90,22 +90,15 @@ function settle() {
 }
 
 function createHarness({
-  userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-  platform = "Win32",
-  maxTouchPoints = 0,
-  standalone = false,
   serviceWorker = false,
   controller = null,
   waiting = null,
   registerError = null,
 } = {}) {
-  const installButton = new FakeElement("button");
-  installButton.hidden = true;
   const body = new FakeElement("body");
   const document = {
     body,
     documentElement: body,
-    getElementById: (id) => (id === "install-app" ? installButton : null),
     createElement: (tagName) => new FakeElement(tagName),
   };
   const window = new FakeEventTarget();
@@ -113,9 +106,8 @@ function createHarness({
     reloads: 0,
     reload() { this.reloads += 1; },
   };
-  window.matchMedia = () => ({ matches: standalone });
 
-  const navigator = { userAgent, platform, maxTouchPoints, standalone };
+  const navigator = {};
   let container = null;
   let registration = null;
   const registrations = [];
@@ -147,7 +139,6 @@ function createHarness({
     window,
     document,
     navigator,
-    installButton,
     registration,
     container,
     registrations,
@@ -187,61 +178,6 @@ function createHarness({
     },
   };
 }
-
-test("iOS exposes discoverable home-screen instructions without affecting other platforms", async () => {
-  const ios = createHarness({
-    userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)",
-    platform: "iPhone",
-  });
-  assert.equal(ios.installButton.hidden, false);
-  assert.match(ios.installButton.title, /分享.*添加到主屏幕/);
-  await ios.click(ios.installButton);
-  assert.equal(ios.statusRegions().length, 1);
-  assert.match(ios.visibleText(), /分享.*添加到主屏幕.*Safari/);
-
-  const desktop = createHarness();
-  await desktop.click(desktop.installButton);
-  assert.equal(desktop.installButton.hidden, true);
-  assert.equal(desktop.statusRegions().length, 0);
-
-  const installedIOS = createHarness({ platform: "iPad", userAgent: "iPad", standalone: true });
-  assert.equal(installedIOS.installButton.hidden, true);
-});
-
-for (const failure of ["prompt", "userChoice"]) {
-  test(`install ${failure} rejection is visible and restores the button`, async () => {
-    const harness = createHarness();
-    const promptEvent = new FakeEvent("beforeinstallprompt", { cancelable: true });
-    promptEvent.prompt = async () => {
-      if (failure === "prompt") throw new Error("prompt failed");
-    };
-    promptEvent.userChoice = failure === "userChoice"
-      ? Promise.reject(new Error("choice failed"))
-      : Promise.resolve({ outcome: "accepted" });
-    harness.window.dispatchEvent(promptEvent);
-    assert.equal(promptEvent.defaultPrevented, true);
-    assert.equal(harness.installButton.hidden, false);
-
-    await harness.click(harness.installButton);
-    assert.equal(harness.installButton.disabled, false);
-    assert.equal(harness.installButton.hidden, true);
-    assert.match(harness.visibleText(), /无法完成安装/);
-    assert.equal(harness.warnings.length, 1);
-  });
-}
-
-test("a successful install choice consumes the prompt and gives feedback", async () => {
-  const harness = createHarness();
-  const promptEvent = new FakeEvent("beforeinstallprompt", { cancelable: true });
-  let prompts = 0;
-  promptEvent.prompt = async () => { prompts += 1; };
-  promptEvent.userChoice = Promise.resolve({ outcome: "accepted" });
-  harness.window.dispatchEvent(promptEvent);
-  await harness.click(harness.installButton);
-  assert.equal(prompts, 1);
-  assert.equal(harness.installButton.hidden, true);
-  assert.match(harness.visibleText(), /安装请求已接受/);
-});
 
 test("service-worker registration failure produces non-blocking visible feedback", async () => {
   const harness = createHarness({ serviceWorker: true, registerError: new Error("registration denied") });

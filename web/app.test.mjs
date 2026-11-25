@@ -1000,6 +1000,24 @@ test("pairing dialog click handlers do not use the event as a pair code", () => 
   }
 });
 
+test("Android download is available without pairing and opens the Releases guide", () => {
+  const { elements, document } = loadApp();
+  const dialog = document.getElementById("android-download-dialog");
+  let opened = false;
+  dialog.showModal = () => { opened = true; };
+  elements.get("android-download").onclick();
+  assert.equal(opened, true);
+
+  const html = readFileSync(new URL("index.html", import.meta.url), "utf8");
+  const button = html.match(/<button\b[^>]*id="android-download"[^>]*>/)?.[0];
+  assert.ok(button);
+  assert.doesNotMatch(button, /\s(?:disabled|hidden)\b/);
+  const guide = html.match(/<dialog id="android-download-dialog"[^>]*>[\s\S]*?<\/dialog>/)?.[0];
+  assert.ok(guide);
+  assert.match(guide, /href="https:\/\/github\.com\/CyL-Cly\/CodexRM\/releases"/);
+  assert.match(guide, /android-arm64-v8a-release\.apk/);
+});
+
 test("connection button opens device selection instead of the pairing dialog", () => {
   const { app, context, elements, document } = loadApp();
   const deviceDialog = document.getElementById("device-dialog");

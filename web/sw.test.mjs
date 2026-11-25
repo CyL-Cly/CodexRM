@@ -121,7 +121,7 @@ function createHarness() {
   };
 }
 
-const VERSION = "20261124-2";
+const VERSION = "20261125-1";
 const SHELL = `codexrm-shell-${VERSION}`;
 const PAGES = `codexrm-pages-${VERSION}`;
 const RUNTIME = `codexrm-runtime-${VERSION}`;

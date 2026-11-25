@@ -1786,6 +1786,9 @@ html[data-theme="light"] .composer {
   font-size: 12px;
   margin-top: 15px;
 }
+.android-download-link {
+  text-decoration: none;
+}
 .primary-button svg {
   width: 15px;
 }

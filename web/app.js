@@ -4190,6 +4190,7 @@ document.querySelectorAll("dialog").forEach((d) =>
 $("new-chat").onclick = newChat;
 $("add-device").onclick = () => openPair();
 $("connection-button").onclick = openDevicePicker;
+$("android-download").onclick = () => $("android-download-dialog").showModal();
 $("device-pair").onclick = () => {
   $("device-dialog").close();
   openPair();
