@@ -1,13 +1,13 @@
 # CodexRM
 
-**用 Android 手机远程操作电脑上的 Codex。** 扫码配对后，可以在手机上切换工作区、继续已有会话、发起任务、查看进度和处理审批。代码、命令和 Codex 都在 Windows 或 Linux 电脑上运行；手机不需要安装 Codex，也不是在远程操控整个桌面。Web 是免安装的备用入口，中继可自行部署。
+**用 Android 手机远程操作电脑上的 Codex。** 扫码配对后，可以在手机上切换工作区、继续已有会话、发起任务、查看进度和处理审批。代码、命令和 Codex 都在 Windows 或 Linux 电脑上运行；手机不需要安装 Codex，也不是在远程操控整个桌面。Web 是免安装的备用入口。远程使用需要 CodexRM 中继，但可以用默认公共中继，不必自己部署。
 
-**[下载 Android 客户端](https://github.com/CyL-Cly/CodexRM/releases)** · [下载 Windows / Linux Agent 与 Server](#选择下载包) · [配对指南](#首次配对和发起任务) · [Linux Agent 专有功能](#linux-agent-专有功能)
+**[下载 Android 客户端](https://github.com/CyL-Cly/CodexRM/releases)** · [下载 Windows / Linux Agent 与 Server](#选择下载包) · [中继与网络要求](#中继与网络要求) · [配对指南](#首次配对和发起任务) · [Linux Agent 专有功能](#linux-agent-专有功能)
 
 > CodexRM 是独立的社区项目，不是 OpenAI 官方产品。使用真实模式前，请安装并登录 Codex 桌面版，或自行安装并配置 Codex CLI。
 
 ```text
-Android（主客户端）/ Web ←→ CodexRM 中继 ←── 出站 WebSocket ── 电脑 Agent ←→ 本地 Codex
+Android / Web ←── HTTPS / WSS ──→ CodexRM 中继 ←── 出站 WSS ──→ 电脑连接器（Agent） ←→ 本地 Codex
 ```
 
 功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复；发送在途记录独立保存，进程或页面中断后标记为“发送状态未确认”，先同步核对，不自动重发。配对失效可直接重新配对，草稿继续保留。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
@@ -55,6 +55,14 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 
 手机安装 CodexRM Android 客户端。电脑安装对应平台的 Agent，使用运行 Agent 的同一用户登录 Codex 桌面版或配置 Codex CLI。电脑休眠或退出 Agent 后，手机会显示设备离线。
 
+### 中继与网络要求
+
+| 常见问题 | 答案 |
+| --- | --- |
+| **一定要有中继吗？** | **需要能连到同一个 CodexRM 中继，但不必自建。** 电脑连接器默认使用公共中继 `https://codexrm.ooth.tech`。即使手机和电脑在同一局域网，配对、认证和 P2P 握手仍需要中继；P2P 不是免中继配对模式。 |
+| **中继要开 SSE 或 QUIC 吗？** | **都不用。** 自部署的基本要求是 **HTTPS 和 WebSocket（WSS）**：配对走 HTTPS，对话和任务事件可以通过 WebSocket 转发。反向代理必须支持 WebSocket 升级；不需要 SSE，也不需要在中继域名开启 HTTP/3 或 UDP 443。 |
+| **QUIC 用在哪里？** | QUIC over UDP 用于 **Android 与电脑之间的 P2P 直连**，不是中继的 HTTPS 服务。直连失败时，普通对话仍可走中继；文件传输助手、普通聊天附件和远端工作区文件下载等依赖直连的功能不可用。 |
+
 ### 选择下载包
 
 从 [GitHub Releases](https://github.com/CyL-Cly/CodexRM/releases) 打开相应的 Nightly 预发布，在 **Assets** 中按用途选择附件，不要下载源码压缩包。
@@ -64,16 +72,16 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 | Windows x64 被控电脑 | `windows-amd64-Setup.exe` | 双击安装 Agent，启动后在系统托盘打开设置 |
 | Linux x86-64 被控电脑 | `linux-amd64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux ARM64 被控电脑 | `linux-arm64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
-| Linux x86-64 中继主机 | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
+| Linux x86-64 中继主机（仅自部署时下载） | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
 | Android ARM64 手机 | `android-arm64-v8a-release.apk` | 下载已签名的 APK，安装后扫描 Agent 的配对二维码 |
 
 Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android 请选择包含已签名 APK 的预发布；文件名带 `unsigned` 的安装包无法直接安装。暂时没有签名 APK 时，也可以直接用手机浏览器连接。
 
 ### 首次配对和发起任务
 
-1. 启动电脑 Agent。Windows 在系统托盘右键打开 **设置**；Linux 按[无桌面设置](#linux-无桌面设置)打开设置页。默认使用公共中继 `https://codexrm.ooth.tech`。使用自托管中继时，将服务器改成自己的 HTTPS 地址，填入该中继的注册密钥，保存后等待重连。
-2. 等设置页显示服务器已连接，在 **设备配对** 页点击 **生成配对码**。配对码有效期 10 分钟，只可使用一次。每台浏览器或手机分别生成一个码。
-3. 在 Android 客户端点 **扫描二维码**；也可以粘贴完整配对链接，或手动输入短码和与电脑相同的中继地址。使用 Web 时，打开同一个中继地址并输入配对码，或用相机扫描二维码打开配对链接。
+1. **在电脑连接器选定中继。** Windows 在系统托盘右键打开 **设置**；Linux 按[无桌面设置](#linux-无桌面设置)打开设置页。进入 **服务器连接 → 远程服务器**。使用默认公共中继时无需修改；使用自托管中继时，在这里填入自己的 HTTPS 地址和管理员提供的连接授权密钥，保存后等待连接成功。不要把连接授权密钥填到手机上。
+2. 在电脑连接器的 **设备配对** 页点 **生成配对码**。二维码和完整配对链接会带上电脑当前连接的中继地址。配对码有效期 10 分钟，只可用一次；每台手机或浏览器分别生成一个码。
+3. **手机使用电脑选定的中继，不另选服务器。** 在 Android 客户端点 **扫描二维码**，或粘贴完整配对链接，应用会自动读取并保存该电脑的中继地址。只有手动输入短码时才需要填写服务器地址，且必须与电脑连接器一致。使用 Web 时，可打开完整配对链接，或到同一个中继的网页输入短码。电脑改用另一个中继后，请用新中继生成的二维码重新配对。
 4. 连接设备后，在侧栏 **工作区** 旁点击 **+**，浏览或输入被控电脑上的项目路径，选择 **添加此文件夹**，再为该目录新建会话。
 5. 发送“请说明当前项目结构”。收到流式回复即完成验证。运行中遇到审批或用户输入请求时，先查看会话中的请求内容再决定如何处理。
 
@@ -82,7 +90,7 @@ Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm6
 | 现象 | 检查方法 |
 | --- | --- |
 | Agent 无法连接或注册 | 检查 HTTPS 地址、证书及注册密钥，确认反向代理支持 WebSocket |
-| 配对码无效 | 确认两端使用同一中继，并在 Agent 设置中生成新的码 |
+| 配对码无效 | 在电脑连接器生成新二维码并重新扫码；手输短码时，确认填写的是电脑当前的中继地址 |
 | 已配对但设备离线 | 确认被控电脑未休眠、Agent 仍在运行，并检查设置页的连接状态 |
 | 在线但无法开始会话 | 在运行 Agent 的账号下确认 Codex 已登录、项目目录有访问权限，并查看 Agent 日志 |
 | 页面提示发送状态未确认 | 等待重连后同步会话，确认消息是否已经送达，再决定是否重发 |
@@ -256,6 +264,8 @@ codex app-server --listen ws://127.0.0.1:4500
 
 ## 自行部署
 
+本节仅适用于希望替换默认公共中继的用户。普通远程会话只需要 HTTPS + WSS，不用为中继开启 SSE 或 HTTP/3（QUIC）。
+
 在使用 systemd 的 Linux x86-64 中继主机上安装。先从 GitHub Releases 下载 `linux-amd64-server.tar.gz`，并按同一预发布的 `SHA256SUMS.txt` 核对文件。准备一个指向主机的域名和 TLS 证书，以便客户端通过 HTTPS 连接。
 
 ```bash
@@ -278,7 +288,7 @@ sudo bash build/scripts/install-server.sh /path/to/server-package/codexrm-server
 
 1. 将 `deploy/nginx-location.conf` 中的代理配置合入中继域名的 TLS `server` 块，保留 WebSocket 升级请求头。运行 `sudo nginx -t`，通过后执行 `sudo systemctl reload nginx`。
 2. 从客户端网络访问 `https://你的中继域名/api/v1/health`，确认返回 `ok: true`。若本机健康检查失败，用 `sudo systemctl status codexrm` 和 `sudo journalctl -u codexrm -n 50 --no-pager` 排查服务。
-3. 从服务器上的 `/opt/codexrm/server.env` 私下读取 `CODEXRM_ENROLL_KEY`，在 Agent 设置中填入中继的 HTTPS 地址和该密钥。服务器地址和注册密钥保存后，按上面的流程生成浏览器或 Android 配对码。
+3. 从服务器上的 `/opt/codexrm/server.env` 私下读取 `CODEXRM_ENROLL_KEY`，只在电脑连接器的 **服务器连接** 页填写中继的 HTTPS 地址和该密钥。等电脑连接成功后，按[配对指南](#首次配对和发起任务)生成二维码；Android 扫码时会自动使用同一中继。
 
 服务监听 `127.0.0.1:18080`，程序位于 `/opt/codexrm/bin`，页面位于 `/opt/codexrm/web`，持久化状态位于 `/opt/codexrm/data`。升级前备份状态目录和权限为 `0600` 的 `server.env`。解压新版本后再次运行安装脚本即可更新二进制和页面并重启服务，脚本沿用已有注册密钥。注册密钥、设备 token 和配对码均应按凭证保管。
 
