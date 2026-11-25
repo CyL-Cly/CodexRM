@@ -41,9 +41,15 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 
 ![CodexRM Web 工作区](docs/screenshots/web-workspace.png)
 
-### Windows Agent 设置
+### 电脑端连接器（Agent）设置
 
-<img src="docs/screenshots/agent-settings.png" alt="Windows Agent 设置页" width="640">
+**Windows**：从系统托盘打开设置，查看中继连接和已授权设备，并管理设备配对、模型供应商和 Agent 更新。
+
+<img src="docs/screenshots/agent-settings.png" alt="Windows 连接器设置仪表盘：中继连接与已授权设备" width="900">
+
+**Linux**：除基本设置外，侧栏还有 QQ OneBot 11 和微信机器人管理入口。详情见 [Linux Agent 专有功能](#linux-agent-专有功能)。
+
+<img src="docs/screenshots/agent-settings-linux.png" alt="Linux 连接器设置仪表盘：中继连接、已授权设备、微信机器人与 OneBot 11" width="900">
 
 ## 快速开始
 
