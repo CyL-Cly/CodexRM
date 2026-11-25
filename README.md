@@ -63,7 +63,7 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 | Linux x86-64 中继主机 | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
 | Android ARM64 手机 | `android-arm64-v8a-release-unsigned.apk` | 签名后安装，再扫描配对二维码 |
 
-Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 只发布签名证书与现有发行版一致、可直接安装的 APK。若当次没有 APK附件，请选择有签名 Android 安装包的发布。 手机也可以直接用浏览器访问。
+Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android Nightly 只发布签名证书与现有发行版一致、可直接安装的 APK。若当次没有 APK 附件，请选择有签名 Android 安装包的发布。手机也可以直接用浏览器访问。
 
 ### 首次配对和发起任务
 

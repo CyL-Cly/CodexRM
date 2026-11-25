@@ -147,6 +147,11 @@ jobs:
           install -m 0755 build/scripts/install-server.sh "$server/install-server.sh"
           install -d "$server/deploy"
           install -m 0644 deploy/codexrm.service deploy/nginx-location.conf "$server/deploy/"
+          # Older commits can still be selected for a Nightly; package the updater when present.
+          if [[ -d cmd/codexrm-server-updater ]]; then
+            go build -trimpath -ldflags "-s -w" -o "$server/codexrm-server-updater" ./cmd/codexrm-server-updater
+            install -m 0644 deploy/codexrm-server-update.{service,timer,env.example} "$server/deploy/"
+          fi
           tar -czf "nightly-dist/CodexRM-$TAG-linux-amd64-server.tar.gz" -C "$server" .
 
       - name: Check Android signing configuration
