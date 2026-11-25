@@ -34,20 +34,26 @@ jobs:
         run: |
           if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
             day=$(date --date=yesterday +%F)
+            start=$(date --date="$day 00:00:00 +0800" +%s)
+            end=$((start + 86400))
+            sha=$(git log --first-parent --format='%ct %H' | awk -v start="$start" -v end="$end" '$1 >= start && $1 < end && !found { print $2; found = 1 }')
           else
             day=$(date +%F)
+            sha=$(git rev-parse HEAD)
           fi
-          start=$(date --date="$day 00:00:00 +0800" +%s)
-          end=$((start + 86400))
-          sha=$(git log --first-parent --format='%ct %H' | awk -v start="$start" -v end="$end" '$1 >= start && $1 < end && !found { print $2; found = 1 }')
           if [[ -z "$sha" ]]; then
             echo "No commits on the default branch for $day (Asia/Singapore)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           tag="nightly-$day-${sha:0:12}"
           if git show-ref --verify --quiet "refs/tags/$tag"; then
-            echo "Nightly $tag already exists." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+              echo "Nightly $tag already exists." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            # A deleted GitHub Release leaves its tag behind. Allow manual rebuilds
+            # without moving that tag or replacing an already published release.
+            [[ $(git rev-parse "refs/tags/$tag^{commit}") == "$sha" ]]
           fi
           printf 'sha=%s\ntag=%s\n' "$sha" "$tag" >> "$GITHUB_OUTPUT"
 
@@ -161,6 +167,10 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEYSTORE_PASSWORD }}
         run: |
           if [[ -z "$KEYSTORE_BASE64" && -z "$KEYSTORE_PASSWORD" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+              echo '::error::Manual Nightly requires Android release signing secrets.'
+              exit 1
+            fi
             echo '::warning::Android signing secrets are not configured. No APK will be uploaded.'
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
           elif [[ -z "$KEYSTORE_BASE64" || -z "$KEYSTORE_PASSWORD" ]]; then
@@ -258,6 +268,9 @@ jobs:
           if [[ -f "$apk" ]]; then
             assets+=("$apk")
             android_note='The Android arm64-v8a APK is signed and can be installed directly.'
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo '::error::The required signed Android APK is missing; release not published.'
+            exit 1
           fi
           notes="Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation. $android_note"
           sha256sum "${assets[@]}" > SHA256SUMS.txt
