@@ -16,7 +16,7 @@ import (
 )
 
 type Options struct {
-	ManifestURL, Workspace, CodexPath string
+	Workspace, CodexPath              string
 	NoShortcuts, NoAutostart, NoStart bool
 }
 

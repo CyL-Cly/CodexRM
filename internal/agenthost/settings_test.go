@@ -348,9 +348,10 @@ func TestManualUpdateStartsHelperAndStopsRunningHost(t *testing.T) {
 
 func useUpdateFeed(t *testing.T, h *Host, feed *httptest.Server) {
 	t.Helper()
+	t.Setenv("CODEXRM_AGENT_UPDATE_SERVER", "https://updates.example/base")
 	h.newUpdater = func(cfg updater.Config) (*updater.Updater, error) {
-		if cfg.ServerURL != clientconfig.DefaultUpdateServer || cfg.ManifestURL != clientconfig.DefaultUpdateServer+"update.json" {
-			t.Errorf("host used a configurable update feed: %+v", cfg)
+		if cfg.ServerURL != "https://updates.example/base" || cfg.ManifestURL != "https://updates.example/base/update.json" {
+			t.Errorf("host did not use the configured update feed: %+v", cfg)
 		}
 		cfg.ServerURL, cfg.ManifestURL = feed.URL, feed.URL+"/update.json"
 		return updater.New(cfg)

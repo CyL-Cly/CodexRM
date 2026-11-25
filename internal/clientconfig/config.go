@@ -11,11 +11,24 @@ import (
 	"strings"
 )
 
-const (
-	DefaultRelayServer  = "https://codexrm.ooth.tech"
-	DefaultUpdateServer = "https://codexrm.dagongren.tech/"
-	LinuxUpdateManifest = DefaultUpdateServer + "linux-update.json"
-)
+const DefaultRelayServer = "https://codexrm.ooth.tech"
+
+// UpdateFeed is separate from pairing and only trusts local operator configuration.
+func UpdateFeed(linux bool) (base, manifest string, err error) {
+	raw := strings.TrimSpace(os.Getenv("CODEXRM_AGENT_UPDATE_SERVER"))
+	if raw == "" {
+		return "", "", nil
+	}
+	base, err = ServerURL(raw)
+	if err != nil || !strings.HasPrefix(base, "https://") {
+		return "", "", errors.New("CODEXRM_AGENT_UPDATE_SERVER must be an HTTPS base URL (without credentials, query or fragment)")
+	}
+	name := "update.json"
+	if linux {
+		name = "linux-update.json"
+	}
+	return base, base + "/" + name, nil
+}
 
 // Connection retains the field names used by older installations.
 type Connection struct {
@@ -25,12 +38,10 @@ type Connection struct {
 	Workspace           string `json:"workspace,omitempty"`
 	CodexPath           string `json:"codexPath,omitempty"`
 	AutoUpdate          bool   `json:"autoUpdate"`
-	UpdateServer        string `json:"updateServer"`
-	UpdateManifestURL   string `json:"updateManifestUrl,omitempty"`
 }
 
 func Load(path string) (Connection, error) {
-	c := Connection{AutoUpdate: true, UpdateServer: DefaultUpdateServer}
+	c := Connection{AutoUpdate: true}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		c.Server = DefaultRelayServer
@@ -40,8 +51,6 @@ func Load(path string) (Connection, error) {
 		return c, err
 	}
 	err = json.Unmarshal(bytes.TrimPrefix(b, []byte{0xef, 0xbb, 0xbf}), &c)
-	c.UpdateServer = DefaultUpdateServer
-	c.UpdateManifestURL = ""
 	return c, err
 }
 
@@ -63,16 +72,8 @@ func (c *Connection) Normalize() error {
 	} else {
 		c.Server = ""
 	}
-	// Older installations may retain custom feeds. They must not override the
-	// built-in update service, even when settings are loaded without saving.
-	c.UpdateServer = DefaultUpdateServer
-	c.UpdateManifestURL = ""
 	c.EnrollmentKey = strings.TrimSpace(c.EnrollmentKey)
 	return nil
-}
-
-func (c Connection) ManifestURL() string {
-	return DefaultUpdateServer + "update.json"
 }
 
 func Save(path string, c Connection) error {

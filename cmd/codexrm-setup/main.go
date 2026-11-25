@@ -19,10 +19,6 @@ import (
 	"github.com/codexrm/codexrm/internal/updater"
 )
 
-// Release builds may override the public update feed. It is independent of
-// the remote connection configured later in the agent's settings page.
-var defaultManifestURL = "https://codexrm.dagongren.tech/update.json"
-
 type options struct {
 	manifestURL, installDir, workspace, codexPath                    string
 	installDirSet, nonInteractive, noShortcuts, noAutostart, noStart bool
@@ -82,13 +78,10 @@ func hasOption(args []string, name string) bool {
 
 func parseOptions(args []string, output io.Writer) (options, error) {
 	var opts options
-	manifestDefault := os.Getenv("CODEXRM_UPDATE_MANIFEST")
-	if manifestDefault == "" {
-		manifestDefault = defaultManifestURL
-	}
+	manifestDefault := strings.TrimSpace(os.Getenv("CODEXRM_UPDATE_MANIFEST"))
 	flags := flag.NewFlagSet("codexrm-setup", flag.ContinueOnError)
 	flags.SetOutput(output)
-	flags.StringVar(&opts.manifestURL, "manifest", manifestDefault, "公开 update.json 地址")
+	flags.StringVar(&opts.manifestURL, "manifest", manifestDefault, "可信的 update.json 地址（仅联网安装需要）")
 	flags.StringVar(&opts.installDir, "install-dir", installation.ResolveDir(), "安装目录")
 	flags.StringVar(&opts.workspace, "workspace", "", "初始工作区")
 	flags.StringVar(&opts.codexPath, "codex-path", "", "Codex CLI 路径，可留空自动查找")
@@ -138,11 +131,13 @@ func install(ctx context.Context, opts options, stdin io.Reader, stdout, _ io.Wr
 		fmt.Fprintln(stdout, "正在安装离线软件包...")
 		return installation.Install(ctx, localBinary, installDir, installOptions)
 	}
+	if strings.TrimSpace(opts.manifestURL) == "" {
+		return errors.New("未配置更新源：请使用离线安装包，或通过 --manifest / CODEXRM_UPDATE_MANIFEST 提供更新清单")
+	}
 	manifestURL, err := validateManifestURL(opts.manifestURL)
 	if err != nil {
 		return err
 	}
-	installOptions.ManifestURL = manifestURL
 	u, _ := url.Parse(manifestURL)
 	client, err := updater.New(updater.Config{ServerURL: (&url.URL{Scheme: u.Scheme, Host: u.Host}).String(), ManifestURL: manifestURL, InstallDir: installDir, VersionCode: 0})
 	if err != nil {

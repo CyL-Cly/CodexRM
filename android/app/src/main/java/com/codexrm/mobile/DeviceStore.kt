@@ -34,8 +34,12 @@ internal class DeviceStore(context: Context) {
         set(value) = uiPrefs.edit().putString("selected", value).apply()
 
     var lastServer: String
-        get() = uiPrefs.getString("last_server", "https://codexrm.dagongren.tech") ?: ""
+        get() = uiPrefs.getString("last_server", "https://codexrm.ooth.tech") ?: ""
         set(value) = uiPrefs.edit().putString("last_server", value).apply()
+
+    var updateServer: String
+        get() = uiPrefs.getString("update_server", "").orEmpty()
+        set(value) = uiPrefs.edit().putString("update_server", value).apply()
 
     var sandbox: String
         get() = uiPrefs.getString("sandbox", null) ?: "danger-full-access"

@@ -1,6 +1,7 @@
 package clientconfig
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,9 +13,6 @@ func TestDefaultRelayRequiresMissingSettings(t *testing.T) {
 	if err != nil || fresh.Server != "https://codexrm.ooth.tech" || fresh.EnrollmentKey != "" || !fresh.AutoUpdate {
 		t.Fatalf("unexpected defaults: %+v, %v", fresh, err)
 	}
-	if fresh.ManifestURL() != "https://codexrm.dagongren.tech/update.json" {
-		t.Fatalf("unexpected update manifest: %s", fresh.ManifestURL())
-	}
 	if err := Save(path, Connection{}); err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +22,7 @@ func TestDefaultRelayRequiresMissingSettings(t *testing.T) {
 	}
 }
 
-func TestLegacyUpdateSourcesAlwaysUseBuiltInService(t *testing.T) {
+func TestLegacyUpdateFieldsDoNotConfigureUpdates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "connection.json")
 	legacy := `{"server":"https://relay.example","enrollmentKey":"saved-key","autoUpdate":true,"updateServer":"not a URL","updateManifestUrl":"https://old.example/custom.json"}`
 	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
@@ -34,21 +32,38 @@ func TestLegacyUpdateSourcesAlwaysUseBuiltInService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.UpdateServer != DefaultUpdateServer || cfg.UpdateManifestURL != "" || cfg.ManifestURL() != DefaultUpdateServer+"update.json" {
-		t.Fatalf("legacy source was retained: %+v", cfg)
-	}
 	if cfg.Server != "https://relay.example" || cfg.EnrollmentKey != "saved-key" {
 		t.Fatal("migration changed connection settings")
-	}
-	cfg.UpdateServer, cfg.UpdateManifestURL = "https://other.example/", "https://other.example/feed.json"
-	if cfg.ManifestURL() != DefaultUpdateServer+"update.json" {
-		t.Fatal("unnormalized config overrode the built-in manifest")
 	}
 	if err = Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
-	saved, err := Load(path)
-	if err != nil || saved.UpdateServer != DefaultUpdateServer || saved.UpdateManifestURL != "" {
-		t.Fatalf("fixed update service did not survive saving: %+v, %v", saved, err)
+	saved, err := os.ReadFile(path)
+	if err != nil || bytes.Contains(saved, []byte("updateServer")) || bytes.Contains(saved, []byte("updateManifestUrl")) {
+		t.Fatalf("legacy update fields were not removed: %s, %v", saved, err)
+	}
+}
+
+func TestUpdateFeedRequiresExplicitHTTPSConfiguration(t *testing.T) {
+	t.Setenv("CODEXRM_AGENT_UPDATE_SERVER", "")
+	if base, manifest, err := UpdateFeed(false); err != nil || base != "" || manifest != "" {
+		t.Fatalf("unconfigured feed: %q %q %v", base, manifest, err)
+	}
+	t.Setenv("CODEXRM_AGENT_UPDATE_SERVER", " https://updates.example/base/ ")
+	for _, linux := range []bool{false, true} {
+		name := "update.json"
+		if linux {
+			name = "linux-update.json"
+		}
+		base, manifest, err := UpdateFeed(linux)
+		if err != nil || base != "https://updates.example/base" || manifest != base+"/"+name {
+			t.Errorf("wrong feed for Linux=%t: %q %q %v", linux, base, manifest, err)
+		}
+	}
+	for _, invalid := range []string{"http://updates.example", "https://@updates.example", "https://updates.example?query", "https://updates.example#fragment"} {
+		t.Setenv("CODEXRM_AGENT_UPDATE_SERVER", invalid)
+		if _, _, err := UpdateFeed(false); err == nil {
+			t.Errorf("accepted %q", invalid)
+		}
 	}
 }

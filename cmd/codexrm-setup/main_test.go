@@ -56,17 +56,20 @@ func TestManifestURLValidation(t *testing.T) {
 	}
 }
 
-func TestParseOptionsUsesBuiltInManifest(t *testing.T) {
-	oldDefault := defaultManifestURL
-	defaultManifestURL = "https://updates.example/update.json"
-	t.Cleanup(func() { defaultManifestURL = oldDefault })
+func TestParseOptionsRequiresExplicitManifest(t *testing.T) {
 	t.Setenv("CODEXRM_UPDATE_MANIFEST", "")
 	opts, err := parseOptions([]string{"--non-interactive", "--no-start"}, io.Discard)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || opts.manifestURL != "" || !opts.nonInteractive || !opts.noStart {
+		t.Fatalf("unexpected options: %+v, %v", opts, err)
 	}
-	if opts.manifestURL != defaultManifestURL || !opts.nonInteractive || !opts.noStart {
-		t.Fatalf("unexpected options: %+v", opts)
+	t.Setenv("CODEXRM_UPDATE_MANIFEST", " https://updates.example/update.json ")
+	opts, err = parseOptions(nil, io.Discard)
+	if err != nil || opts.manifestURL != "https://updates.example/update.json" {
+		t.Fatalf("unexpected environment override: %+v, %v", opts, err)
+	}
+	opts, err = parseOptions([]string{"--manifest", "https://other.example/update.json"}, io.Discard)
+	if err != nil || opts.manifestURL != "https://other.example/update.json" {
+		t.Fatalf("unexpected flag override: %+v, %v", opts, err)
 	}
 }
 
@@ -122,7 +125,7 @@ func TestOnlineInstallFromManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	if config.Server != clientconfig.DefaultRelayServer || config.EnrollmentKey != nil || config.Workspace != workspace ||
-		config.UpdateManifest != "" || config.UpdateServer != clientconfig.DefaultUpdateServer || !config.AutoUpdate {
+		config.UpdateManifest != "" || config.UpdateServer != "" || !config.AutoUpdate {
 		t.Fatalf("unexpected installed configuration: %+v", config)
 	}
 	if _, err := os.Stat(filepath.Join(localAppData, "CodexRM", "installation.json")); err != nil {

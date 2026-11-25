@@ -16,6 +16,7 @@ import androidx.core.content.FileProvider
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody
@@ -29,9 +30,6 @@ import java.time.OffsetDateTime
 import java.time.ZoneId
 
 internal object UpdateChecker {
-    private const val UPDATE_ORIGIN = "https://codexrm.dagongren.tech"
-    const val MANIFEST_URL = "$UPDATE_ORIGIN/android-update.json"
-    private const val HISTORY_URL = "$UPDATE_ORIGIN/release-history.json"
     const val MAX_PACKAGE_SIZE = 512L * 1024L * 1024L
     internal const val SILENT_INSTALL_FALLBACK_MS = 20_000L
     private const val MAX_MANIFEST_SIZE = 1024 * 1024
@@ -95,11 +93,26 @@ internal object UpdateChecker {
 
     data class ReleaseNote(val versionName: String, val date: String, val notes: String)
 
-    fun fetchLatest(callback: (VersionInfo?, ApiException?) -> Unit): Call =
-        fetchJson(MANIFEST_URL, { parseManifest(it) }, callback)
+    internal fun normalizeUpdateServer(raw: String): String? {
+        val value = raw.trim()
+        if (value.isEmpty()) return ""
+        if (!value.startsWith("https://", ignoreCase = true) || value.any { it == '\\' || it.isWhitespace() }) return null
+        val url = value.toHttpUrlOrNull() ?: return null
+        if (url.encodedQuery != null || url.encodedFragment != null ||
+            '@' in value.substringAfter("://").substringBefore('/')) return null
+        return url.toString().trimEnd('/')
+    }
 
-    fun fetchHistory(callback: (List<ReleaseNote>?, ApiException?) -> Unit): Call =
-        fetchJson(HISTORY_URL, ::parseHistory, callback)
+    internal fun updateEndpoint(server: String, file: String): String? =
+        normalizeUpdateServer(server)?.takeIf(String::isNotEmpty)?.let { "$it/$file" }
+
+    fun fetchLatest(server: String, callback: (VersionInfo?, ApiException?) -> Unit): Call {
+        val manifestUrl = requireNotNull(updateEndpoint(server, "android-update.json"))
+        return fetchJson(manifestUrl, { parseManifest(it, manifestUrl) }, callback)
+    }
+
+    fun fetchHistory(server: String, callback: (List<ReleaseNote>?, ApiException?) -> Unit): Call =
+        fetchJson(requireNotNull(updateEndpoint(server, "release-history.json")), ::parseHistory, callback)
 
     internal fun parseHistory(text: String): List<ReleaseNote> {
         val history = JSONObject(text)
@@ -151,7 +164,7 @@ internal object UpdateChecker {
         return call
     }
 
-    internal fun parseManifest(text: String, manifestUrl: String = MANIFEST_URL): VersionInfo {
+    internal fun parseManifest(text: String, manifestUrl: String): VersionInfo {
         require(text.length <= MAX_MANIFEST_SIZE) { "更新清单超过 1 MiB" }
         val json = JSONObject(text)
         val versionCode = json.optLong("versionCode", 0L)

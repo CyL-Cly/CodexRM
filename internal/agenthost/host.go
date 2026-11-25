@@ -243,11 +243,18 @@ func (h *Host) RestartUpdate(ctx context.Context) error {
 	return nil
 }
 
-func (h *Host) updaterConfig() updater.Config {
-	if h.updateMode() == updateLinuxAgent {
-		return updater.Config{ServerURL: clientconfig.DefaultUpdateServer, ManifestURL: clientconfig.LinuxUpdateManifest, StateDir: filepath.Join(h.StateDir(), ".codexrm-updates"), LinuxExecutable: h.LinuxUpdateExecutable, VersionCode: release.VersionCode}
+func (h *Host) updaterConfig() (updater.Config, error) {
+	linux := h.updateMode() == updateLinuxAgent
+	base, manifest, err := clientconfig.UpdateFeed(linux)
+	cfg := updater.Config{ServerURL: base, ManifestURL: manifest, VersionCode: release.VersionCode}
+	if linux {
+		cfg.StateDir = filepath.Join(h.StateDir(), ".codexrm-updates")
+		cfg.LinuxExecutable = h.LinuxUpdateExecutable
+	} else {
+		cfg.InstallDir = h.installDir
+		cfg.Args = []string{"--config", h.path}
 	}
-	return updater.Config{ServerURL: clientconfig.DefaultUpdateServer, ManifestURL: clientconfig.DefaultUpdateServer + "update.json", InstallDir: h.installDir, VersionCode: release.VersionCode, Args: []string{"--config", h.path}}
+	return cfg, err
 }
 
 func (h *Host) runUpdates(ctx context.Context, ready chan<- *updater.Plan) {
@@ -258,7 +265,15 @@ func (h *Host) runUpdates(ctx context.Context, ready chan<- *updater.Plan) {
 	if (mode != updateWindowsAgent && mode != updateLinuxAgent) || h.base.Mock || !autoUpdate {
 		return
 	}
-	u, err := h.newUpdater(h.updaterConfig())
+	cfg, err := h.updaterConfig()
+	if err != nil {
+		log.Printf("automatic update: %v", err)
+		return
+	}
+	if cfg.ManifestURL == "" {
+		return
+	}
+	u, err := h.newUpdater(cfg)
 	if err != nil {
 		log.Printf("automatic update: %v", err)
 		return
@@ -368,7 +383,14 @@ func (h *Host) checkForUpdateMode(applyImmediately bool) (bool, error) {
 	if pending {
 		return true, nil
 	}
-	u, err := h.newUpdater(h.updaterConfig())
+	cfg, err := h.updaterConfig()
+	if err != nil {
+		return false, err
+	}
+	if cfg.ManifestURL == "" {
+		return false, errors.New("尚未配置更新源，请设置 CODEXRM_AGENT_UPDATE_SERVER 后重启 Agent")
+	}
+	u, err := h.newUpdater(cfg)
 	if err != nil {
 		return false, err
 	}

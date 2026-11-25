@@ -20,6 +20,7 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
+import android.text.InputType
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -3725,6 +3726,9 @@ internal class MainActivity : ComponentActivity() {
                     ),
                     SettingsPage.Section("应用", actions = listOf(
                         SettingsPage.Action("检查更新", ::checkForUpdates),
+                        SettingsPage.Action("更新源", ::showUpdateServerSettings) {
+                            if (store.updateServer.isBlank()) "未配置" else "已配置"
+                        },
                         SettingsPage.Action("关于", ::showAbout) { UpdateChecker.currentVersionName(this) },
                         SettingsPage.Action("开放源代码许可", { settingsPage?.showOpenSourceLicenses() }),
                         SettingsPage.Action("开源仓库", { settingsPage?.openRepository() }) {
@@ -3765,6 +3769,29 @@ internal class MainActivity : ComponentActivity() {
         styledDialog(builder)
     }
 
+    private fun showUpdateServerSettings() {
+        val input = Ui.boxInput(this, "HTTPS 更新站点（留空关闭）").apply {
+            setText(store.updateServer)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        val content = Ui.column(this).apply {
+            setPadding(Ui.dp(context, 24), Ui.dp(context, 4), Ui.dp(context, 24), Ui.dp(context, 8))
+            addView(input, matchWidth())
+        }
+        styledDialog(MiuixDialog.Builder(this).setTitle("更新源").setView(content)
+            .setNegativeButton("取消", null).setPositiveButton("保存") { _, _ ->
+                val normalized = UpdateChecker.normalizeUpdateServer(input.text.toString())
+                if (normalized == null) {
+                    toast("请输入不含账号、查询参数和片段的 HTTPS 更新站点")
+                } else {
+                    cancelUpdateOperation()
+                    startupUpdate = null
+                    store.updateServer = normalized
+                    settingsPage?.refreshActionSummaries()
+                }
+            })
+    }
+
     private fun showAbout() {
         val content = Ui.column(this).apply {
             setPadding(Ui.dp(context, 24), Ui.dp(context, 8), Ui.dp(context, 24), Ui.dp(context, 16))
@@ -3781,8 +3808,13 @@ internal class MainActivity : ComponentActivity() {
 
         fun loadHistory() {
             history.removeAllViews()
+            val source = UpdateChecker.normalizeUpdateServer(store.updateServer).orEmpty()
+            if (source.isEmpty()) {
+                history.addView(Ui.text(this, "未配置更新源", 12f, Ui.MUTED))
+                return
+            }
             history.addView(Ui.text(this, "正在读取更新日志…", 12f, Ui.MUTED))
-            historyCall = UpdateChecker.fetchHistory { releases, error ->
+            historyCall = UpdateChecker.fetchHistory(source) { releases, error ->
                 if (!dialog.isShowing || isFinishing || isDestroyed) return@fetchHistory
                 history.removeAllViews()
                 if (error != null || releases == null) {
@@ -3920,8 +3952,10 @@ internal class MainActivity : ComponentActivity() {
     }
 
     private fun checkForUpdatesOnStartup() {
+        val source = UpdateChecker.normalizeUpdateServer(store.updateServer).orEmpty()
+        if (source.isEmpty()) return
         val operation = updateOperation
-        updateCall = UpdateChecker.fetchLatest { latest, error ->
+        updateCall = UpdateChecker.fetchLatest(source) { latest, error ->
             if (operation != updateOperation || isFinishing || isDestroyed) return@fetchLatest
             updateCall = null
             if (error != null || latest == null || latest.versionCode <= UpdateChecker.currentVersionCode(this)) {
@@ -3941,6 +3975,11 @@ internal class MainActivity : ComponentActivity() {
     }
 
     private fun checkForUpdates() {
+        val source = UpdateChecker.normalizeUpdateServer(store.updateServer).orEmpty()
+        if (source.isEmpty()) {
+            showUpdateServerSettings()
+            return
+        }
         cancelUpdateOperation()
         val operation = updateOperation
         val spinner = MiuixProgressView(this)
@@ -3958,7 +3997,7 @@ internal class MainActivity : ComponentActivity() {
         )
         updateDialog = dialog
         dialog.setOnCancelListener { if (operation == updateOperation) cancelUpdateOperation() }
-        updateCall = UpdateChecker.fetchLatest { latest, error ->
+        updateCall = UpdateChecker.fetchLatest(source) { latest, error ->
             if (operation != updateOperation || isDestroyed) return@fetchLatest
             updateCall = null
             updateDialog = null

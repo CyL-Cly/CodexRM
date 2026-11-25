@@ -37,7 +37,7 @@ func TestNativeInstallationCreatesOnlyDirectRestartShortcut(t *testing.T) {
 		t.Fatal("native installation contains a script directory")
 	}
 	cfg, err := clientconfig.Load(filepath.Join(root, ".state", "connection.json"))
-	if err != nil || cfg.Server != clientconfig.DefaultRelayServer || cfg.EnrollmentKey != "" || cfg.UpdateServer != clientconfig.DefaultUpdateServer {
+	if err != nil || cfg.Server != clientconfig.DefaultRelayServer || cfg.EnrollmentKey != "" {
 		t.Fatalf("new installation should use the public relay without a key: %+v, %v", cfg, err)
 	}
 	cfg.Server, cfg.EnrollmentKey = "https://relay.example", "keep-secret"

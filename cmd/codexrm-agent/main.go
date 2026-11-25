@@ -181,14 +181,18 @@ func main() {
 		if *updateDir == "" && (runtime.GOOS != "linux" || *installUpdate) {
 			fatal("--update-dir is required")
 		}
-		manifest := cfg.ManifestURL()
-		if runtime.GOOS == "linux" {
-			if runtime.GOARCH != "amd64" {
-				fatal("the Linux Agent update feed is for amd64")
-			}
-			manifest = clientconfig.LinuxUpdateManifest
+		linux := runtime.GOOS == "linux"
+		if linux && runtime.GOARCH != "amd64" {
+			fatal("the Linux Agent update feed is for amd64")
 		}
-		u, err := updater.New(updater.Config{ServerURL: cfg.UpdateServer, ManifestURL: manifest, InstallDir: *updateDir, VersionCode: *currentVersion})
+		updateServer, manifest, err := clientconfig.UpdateFeed(linux)
+		if err != nil {
+			fatal(err)
+		}
+		if manifest == "" {
+			fatal("set CODEXRM_AGENT_UPDATE_SERVER to a trusted HTTPS update source")
+		}
+		u, err := updater.New(updater.Config{ServerURL: updateServer, ManifestURL: manifest, InstallDir: *updateDir, VersionCode: *currentVersion})
 		if err != nil {
 			fatal(err)
 		}

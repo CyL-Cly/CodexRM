@@ -151,7 +151,9 @@ Linux Agent 设置页的「QQ 机器人 → OneBot 11」可直接连接 NapCat�
 
 安装器输出到 `build/dist`。
 
-已安装的 Windows EXE 客户端每次启动立即检查更新，之后每 20 小时检查固定更新服务器的 `update.json`，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。
+Windows EXE 与 Linux amd64 Agent 不内置更新服务器。若要启用检查更新，在 Agent 进程环境中设置 `CODEXRM_AGENT_UPDATE_SERVER` 为可信的 HTTPS 更新站点（如 `https://updates.example.com/`），然后重启 Agent。配置后，Agent 启动时及每隔 20 小时检查清单，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。未配置更新源可从 GitHub Releases 手动更新。Windows 离线安装包无需更新源；联网安装器通过 `--manifest` 或 `CODEXRM_UPDATE_MANIFEST` 指定清单。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。
+
+Android 可在「设置 → 应用 → 更新源」填写可信的 HTTPS 更新站点，或留空关闭应用内更新检查，改从 GitHub Releases 下载签名 APK。此地址仅用于更新清单和更新日志，与中继配对地址分开。
 
 ## PWA 与加载缓存
 
@@ -306,13 +308,13 @@ Server 独立于 Windows、Android 和 Linux Agent 维护版本。运行 `/opt/c
 CODEXRM_SERVER_AUTO_UPDATE=true
 CODEXRM_SERVER_UPDATE_CRON="0 3 * * *"
 CODEXRM_SERVER_UPDATE_TZ=Asia/Singapore
-# 可选：换成自己信任并控制的 HTTPS Server 更新源
+# 要自动更新，请填入自己信任并控制的 HTTPS Server 更新源
 # CODEXRM_SERVER_UPDATE_URL=https://releases.example.com/server-update.json
 ```
 
 - 关闭自动更新：设置 `CODEXRM_SERVER_AUTO_UPDATE=false`。也可运行 `sudo systemctl disable --now codexrm-server-update.timer` 停止定时器；要恢复，设置为 `true`，再运行 `sudo systemctl enable --now codexrm-server-update.timer`。
 - Cron 使用五字段：分、时、日、月、星期。例：`"30 4 * * MON-FRI"` 表示工作日 04:30；`"0 3 * * SUN"` 表示每周日 03:00。`CODEXRM_SERVER_UPDATE_TZ` 支持 IANA 时区名。机器关机或定时器关闭时错过的检查不补跑。
-- 默认清单源为 `https://codexrm.dagongren.tech/server-update.json`。清单和下载都要求 HTTPS，安装前核对大小与 SHA-256。只信任管理员控制的更新源；不要把 Server 清单交给中继账户或其他非发布人员写入。
+- 公开安装包不内置更新源。由管理员在 `/etc/codexrm/server-update.env` 设置 `CODEXRM_SERVER_UPDATE_URL`；未设置时定时器不访问网络。清单和下载都要求 HTTPS，安装前核对大小与 SHA-256。只信任管理员控制的更新源；不要把 Server 清单交给中继账户或其他非发布人员写入。
 - 更新会一起替换 Server 程序和 Web 前端并重启中继，现有 WebSocket 会短暂断开。新版本启动失败或健康接口版本不匹配时，会尝试恢复旧程序和页面。更新器不替换 `server.env`、`data/` 或 systemd 中继配置；升级前仍建议备份。查看更新日志：`sudo journalctl -u codexrm-server-update.service -n 50 --no-pager`。
 
 **发布 Server 更新（Windows 构建机）**：首次用 `build\release-server.cmd nopause` 构建。后续发布前分别修改 `internal/release/server.go` 的 `ServerVersionName` 并递增 `ServerVersionCode`，不要重复使用已发布的版本号。输出在 `build/dist/`，其中 `.tar.gz` 是手动安装包，`.zip` 是自动更新包，`server-update.json` 是清单。使用 `build\release-server.cmd nopause -Publish` 构建并通过现有的 Cloudreve/RM 配置发布，失败可用 `-PublishOnly` 重试原包。首发前须先手动安装支持该接口的 Server。发布更新清单不会立即重启中继。

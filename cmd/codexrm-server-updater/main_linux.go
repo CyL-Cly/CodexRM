@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,7 +23,6 @@ import (
 )
 
 const installRoot = "/opt/codexrm"
-const defaultFeed = "https://codexrm.dagongren.tech/" + release.ServerManifestName
 const healthURL = "http://127.0.0.1:18080/api/v1/health"
 
 func main() {
@@ -57,13 +57,22 @@ func run(ctx context.Context, immediate, check bool) error {
 	if err != nil {
 		return err
 	}
-	feed, err := serverupdate.ParseFeed(env("CODEXRM_SERVER_UPDATE_URL", defaultFeed))
-	if err != nil {
-		return err
+	var feed *url.URL
+	if raw := strings.TrimSpace(os.Getenv("CODEXRM_SERVER_UPDATE_URL")); raw != "" {
+		feed, err = serverupdate.ParseFeed(raw)
+		if err != nil {
+			return err
+		}
 	}
 	if check {
-		fmt.Printf("Automatic Server updates: %t; cron: %s; timezone: %s; next matching time: %s\n",
-			enabled, spec, zone, schedule.Next(time.Now().In(schedule.Location)).Format(time.RFC3339))
+		fmt.Printf("Automatic Server updates: %t; update source configured: %t; cron: %s; timezone: %s; next matching time: %s\n",
+			enabled, feed != nil, spec, zone, schedule.Next(time.Now().In(schedule.Location)).Format(time.RFC3339))
+		return nil
+	}
+	if feed == nil {
+		if immediate {
+			return errors.New("set CODEXRM_SERVER_UPDATE_URL to a trusted HTTPS Server update manifest")
+		}
 		return nil
 	}
 	if !immediate && !serverupdate.Due(schedule, time.Now()) {

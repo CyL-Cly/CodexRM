@@ -18,6 +18,20 @@ class UpdateCheckerTest {
         }
     """.trimIndent()
 
+    private val manifestUrl = "https://updates.example/base/android-update.json"
+
+    @Test fun acceptsOnlyAnExplicitHttpsUpdateServer() {
+        assertEquals("", UpdateChecker.normalizeUpdateServer("  "))
+        assertEquals(null, UpdateChecker.updateEndpoint("", "android-update.json"))
+        assertEquals(manifestUrl, UpdateChecker.updateEndpoint(" https://updates.example/base/ ", "android-update.json"))
+        assertEquals("https://updates.example/base/release-history.json",
+            UpdateChecker.updateEndpoint("https://updates.example/base", "release-history.json"))
+        for (invalid in listOf("http://updates.example", "https:updates.example", "https://user@updates.example",
+            "https://@updates.example", "https://updates.example?x=1", "https://updates.example#fragment")) {
+            assertEquals(null, UpdateChecker.normalizeUpdateServer(invalid))
+        }
+    }
+
     @Test fun parsesManifestAndResolvesRelativeDownload() {
         val info = UpdateChecker.parseManifest(validManifest, "https://rm.example/base/android-update.json")
         assertEquals(4L, info.versionCode)
@@ -47,35 +61,36 @@ class UpdateCheckerTest {
             "updates/CodexRM.apk",
             "https://cloud.example/f/permanent/CodexRM.apk?key=public",
         )
-        val info = UpdateChecker.parseManifest(manifest)
+        val info = UpdateChecker.parseManifest(manifest, manifestUrl)
         assertEquals("https://cloud.example/f/permanent/CodexRM.apk?key=public", info.downloadUrl)
     }
 
     @Test(expected = IllegalArgumentException::class)
     fun rejectsNonHttpDownload() {
-        UpdateChecker.parseManifest(validManifest.replace("updates/CodexRM.apk", "file:///tmp/update.apk"))
+        UpdateChecker.parseManifest(validManifest.replace("updates/CodexRM.apk", "file:///tmp/update.apk"), manifestUrl)
     }
 
     @Test(expected = IllegalArgumentException::class)
     fun rejectsCredentialsInDownload() {
         UpdateChecker.parseManifest(
             validManifest.replace("updates/CodexRM.apk", "https://user:secret@cloud.example/update.apk"),
+            manifestUrl,
         )
     }
 
     @Test(expected = IllegalArgumentException::class)
     fun rejectsSchemeRelativeDownload() {
-        UpdateChecker.parseManifest(validManifest.replace("updates/CodexRM.apk", "//cloud.example/update.apk"))
+        UpdateChecker.parseManifest(validManifest.replace("updates/CodexRM.apk", "//cloud.example/update.apk"), manifestUrl)
     }
 
     @Test(expected = IllegalArgumentException::class)
     fun rejectsInvalidSha256() {
-        UpdateChecker.parseManifest(validManifest.replace("0123456789abcdef", "not-a-sha256-value"))
+        UpdateChecker.parseManifest(validManifest.replace("0123456789abcdef", "not-a-sha256-value"), manifestUrl)
     }
 
     @Test(expected = IllegalArgumentException::class)
     fun rejectsOversizedPackage() {
-        UpdateChecker.parseManifest(validManifest.replace("123456", (UpdateChecker.MAX_PACKAGE_SIZE + 1L).toString()))
+        UpdateChecker.parseManifest(validManifest.replace("123456", (UpdateChecker.MAX_PACKAGE_SIZE + 1L).toString()), manifestUrl)
     }
 
     @Test fun silentInstallFlagIsLimitedToAndroid12AndNewer() {

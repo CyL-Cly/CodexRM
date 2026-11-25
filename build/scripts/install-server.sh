@@ -189,7 +189,7 @@ if $update_enabled; then
             mv -fT -- "$root/bin/.codexrm-server-updater.next" "$root/bin/codexrm-server-updater" &&
             install -d -m 0755 "$config_dir" &&
             { [[ -e "$config_dir/server-update.env" ]] ||
-              install -m 0644 "$package_dir/deploy/codexrm-server-update.env.example" "$config_dir/server-update.env"; } &&
+              install -m 0600 "$package_dir/deploy/codexrm-server-update.env.example" "$config_dir/server-update.env"; } &&
             install -m 0644 "$package_dir/deploy/codexrm-server-update.service" "$updater_unit_dir/codexrm-server-update.service" &&
             install -m 0644 "$package_dir/deploy/$updater_timer" "$updater_unit_dir/$updater_timer" &&
             systemctl daemon-reload &&
