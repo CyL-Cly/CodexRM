@@ -58,7 +58,7 @@ func run(ctx context.Context, immediate, check bool) error {
 		return err
 	}
 	var feed *url.URL
-	if raw := strings.TrimSpace(os.Getenv("CODEXRM_SERVER_UPDATE_URL")); raw != "" {
+	if raw := release.UpdateEndpoint("CODEXRM_SERVER_UPDATE_URL", release.ServerManifestName); raw != "" {
 		feed, err = serverupdate.ParseFeed(raw)
 		if err != nil {
 			return err

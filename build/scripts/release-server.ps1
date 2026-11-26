@@ -5,6 +5,7 @@ param(
     [switch]$PublishOnly
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'release-update-flags.ps1')
 if ($Publish -and $PublishOnly) { throw 'Choose either -Publish or -PublishOnly.' }
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $projectRoot = Split-Path -Parent $buildRoot
@@ -47,7 +48,9 @@ try {
         try {
             $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
             foreach ($target in @('codexrm-server', 'codexrm-server-updater')) {
-                go build -trimpath -ldflags '-s -w' -o (Join-Path $bundle $target) "./cmd/$target"
+                $ldflags = '-s -w'
+                if ($target -eq 'codexrm-server-updater') { $ldflags += (Get-ReleaseUpdateLinkerFlags) }
+                go build -trimpath -ldflags $ldflags -o (Join-Path $bundle $target) "./cmd/$target"
                 if ($LASTEXITCODE) { throw "$target build failed." }
             }
         } finally {

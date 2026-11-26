@@ -9,13 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/codexrm/codexrm/internal/release"
 )
 
 const DefaultRelayServer = "https://codexrm.ooth.tech"
 
-// UpdateFeed is separate from pairing and only trusts local operator configuration.
+// UpdateFeed is separate from pairing. Local operator configuration overrides the release default.
 func UpdateFeed(linux bool) (base, manifest string, err error) {
-	raw := strings.TrimSpace(os.Getenv("CODEXRM_AGENT_UPDATE_SERVER"))
+	raw := release.UpdateEndpoint("CODEXRM_AGENT_UPDATE_SERVER", "")
 	if raw == "" {
 		return "", "", nil
 	}

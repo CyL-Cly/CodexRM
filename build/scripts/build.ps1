@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $root = Split-Path -Parent $buildRoot
 $ldflags = '-s -w'
+. (Join-Path $PSScriptRoot 'release-update-flags.ps1')
 
 if ($Interactive) {
     Write-Host ''
@@ -68,6 +69,7 @@ try {
         Write-Host ''
         Write-Host "Building $component for $env:GOOS/$env:GOARCH..."
         $componentLdflags = $ldflags
+        if ($component -eq 'agent') { $componentLdflags += (Get-ReleaseUpdateLinkerFlags) }
         if (-not $Linux -and $component -eq 'agent') { $componentLdflags += ' -H=windowsgui' }
         if ($Linux -and $component -eq 'agent' -and $wxbotLock64) {
             $componentLdflags += " -X github.com/codexrm/codexrm/internal/agenthost.wxReleaseImageLock=$wxbotLock64"

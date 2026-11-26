@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/codexrm/codexrm/internal/installation"
+	"github.com/codexrm/codexrm/internal/release"
 	"github.com/codexrm/codexrm/internal/updater"
 )
 
@@ -78,7 +79,7 @@ func hasOption(args []string, name string) bool {
 
 func parseOptions(args []string, output io.Writer) (options, error) {
 	var opts options
-	manifestDefault := strings.TrimSpace(os.Getenv("CODEXRM_UPDATE_MANIFEST"))
+	manifestDefault := release.UpdateEndpoint("CODEXRM_UPDATE_MANIFEST", "update.json")
 	flags := flag.NewFlagSet("codexrm-setup", flag.ContinueOnError)
 	flags.SetOutput(output)
 	flags.StringVar(&opts.manifestURL, "manifest", manifestDefault, "可信的 update.json 地址（仅联网安装需要）")
