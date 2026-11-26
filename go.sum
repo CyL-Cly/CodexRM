@@ -1,7 +1,7 @@
 github.com/CyL-Cly/CodexRM-Agent v0.0.0-20261126104517-b626ef809da1 h1:tOq+P2h6qIhtQ4/62VnxUd5ahQAmLMlyUl5fsNHbkXY=
 github.com/CyL-Cly/CodexRM-Agent v0.0.0-20261126104517-b626ef809da1/go.mod h1:lwHD07MtlfcBo8fpKKsb12AsCsLOkLIKlHEEOBe/A68=
-github.com/CyL-Cly/CodexRM-Server v0.0.0-20261126112033-43e5d4286d91 h1:ScFA/FIi8MoOfcTcxUM0OpUlieOaFIKN7EGgUcHWM2g=
-github.com/CyL-Cly/CodexRM-Server v0.0.0-20261126112033-43e5d4286d91/go.mod h1:28Gsv8XGtTA+UPrMKCDgaRnG3wFJBovWuXNJo7SNPS4=
+github.com/CyL-Cly/CodexRM-Server v0.0.0-20261126112553-cdd81a1720ea h1:PY1mNcgZPLW5E9cmLj0I+wp7yWNhzuhdg7qIsWJHbGE=
+github.com/CyL-Cly/CodexRM-Server v0.0.0-20261126112553-cdd81a1720ea/go.mod h1:28Gsv8XGtTA+UPrMKCDgaRnG3wFJBovWuXNJo7SNPS4=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
