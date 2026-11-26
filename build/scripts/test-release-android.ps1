@@ -18,7 +18,7 @@ $config = Join-Path $testRoot 'publish.config.json'
 $logPath = Join-Path $testRoot 'events.log'
 $fixtureTool = Join-Path $testRoot 'fixture.exe'
 $savedEnvironment = @{}
-foreach ($key in @('JAVA_EXE','BUILD_PROXY','ANDROID_HOME','ANDROID_SDK_ROOT','CODEXRM_ANDROID_TEST_ROOT','CODEXRM_ANDROID_TEST_MODE','CODEXRM_ANDROID_TEST_PACKAGE','CODEXRM_ANDROID_TEST_CODE','CODEXRM_ANDROID_TEST_NAME','CODEXRM_ANDROID_TEST_SIGNATURE')) {
+foreach ($key in @('JAVA_EXE','BUILD_PROXY','ANDROID_HOME','ANDROID_SDK_ROOT','CODEXRM_RELEASE_UPDATE_BASE','CODEXRM_ANDROID_TEST_ROOT','CODEXRM_ANDROID_TEST_MODE','CODEXRM_ANDROID_TEST_PACKAGE','CODEXRM_ANDROID_TEST_CODE','CODEXRM_ANDROID_TEST_NAME','CODEXRM_ANDROID_TEST_SIGNATURE')) {
     $savedEnvironment[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
 }
 $env:JAVA_EXE = $fixtureTool
@@ -30,6 +30,7 @@ function Assert-AndroidRelease([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 function Reset-Fixture {
+    $env:CODEXRM_RELEASE_UPDATE_BASE = ''
     $env:CODEXRM_ANDROID_TEST_MODE = ''
     $env:CODEXRM_ANDROID_TEST_PACKAGE = ''
     $env:CODEXRM_ANDROID_TEST_CODE = ''
@@ -67,6 +68,7 @@ package main
 
 import (
     "archive/zip"
+    "encoding/binary"
     "fmt"
     "os"
     "path/filepath"
@@ -135,6 +137,15 @@ func main() {
             writer, err := archive.Create(entry.name)
             if err != nil { panic(err) }
             if _, err := writer.Write([]byte(entry.contents)); err != nil { panic(err) }
+            if entry.name == "classes.dex" && mode != "missing origin" {
+                if origin := os.Getenv("CODEXRM_RELEASE_UPDATE_BASE"); origin != "" {
+                    if mode == "partial origin" { origin += "/extra" }
+                    var prefix [binary.MaxVarintLen64]byte
+                    n := binary.PutUvarint(prefix[:], uint64(len(origin)))
+                    if _, err := writer.Write(prefix[:n]); err != nil { panic(err) }
+                    if _, err := writer.Write(append([]byte(origin), 0)); err != nil { panic(err) }
+                }
+            }
         }
         if err := archive.Close(); err != nil { panic(err) }
         if err := file.Close(); err != nil { panic(err) }
@@ -167,7 +178,9 @@ if (-not $ValidateOnly -and $env:CODEXRM_ANDROID_TEST_MODE -eq 'manifest failure
     [IO.File]::WriteAllText($windowsManifest, 'Windows manifest sentinel')
 
     Reset-Fixture
+    $env:CODEXRM_RELEASE_UPDATE_BASE = 'https://environment.example'
     & $releaseScript -Config $config -ReleaseNotes 'fixture release'
+    Assert-AndroidRelease ($env:CODEXRM_RELEASE_UPDATE_BASE -ceq 'https://environment.example') 'The temporary update origin leaked into the caller environment.'
     $events = @(Get-Events)
     $version = [IO.File]::ReadAllText($versionPath)
     Assert-AndroidRelease ($version.Contains('versionCode = 11') -and $version.Contains('versionName = "1.2.4"')) 'Default Android release did not increment both versions.'
@@ -175,6 +188,8 @@ if (-not $ValidateOnly -and $env:CODEXRM_ANDROID_TEST_MODE -eq 'manifest failure
     Assert-AndroidRelease ($events[2].Contains('testDebugUnitTest assembleRelease -Pcodexrm.testSign')) 'Default release did not run tests and build the signed Release APK.'
     Assert-AndroidRelease ($events[-2] -ceq 'publisher' -and $events[-1] -ceq 'manifest:android-update.json:False') 'Manifest activation did not follow APK upload.'
     $metadata = Get-Content -LiteralPath (Join-Path $dist 'android-update.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-AndroidRelease (-not ($events -join ' ').Contains('https://rm.example')) 'Update origin was passed as a command-line flag.'
+    Assert-AndroidRelease (-not ($metadata | ConvertTo-Json).Contains('https://rm.example')) 'Update origin was written into the packaged manifest.'
     Assert-AndroidRelease ($metadata.releaseNotes -ceq 'fixture release' -and $metadata.versionCode -eq 11) 'Release notes/version were not packaged.'
     Assert-AndroidRelease ([IO.File]::ReadAllText($windowsManifest) -ceq 'Windows manifest sentinel') 'Android release modified the Windows manifest.'
     Write-Host 'PASS: Default release bumps only Android, runs tests, packages, uploads, then activates the Android manifest.'
@@ -187,6 +202,30 @@ if (-not $ValidateOnly -and $env:CODEXRM_ANDROID_TEST_MODE -eq 'manifest failure
     Assert-AndroidRelease ($events.Count -eq 1 -and $events[0].Contains('-Dhttp.proxyHost=127.0.0.1') -and $events[0].Contains('-Dhttps.proxyPort=8848')) 'Build-only mode performed publication or lost proxy settings.'
     Assert-AndroidRelease (-not $env:BUILD_PROXY) 'Build proxy settings leaked into the caller environment.'
     Write-Host 'PASS: Local builds retain the requested version, accept proxy settings, and require no publication configuration.'
+
+    [IO.File]::WriteAllText($logPath, '')
+    Expect-Failure { & $releaseScript -Config $config -PublishOnly }
+    Assert-AndroidRelease (@(Get-Events | Where-Object { $_ -eq 'publisher' }).Count -eq 0) 'Publish-only uploaded an APK without the configured update origin.'
+    $env:CODEXRM_RELEASE_UPDATE_BASE = 'https://rm.example/'
+    & $releaseScript -BuildOnly -KeepVersion -Config (Join-Path $testRoot 'missing-config.json')
+    & $releaseScript -Config $config -PublishOnly
+    Write-Host 'PASS: Publish-only rejects a defaultless APK and accepts a build injected via the environment.'
+
+    foreach ($mode in @('missing origin', 'partial origin')) {
+        Reset-Fixture
+        $original = [IO.File]::ReadAllBytes($versionPath)
+        $env:CODEXRM_ANDROID_TEST_MODE = $mode
+        Expect-Failure { & $releaseScript -Config $config }
+        Assert-OriginalVersion $original
+        Assert-AndroidRelease (@(Get-Events | Where-Object { $_ -eq 'publisher' }).Count -eq 0) 'An APK without the complete update origin was uploaded.'
+    }
+    Reset-Fixture
+    $original = [IO.File]::ReadAllBytes($versionPath)
+    $env:CODEXRM_RELEASE_UPDATE_BASE = 'https://fixture.example/subpath'
+    Expect-Failure { & $releaseScript -BuildOnly -Config (Join-Path $testRoot 'missing-config.json') }
+    Assert-OriginalVersion $original
+    Assert-AndroidRelease ((Get-Events).Count -eq 0) 'Invalid update origin reached a build.'
+    Write-Host 'PASS: Missing, prefix-only, and invalid update origins fail before upload.'
 
     foreach ($mode in @('build failure', 'package failure')) {
         Reset-Fixture
@@ -228,7 +267,7 @@ if (-not $ValidateOnly -and $env:CODEXRM_ANDROID_TEST_MODE -eq 'manifest failure
     Assert-AndroidRelease (@(Get-Events | Where-Object { $_ -eq 'publisher' }).Count -eq 0) 'A tampered package was uploaded.'
     Write-Host 'PASS: Publish-only rejects APK/manifest mismatches before upload.'
 
-    & $releaseScript -BuildOnly -KeepVersion
+    & $releaseScript -BuildOnly -KeepVersion -Config $config
     foreach ($case in @('wrong package', 'stale code', 'stale name', 'unsigned', 'missing certificate')) {
         $env:CODEXRM_ANDROID_TEST_PACKAGE = ''
         $env:CODEXRM_ANDROID_TEST_CODE = ''

@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory=$true)][string]$ApkPath,
     [Parameter(Mandatory=$true)][long]$ExpectedVersionCode,
-    [Parameter(Mandatory=$true)][string]$ExpectedVersionName
+    [Parameter(Mandatory=$true)][string]$ExpectedVersionName,
+    [string]$ExpectedUpdateOrigin
 )
 $ErrorActionPreference = 'Stop'
 $buildRoot = Split-Path -Parent $PSScriptRoot
@@ -71,6 +72,28 @@ try {
     $manifestEntries = @($archive.Entries | Where-Object { $_.FullName.Replace('\', '/') -ceq 'AndroidManifest.xml' })
     if ($manifestEntries.Count -ne 1 -or $manifestEntries[0].Length -le 0) {
         throw 'The APK ZIP does not contain exactly one non-empty AndroidManifest.xml.'
+    }
+    if ($ExpectedUpdateOrigin) {
+        # DEX strings store their UTF-16 length as ULEB128, followed by data and a NUL.
+        # Origins are ASCII, so matching the full string avoids accepting a URL prefix.
+        $encoding = [Text.Encoding]::GetEncoding(28591)
+        $prefix = [Text.StringBuilder]::new()
+        $length = $ExpectedUpdateOrigin.Length
+        while ($length -ge 128) {
+            [void]$prefix.Append([char](($length -band 127) -bor 128))
+            $length = $length -shr 7
+        }
+        [void]$prefix.Append([char]$length)
+        $needle = $prefix.ToString() + $ExpectedUpdateOrigin + "`0"
+        $found = $false
+        foreach ($entry in $archive.Entries) {
+            if ($entry.FullName -cnotmatch '^classes(\d+)?\.dex$') { continue }
+            $reader = [IO.StreamReader]::new($entry.Open(), $encoding, $false)
+            try {
+                if ($reader.ReadToEnd().Contains($needle)) { $found = $true; break }
+            } finally { $reader.Dispose() }
+        }
+        if (-not $found) { throw 'The expected default update origin is missing from the Release APK.' }
     }
 } catch {
     throw "APK is not a valid ZIP/Android package: $ApkPath. $($_.Exception.Message)"

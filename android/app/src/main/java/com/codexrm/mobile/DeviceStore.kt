@@ -38,7 +38,7 @@ internal class DeviceStore(context: Context) {
         set(value) = uiPrefs.edit().putString("last_server", value).apply()
 
     var updateServer: String
-        get() = uiPrefs.getString("update_server", "").orEmpty()
+        get() = uiPrefs.getString("update_server", BuildConfig.DEFAULT_UPDATE_SERVER).orEmpty()
         set(value) = uiPrefs.edit().putString("update_server", value).apply()
 
     var sandbox: String

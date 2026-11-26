@@ -30,7 +30,10 @@ Default: bump Android version, run tests, build a signed Release APK,
   -Help               Print this help without building or publishing.
 
 Signing uses .signature/debug.keystore in the project root (-Pcodexrm.testSign),
-matching the APKs currently distributed by this project.
+matching the APKs currently distributed by this project. Official builds use
+rm.server from the local publication config as their default update origin.
+For a local build without a config, set CODEXRM_RELEASE_UPDATE_BASE to inject
+an origin, or leave it unset to build without a default update source.
 '@
     return
 }
@@ -45,11 +48,21 @@ if (-not $OutputDirectory) { $OutputDirectory = Join-Path $buildRoot 'dist' }
 $Config = [IO.Path]::GetFullPath($Config)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 
-function Assert-AndroidPackage($Apk, $Manifest, [long]$Code, [string]$Name) {
+function Resolve-AndroidUpdateOrigin([string]$Value) {
+    $origin = $Value.Trim().TrimEnd('/')
+    $uri = $null
+    if ($origin -cnotmatch '^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$' -or
+        -not [Uri]::TryCreate($origin, [UriKind]::Absolute, [ref]$uri) -or $uri.Port -eq 0) {
+        throw 'The Android Release update source must be an HTTPS origin without credentials or a path.'
+    }
+    return $origin
+}
+
+function Assert-AndroidPackage($Apk, $Manifest, [long]$Code, [string]$Name, [string]$UpdateOrigin) {
     if (-not (Test-Path -LiteralPath $Apk -PathType Leaf) -or -not (Test-Path -LiteralPath $Manifest -PathType Leaf)) {
         throw 'No APK/android-update.json for this version. Build the package first.'
     }
-    & (Join-Path $PSScriptRoot 'assert-android-package.ps1') -ApkPath $Apk -ExpectedVersionCode $Code -ExpectedVersionName $Name
+    & (Join-Path $PSScriptRoot 'assert-android-package.ps1') -ApkPath $Apk -ExpectedVersionCode $Code -ExpectedVersionName $Name -ExpectedUpdateOrigin $UpdateOrigin
     $metadata = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($metadata.versionCode -ne $Code -or $metadata.versionName -cne $Name -or
         $metadata.fileSize -ne (Get-Item -LiteralPath $Apk).Length -or
@@ -70,9 +83,18 @@ try {
         $lock = [IO.File]::Open((Join-Path $binDirectory '.android-release.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     } catch { throw 'Another Android release is running, or the release lock cannot be opened.' }
 
-    if (-not $BuildOnly) {
-        if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) { throw 'Configure build/publish.config.json first, or use -BuildOnly.' }
+    $publishConfig = $null
+    if (Test-Path -LiteralPath $Config -PathType Leaf) {
         $publishConfig = Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    $updateOrigin = ''
+    if (-not $BuildOnly -or ($publishConfig -and $publishConfig.rm.server)) {
+        if (-not $publishConfig) { throw 'Configure build/publish.config.json first, or use -BuildOnly.' }
+        $updateOrigin = Resolve-AndroidUpdateOrigin ([string]$publishConfig.rm.server)
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:CODEXRM_RELEASE_UPDATE_BASE)) {
+        $updateOrigin = Resolve-AndroidUpdateOrigin $env:CODEXRM_RELEASE_UPDATE_BASE
+    }
+    if (-not $BuildOnly) {
         if (-not $publishConfig.cloudreve.base -or -not $publishConfig.cloudreve.email -or
             (-not $publishConfig.cloudreve.password -and -not $env:CLOUDREVE_PASSWORD)) {
             throw 'Configure Cloudreve base/email/password (or CLOUDREVE_PASSWORD) first.'
@@ -105,7 +127,7 @@ try {
     $manifest = Join-Path $OutputDirectory 'android-update.json'
 
     if ($PublishOnly) {
-        Assert-AndroidPackage $apk $manifest $code $name
+        Assert-AndroidPackage $apk $manifest $code $name $updateOrigin
         $builtPackage = $true
     } else {
         if ($JavaExe) {
@@ -153,19 +175,22 @@ try {
         Write-Host "Running Android tests and Release build. Log: $buildLog"
         Push-Location $androidRoot
         $previousPreference = $ErrorActionPreference
+        $previousUpdateOrigin = [Environment]::GetEnvironmentVariable('CODEXRM_RELEASE_UPDATE_BASE', 'Process')
         try {
+            [Environment]::SetEnvironmentVariable('CODEXRM_RELEASE_UPDATE_BASE', $updateOrigin, 'Process')
             # PowerShell 5.1 wraps native stderr as errors, including harmless JVM warnings.
             $ErrorActionPreference = 'Continue'
             $global:LASTEXITCODE = 1
             & $JavaExe @proxyArguments -jar $wrapper testDebugUnitTest assembleRelease '-Pcodexrm.testSign' --console=plain @proxyArguments *> $buildLog
             $gradleExit = $LASTEXITCODE
         } finally {
+            [Environment]::SetEnvironmentVariable('CODEXRM_RELEASE_UPDATE_BASE', $previousUpdateOrigin, 'Process')
             $ErrorActionPreference = $previousPreference
             Pop-Location
         }
         if ($gradleExit) { throw "Android tests/build failed (exit $gradleExit). See $buildLog" }
         & (Join-Path $PSScriptRoot 'package-android.ps1') -ApkPath (Join-Path $androidRoot 'app\build\outputs\apk\release\app-release.apk') -OutputPath $apk -ReleaseNotes $ReleaseNotes
-        Assert-AndroidPackage $apk $manifest $code $name
+        Assert-AndroidPackage $apk $manifest $code $name $updateOrigin
         $builtPackage = $true
         Get-Content -LiteralPath $buildLog -Tail 12
         Write-Host "APK: $apk"
