@@ -12,6 +12,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Parcel
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.Settings
 import java.io.InputStream
 import java.io.IOException
@@ -40,9 +41,17 @@ internal object LocalCodex {
     fun serviceIntent() = Intent().setComponent(ComponentName(PACKAGE, "$PACKAGE.RuntimeService"))
 }
 
+private const val LOCAL_FOREGROUND_RENEW_MS = 8_000L
+
+internal fun needsLocalForegroundRenewal(manufacturer: String, brand: String): Boolean =
+    listOf(manufacturer, brand).any { value ->
+        value.equals("oppo", ignoreCase = true) || value.equals("oneplus", ignoreCase = true) ||
+            value.equals("realme", ignoreCase = true)
+    }
+
 /** Same Agent envelopes as the remote connection, isolated to two anonymous Binder-transferred pipes. */
 internal class LocalCodexConnection(
-    private val app: Context,
+    private val context: Context,
     private val onFrame: (String) -> Unit,
     private val onFailure: (String, Boolean) -> Unit,
 ) : ServiceConnection {
@@ -55,17 +64,29 @@ internal class LocalCodexConnection(
     private var read: InputStream? = null
     private var write: OutputStream? = null
     private var writer: Thread? = null
+    private val renewWhileWorking = needsLocalForegroundRenewal(Build.MANUFACTURER, Build.BRAND)
+    private var foregroundRefreshedAt: Long? = null
+    private var busy = false
+    private val renewForeground = object : Runnable {
+        override fun run() {
+            if (!busy || closed.get()) return
+            if (!refreshForeground()) return
+            main.postDelayed(this, LOCAL_FOREGROUND_RENEW_MS)
+        }
+    }
     private val startupTimeout = Runnable { fail("启动本机 Codex 超时。") }
 
     fun start() {
         if (!LocalCodex.supported) { fail(LocalCodex.UNSUPPORTED); return }
-        if (!LocalCodex.available(app)) {
-            fail(if (LocalCodex.installed(app)) "本机运行扩展的签名与 CodexRM 不一致。" else "请先安装「Codex 本地运行扩展」。")
+        if (!LocalCodex.available(context)) {
+            fail(if (LocalCodex.installed(context)) "本机运行扩展的签名与 CodexRM 不一致。" else "请先安装「Codex 本地运行扩展」。")
             return
         }
-        foregroundStarted = runCatching { app.startForegroundService(LocalCodex.serviceIntent()) != null }.getOrDefault(false)
+        foregroundStarted = refreshForeground()
         if (!foregroundStarted) { fail("Android 未允许启动本机运行扩展。"); return }
-        bound = runCatching { app.bindService(LocalCodex.serviceIntent(), this, Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT) }.getOrDefault(false)
+        // Bind through the visible Activity so the extension shares its foreground importance.
+        val flags = Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT or Context.BIND_ADJUST_WITH_ACTIVITY
+        bound = runCatching { context.bindService(LocalCodex.serviceIntent(), this, flags) }.getOrDefault(false)
         if (!bound) fail("无法连接本机运行扩展。") else main.postDelayed(startupTimeout, 30_000)
     }
 
@@ -124,7 +145,26 @@ internal class LocalCodexConnection(
         true
     }
 
-    fun send(frame: String): Boolean = !closed.get() && queue.offer((frame + "\n").toByteArray(Charsets.UTF_8))
+    // ColorOS can freeze the separate package even while the Activity is visible and
+    // the service is foreground. Renew the already-running service before sending
+    // and only while work remains. This wakes the existing pipes, not a new session.
+    private fun refreshForeground(): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (foregroundRefreshedAt?.let { now - it < LOCAL_FOREGROUND_RENEW_MS } == true) return true
+        val started = runCatching { context.startForegroundService(LocalCodex.serviceIntent()) != null }.getOrDefault(false)
+        if (started) foregroundRefreshedAt = now
+        return started
+    }
+
+    fun setBusy(value: Boolean) {
+        if (!renewWhileWorking || closed.get() || busy == value) return
+        busy = value
+        main.removeCallbacks(renewForeground)
+        if (busy) main.postDelayed(renewForeground, LOCAL_FOREGROUND_RENEW_MS)
+    }
+
+    fun send(frame: String): Boolean = !closed.get() && (!renewWhileWorking || refreshForeground()) &&
+        queue.offer((frame + "\n").toByteArray(Charsets.UTF_8))
     private fun fail(message: String, permission: Boolean = false) {
         main.post {
             if (!closed.get()) {
@@ -140,8 +180,9 @@ internal class LocalCodexConnection(
     fun close() {
         if (!closed.compareAndSet(false, true)) return
         main.removeCallbacks(startupTimeout)
-        if (bound) { runCatching { app.unbindService(this) }; bound = false }
-        if (foregroundStarted) { runCatching { app.stopService(LocalCodex.serviceIntent()) }; foregroundStarted = false }
+        main.removeCallbacks(renewForeground)
+        if (bound) { runCatching { context.unbindService(this) }; bound = false }
+        if (foregroundStarted) { runCatching { context.stopService(LocalCodex.serviceIntent()) }; foregroundStarted = false }
         synchronized(streams) {
             writer?.interrupt()
             runCatching { write?.close() }

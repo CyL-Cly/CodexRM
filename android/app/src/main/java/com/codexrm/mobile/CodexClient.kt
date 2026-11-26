@@ -75,6 +75,7 @@ internal class CodexClient(
     private val pending = HashMap<Int, Pending>()
     private var socket: WebSocket? = null
     private var local: LocalCodexConnection? = null
+    private val localRunningThreads = mutableSetOf<String>()
     private val isLocal get() = device.agentId == LocalCodex.AGENT
     private var active = false
     private var online = false
@@ -89,6 +90,7 @@ internal class CodexClient(
     private var directActive = false
     private var directLan = false
     private var directNetworkHandle = 0L
+    private val localContext = context.takeIf { isLocal }
     private val appContext = context.applicationContext
     private var directWifiLock: WifiManager.WifiLock? = null
     internal val usingDirect: Boolean get() = directActive
@@ -182,7 +184,7 @@ internal class CodexClient(
         active = true
         if (isLocal) {
             listener.onState(ConnectionState.CONNECTING, null)
-            local = LocalCodexConnection(appContext, { handle(it, authenticated = true) }, { message, permission ->
+            local = LocalCodexConnection(requireNotNull(localContext), { handle(it, authenticated = true) }, { message, permission ->
                 stop()
                 listener.onState(ConnectionState.OFFLINE, null)
                 if (permission) listener.onLocalPermissionRequired() else listener.onFailure(message)
@@ -289,12 +291,14 @@ internal class CodexClient(
             "server_message" -> {
                 val message = envelope.optJSONObject("message") ?: return
                 if (message.has("method")) {
+                    if (isLocal) trackLocalTurn(message)
                     listener.onRpcEvent(message)
                     return
                 }
                 val id = (message.opt("id") as? Number)?.toInt() ?: return
                 val request = pending[id]?.takeIf { it.direct == onDirect } ?: return
                 pending.remove(id)
+                updateLocalWork()
                 main.removeCallbacks(request.timeout)
                 val error = message.optJSONObject("error")
                 if (error == null) request.callback.onComplete(message.optJSONObject("result") ?: JSONObject(), null)
@@ -303,6 +307,7 @@ internal class CodexClient(
             "error" -> {
                 val id = envelope.string("streamId").toIntOrNull()
                 val request = if (id == null) null else pending[id]?.takeUnless { it.direct }?.also { pending.remove(id) }
+                updateLocalWork()
                 if (request == null) {
                     listener.onFailure(envelope.string("error").ifEmpty { "中继请求失败" })
                 } else {
@@ -311,6 +316,21 @@ internal class CodexClient(
                 }
             }
         }
+    }
+
+    private fun updateLocalWork() {
+        local?.setBusy(pending.isNotEmpty() || localRunningThreads.isNotEmpty())
+    }
+
+    private fun trackLocalTurn(message: JSONObject) {
+        val threadId = message.optJSONObject("params")?.string("threadId").orEmpty()
+        if (threadId.isEmpty()) return
+        when (message.string("method")) {
+            "turn/started" -> localRunningThreads.add(threadId)
+            "turn/completed" -> localRunningThreads.remove(threadId)
+            else -> return
+        }
+        updateLocalWork()
     }
 
     private fun sendSignal(kind: String, id: String = ""): Boolean {
@@ -714,7 +734,9 @@ internal class CodexClient(
         nextId = if (nextId == Int.MAX_VALUE) 1 else nextId + 1
         val id = nextId
         val timeout = Runnable {
-            pending.remove(id)?.callback?.onComplete(null, RpcOutcomeUnknown(if (requireDirect) "P2P 直连请求超时" else "请求超时，请检查本地 Codex 是否正常运行"))
+            val request = pending.remove(id)
+            updateLocalWork()
+            request?.callback?.onComplete(null, RpcOutcomeUnknown(if (requireDirect) "P2P 直连请求超时" else "请求超时，请检查本地 Codex 是否正常运行"))
         }
         val onDirect = directActive
         pending[id] = Pending(callback, timeout, onDirect)
@@ -728,6 +750,7 @@ internal class CodexClient(
             callback.onComplete(null, IOException("消息发送失败"))
             return
         }
+        updateLocalWork()
         main.postDelayed(timeout, timeoutMs)
     }
 
@@ -787,6 +810,8 @@ internal class CodexClient(
     private fun rejectPending(message: String) {
         val requests = pending.values.toList()
         pending.clear()
+        localRunningThreads.clear()
+        updateLocalWork()
         requests.forEach {
             main.removeCallbacks(it.timeout)
             it.callback.onComplete(null, RpcOutcomeUnknown(message))

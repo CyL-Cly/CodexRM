@@ -2,7 +2,11 @@ package com.codexrm.mobile
 
 import org.json.JSONObject
 
-internal class ModelCatalog(result: JSONObject = JSONObject()) {
+// The on-device runtime has no official account sign-in. Match provider identities, not model names.
+internal fun JSONObject.isLocalThirdPartyProvider(): Boolean =
+    string("id").startsWith("ccswitch_") && string("runtimeId") == string("id")
+
+internal class ModelCatalog(result: JSONObject = JSONObject(), localOnly: Boolean = false) {
     private class Provider(value: JSONObject) {
         val id = value.string("id")
         val runtimeId = value.string("runtimeId")
@@ -14,7 +18,9 @@ internal class ModelCatalog(result: JSONObject = JSONObject()) {
     }
 
     private val providers = result.arrayAt("providers").let { array ->
-        (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let(::Provider) }
+        (0 until array.length()).mapNotNull { array.optJSONObject(it) }
+            .filter { !localOnly || it.isLocalThirdPartyProvider() }
+            .map(::Provider)
     }
 
     fun providerId(runtimeId: String): String = providers.firstOrNull {

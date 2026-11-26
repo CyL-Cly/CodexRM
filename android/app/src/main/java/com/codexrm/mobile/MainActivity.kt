@@ -1491,15 +1491,15 @@ internal class MainActivity : ComponentActivity() {
         } else rpc("model/list", JSONObject().put("limit", 100)) { result, _ ->
             if (result == null || requestGeneration != generation || sequence != modelLoadSequence) return@rpc
             val provider = JSONObject().put("name", "当前 Codex 配置").put("models", result.arrayAt("data"))
-            modelCatalog = ModelCatalog(JSONObject().put("providers", JSONArray().put(provider)))
-            refreshModelChoices()
+            parseProviderModels(JSONObject().put("providers", JSONArray().put(provider)), showWarnings = false)
         }
     }
 
     private fun parseProviderModels(result: JSONObject, showWarnings: Boolean) {
         modelCatalogLoaded = true
-        modelCatalog = ModelCatalog(result)
+        modelCatalog = ModelCatalog(result, localOnly = currentAgent() == LocalCodex.AGENT)
         refreshModelChoices()
+        updateSendState()
         val warnings = result.arrayAt("warnings")
         if (showWarnings && warnings.length() > 0) toast((0 until warnings.length()).joinToString("；") { warnings.optString(it) })
     }
@@ -1603,6 +1603,16 @@ internal class MainActivity : ComponentActivity() {
             return
         }
         selectionDialog?.dismiss()
+        if (currentAgent() == LocalCodex.AGENT && models.isEmpty()) {
+            if (!modelCatalogLoaded) {
+                toast("正在获取本机模型，请稍后重试")
+                loadModels()
+            } else {
+                configSheet?.dismiss()
+                showAppSettings(openProviders = true)
+            }
+            return
+        }
         selectionDialog = showMiuixSelectionDialog(this, "选择模型") { close ->
             MiuixModelChoices(models, selectedModelOption, close) { row ->
                 close()
@@ -1649,6 +1659,7 @@ internal class MainActivity : ComponentActivity() {
         updateEfforts(preferred = model.defaultEffort)
         rememberExplicitChoice()
         saveModelPreference()
+        updateSendState()
     }
 
     private fun updateEfforts(preferred: String = "") {
@@ -2439,7 +2450,7 @@ internal class MainActivity : ComponentActivity() {
     }
 
     private fun canContinueTurn(): Boolean {
-        if (currentThreadId.isEmpty() || readOnly || providerUnavailable || running || latestTurn?.canContinue != true) return false
+        if (currentThreadId.isEmpty() || readOnly || providerUnavailable || localModelBlockReason() != null || running || latestTurn?.canContinue != true) return false
         if (composer.text.isNotBlank() || attachmentFiles.isNotEmpty() || preparingAttachments || editingQueueDraft == composerBinding) return false
         val queue = messageQueues[currentThreadId]
         return queue == null || (!queue.optBoolean("dispatching") &&
@@ -2460,6 +2471,20 @@ internal class MainActivity : ComponentActivity() {
         startTurn(text, creating = false, openGeneration, emptyList(), pending)
     }
 
+    private fun localModelBlockReason(): String? {
+        if (currentAgent() != LocalCodex.AGENT) return null
+        if (currentThread != null) {
+            return if (currentThread?.let(modelCatalog::threadProviderId).isNullOrEmpty())
+                "本机未登录 GPT，请新建会话并选择第三方模型" else null
+        }
+        return when {
+            selectedModel() != null -> null
+            !modelCatalogLoaded -> "正在获取本机模型"
+            models.isEmpty() -> "请先在模型供应商中配置第三方模型"
+            else -> "请选择第三方模型"
+        }
+    }
+
     private fun sendMessage(steer: Boolean) = submitMessage(steer)
 
     private fun submitMessage(steer: Boolean) {
@@ -2477,6 +2502,7 @@ internal class MainActivity : ComponentActivity() {
             toast("此会话为只读，请新建会话")
             return
         }
+        localModelBlockReason()?.let { toast(it); return }
         if (running && !steer && !info.optBoolean("messageQueue")) { toast("请更新本地 Agent 以支持排队发送"); return }
         if (files.isNotEmpty() && !info.has("attachments")) { toast("请更新本地 Agent 以支持文件和图片"); return }
         val sender = client ?: return
@@ -2522,6 +2548,7 @@ internal class MainActivity : ComponentActivity() {
     }
 
     private fun dispatchMessage(text: String, steer: Boolean, files: List<JSONObject>, pending: PendingSend) {
+        localModelBlockReason()?.let { failSend(pending, null, it); return }
         val sendOpenGeneration = openGeneration
         if (running) sendFollowup(text, steer, sendOpenGeneration, files, pending)
         else if (currentThread == null) {
@@ -2975,7 +3002,7 @@ internal class MainActivity : ComponentActivity() {
         val card = Ui.column(this).apply { setPadding(Ui.dp(context, 12), Ui.dp(context, 10), Ui.dp(context, 12), Ui.dp(context, 10)); background = Ui.rounded(Ui.SURFACE, Ui.dp(context, 12).toFloat(), Ui.BORDER) }
         val header = Ui.column(this, false).apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(Ui.text(this, "${if (queue.optBoolean("paused")) "排队已暂停" else "待发送"} · ${entries.length()} 条", 12f, Ui.MUTED), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        if (queue.optBoolean("paused") && !providerUnavailable) header.addView(Ui.button(this, "继续排队") { changeMessageQueue("resume") })
+        if (queue.optBoolean("paused") && !providerUnavailable && localModelBlockReason() == null) header.addView(Ui.button(this, "继续排队") { changeMessageQueue("resume") })
         card.addView(header, matchWidth())
         for (index in 0 until entries.length()) {
             val entry = entries.optJSONObject(index) ?: continue
@@ -3006,7 +3033,7 @@ internal class MainActivity : ComponentActivity() {
     private fun changeMessageQueue(action: String, id: String = "", draft: QueuedComposerDraft? = null) {
         val threadId = currentThreadId
         if (!online || sending || loading || readOnly || threadId.isEmpty()) return
-        if (action == "resume" && providerUnavailable) return
+        if (action == "resume" && (providerUnavailable || localModelBlockReason() != null)) return
         val binding = composerBinding
         if (draft != null && (preparingAttachments || editingQueueDraft != null || binding.threadId != threadId)) return
         val requestClient = client ?: return
@@ -3330,15 +3357,7 @@ internal class MainActivity : ComponentActivity() {
             styledDialog(MiuixDialog.Builder(this).setTitle("Codex 本地运行扩展")
                 .setMessage("首次使用需要下载并安装独立运行扩展。安装后需要允许它访问设备文件，才能读取和修改工作区。")
                 .setPositiveButton("下载扩展") { _, _ ->
-                    if (UpdateChecker.canInstall(this)) downloadLocalCodex()
-                    else {
-                        waitingLocalInstallSource = true
-                        val settings = Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, android.net.Uri.parse("package:$packageName"))
-                        if (runCatching { startActivity(settings) }.isFailure) {
-                            waitingLocalInstallSource = false
-                            toast("请先在系统设置中允许 CodexRM 安装未知来源应用。")
-                        }
-                    }
+                    requestLocalCodexDownload()
                 }.setNegativeButton("取消", null))
             return
         }
@@ -3349,6 +3368,18 @@ internal class MainActivity : ComponentActivity() {
             if (closeSidebarAfter) closeSidebar()
             disconnect(); connect()
         } else selectDevice(localCodexDevice, closeSidebarAfter)
+    }
+
+    private fun requestLocalCodexDownload() {
+        if (UpdateChecker.canInstall(this)) downloadLocalCodex()
+        else {
+            waitingLocalInstallSource = true
+            val settings = Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, android.net.Uri.parse("package:$packageName"))
+            if (runCatching { startActivity(settings) }.isFailure) {
+                waitingLocalInstallSource = false
+                toast("请先在系统设置中允许 CodexRM 安装未知来源应用。")
+            }
+        }
     }
 
     private fun downloadLocalCodex() {
@@ -3795,7 +3826,7 @@ internal class MainActivity : ComponentActivity() {
         android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_SHORT).show()
     }
 
-    private fun showAppSettings() {
+    private fun showAppSettings(openProviders: Boolean = false) {
         if (mainVisible) closeSidebar()
         settingsPage?.dismiss()
         val agent = currentAgent()
@@ -3871,11 +3902,14 @@ internal class MainActivity : ComponentActivity() {
                         add(SettingsPage.Section("服务与模型", actions = buildList {
                             add(providers)
                             if (!local) add(SettingsPage.Action("检查并更新电脑 Agent", ::confirmAgentUpdate))
+                            else if (LocalCodexDownload.updateAvailable(this@MainActivity)) {
+                                add(SettingsPage.Action("更新本机运行扩展", ::requestLocalCodexDownload))
+                            }
                         }))
                     }
                 }
             },
-        ).also { it.show() }
+        ).also { it.show(openProviders) }
     }
 
     private fun showDownloadSettings() {
@@ -4797,9 +4831,13 @@ internal class MainActivity : ComponentActivity() {
             hasAttachments = attachmentFiles.isNotEmpty(),
             attachmentsSupported = info.has("attachments"),
         )
-        val blockReason = if (providerUnavailable) providerSwitchHint else InteractionCopy.sendBlockReason(sendState)
+        val localBlock = if (online && loaded && !readOnly) localModelBlockReason() else null
+        val blockReason = when {
+            providerUnavailable -> providerSwitchHint
+            else -> localBlock ?: InteractionCopy.sendBlockReason(sendState)
+        }
         steerButton.visibility = if (running) View.VISIBLE else View.GONE
-        steerButton.isEnabled = running && !providerUnavailable && InteractionCopy.sendBlockReason(sendState, steer = true) == null
+        steerButton.isEnabled = running && !providerUnavailable && localBlock == null && InteractionCopy.sendBlockReason(sendState, steer = true) == null
         val showContinue = canContinueTurn()
         continueButton.visibility = if (showContinue) View.VISIBLE else View.GONE
         continueButton.isEnabled = showContinue && online && loaded && !loading && !sending && currentThreadId !in deletingThreads
@@ -4813,7 +4851,7 @@ internal class MainActivity : ComponentActivity() {
         }
         sendButton.contentDescription = sendAction + blockReason?.let { "，当前不可用：$it" }.orEmpty()
         sendHint.text = blockReason.orEmpty()
-        sendHint.visibility = if (blockReason != null && (hasPayload || readOnly || providerUnavailable || preparingAttachments || sending)) View.VISIBLE else View.GONE
+        sendHint.visibility = if (blockReason != null && (hasPayload || readOnly || providerUnavailable || localBlock != null || preparingAttachments || sending)) View.VISIBLE else View.GONE
         stopButton.visibility = if (running && !readOnly) View.VISIBLE else View.GONE
         // Keep the button clickable when merely offline or unsupported so a tap explains
         // why (a disabled button gave Android 12 users silent "no response"); dim it instead.

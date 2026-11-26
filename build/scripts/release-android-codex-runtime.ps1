@@ -46,6 +46,6 @@ try {
         go run ./cmd/codexrm-publish -config $PublishConfig -package $apk -manifest $manifest
         if ($LASTEXITCODE) { throw 'Cloudreve runtime publication failed.' }
         Write-Host "Verified Cloudreve release manifest: $manifest"
-        Write-Host 'After smoke testing, use this manifest as android/app/src/main/assets/android-codex-runtime.json in the main APK.'
+        Write-Host 'After smoke testing, pass this manifest to release-android.ps1 -LocalRuntimeManifest. Do not commit the published manifest.'
     }
 } finally { Pop-Location }

@@ -17,10 +17,21 @@ internal object LocalCodexDownload {
     }
 
     @Synchronized
-    fun download(context: Context, progress: (Int) -> Unit): File {
-        val release = try {
+    private fun release(context: Context): JSONObject = try {
+        val encoded = BuildConfig.LOCAL_RUNTIME_RELEASE
+        if (encoded.isEmpty()) {
             context.assets.open("android-codex-runtime.json").bufferedReader().use { JSONObject(it.readText()) }
-        } catch (_: Exception) { throw IOException("本机运行扩展尚未配置下载地址。") }
+        } else JSONObject(android.util.Base64.decode(encoded, android.util.Base64.DEFAULT).toString(Charsets.UTF_8))
+    } catch (_: Exception) { throw IOException("本机运行扩展尚未配置下载地址。") }
+
+    fun updateAvailable(context: Context): Boolean = runCatching {
+        @Suppress("DEPRECATION")
+        val installed = context.packageManager.getPackageInfo(LocalCodex.PACKAGE, 0).longVersionCode
+        LocalCodex.available(context) && installed < release(context).optLong("versionCode")
+    }.getOrDefault(false)
+
+    fun download(context: Context, progress: (Int) -> Unit): File {
+        val release = release(context)
         val url = release.string("downloadUrl").toHttpUrlOrNull()
         if (url == null || !url.isHttps || url.username.isNotEmpty() || url.password.isNotEmpty())
             throw IOException("本机运行扩展的下载地址不是有效的 HTTPS 地址。")

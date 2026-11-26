@@ -100,11 +100,12 @@ internal class SettingsPage(
     private var catalogs = emptyList<JSONObject>()
     private var gptProviderSettings = false
 
-    fun show() {
+    fun show(openProviders: Boolean = false) {
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         dialog.setCanceledOnTouchOutside(false)
         showHome()
         dialog.show()
+        if (openProviders) loadCatalog()
         @Suppress("DEPRECATION")
         dialog.window?.apply {
             clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
@@ -457,6 +458,7 @@ internal class SettingsPage(
             gptProviderSettings = result.optBoolean("gptProviderSettings")
             val groups = result.arrayAt("providers")
             catalogs = (0 until groups.length()).mapNotNull { groups.optJSONObject(it) }
+                .filter { !local || it.isLocalThirdPartyProvider() }
             val selected = open?.let { id -> catalogs.firstOrNull { it.string("id") == id } }
             when {
                 selected != null -> showProvider(selected)

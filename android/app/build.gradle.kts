@@ -45,6 +45,8 @@ abstract class BuildDirectLibraries @Inject constructor(private val exec: ExecOp
 val p2pQa = project.hasProperty("codexrm.p2pQa")
 val secureRelayQa = project.hasProperty("codexrm.secureRelayQa")
 val fileTransferQa = project.hasProperty("codexrm.fileTransferQa")
+val localRuntimeRelease = providers.environmentVariable("CODEXRM_LOCAL_RUNTIME_RELEASE").orElse("").get()
+require(localRuntimeRelease.matches(Regex("[A-Za-z0-9+/]*={0,2}"))) { "Invalid encoded local runtime release manifest" }
 val releaseUpdateBase = providers.environmentVariable("CODEXRM_RELEASE_UPDATE_BASE").orElse("").get().trim().trimEnd('/')
 require(releaseUpdateBase.isEmpty() || (Regex("https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?").matches(releaseUpdateBase) &&
     URI(releaseUpdateBase).let { it.host != null && (it.port == -1 || it.port in 1..65535) })) {
@@ -65,11 +67,12 @@ android {
     defaultConfig {
         applicationId = "com.codexrm.mobile"
         buildConfigField("String", "DEFAULT_UPDATE_SERVER", "\"\"")
+        buildConfigField("String", "LOCAL_RUNTIME_RELEASE", "\"\"")
         minSdk = 28
         targetSdk = 35
         ndk { abiFilters.add("arm64-v8a") }
-        versionCode = 64
-        versionName = "1.6.13"
+        versionCode = 65
+        versionName = "1.6.14"
         testInstrumentationRunner = if (p2pQa || fileTransferQa || secureRelayQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {
@@ -86,6 +89,7 @@ android {
     buildTypes {
         release {
             buildConfigField("String", "DEFAULT_UPDATE_SERVER", "\"$releaseUpdateBase\"")
+            buildConfigField("String", "LOCAL_RUNTIME_RELEASE", "\"$localRuntimeRelease\"")
             isMinifyEnabled = true
             isShrinkResources = true
             if (imageQa) applicationIdSuffix = ".imageqa"

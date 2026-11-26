@@ -4,6 +4,7 @@ param(
     [switch]$KeepVersion,
     [switch]$PublishOnly,
     [string]$ReleaseNotes = '',
+    [string]$LocalRuntimeManifest,
     [string]$Config,
     [string]$OutputDirectory,
     [string]$JavaExe = $env:JAVA_EXE,
@@ -23,6 +24,7 @@ Default: bump Android version, run tests, build a signed Release APK,
   -KeepVersion        Build the current version without incrementing it.
   -PublishOnly        Retry publication of the current package, without rebuilding.
   -ReleaseNotes TEXT  Update notes stored in android-update.json.
+  -LocalRuntimeManifest PATH  Embed a published Android runtime manifest (not committed).
   -Config PATH        Default: build\publish.config.json.
   -OutputDirectory D  Default: build\dist.
   -JavaExe PATH       Java executable; also accepts the JAVA_EXE environment variable.
@@ -171,13 +173,24 @@ try {
             $changedVersion = [Text.Encoding]::UTF8.GetBytes($text)
             [IO.File]::WriteAllBytes($versionPath, $changedVersion)
         }
+        $encodedRuntime = ''
+        if ($LocalRuntimeManifest) {
+            $runtime = Get-Content -LiteralPath $LocalRuntimeManifest -Raw -Encoding utf8 | ConvertFrom-Json
+            $download = [Uri]$runtime.downloadUrl
+            if (!$download.IsAbsoluteUri -or $download.Scheme -ne 'https' -or $download.UserInfo -or
+                $runtime.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or $runtime.versionCode -le 0 -or
+                $runtime.fileSize -le 0 -or $runtime.fileSize -gt 300000000) { throw 'Invalid published local runtime manifest.' }
+            $encodedRuntime = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($runtime | ConvertTo-Json -Compress)))
+        }
         Write-Host "Java: $JavaExe"
         Write-Host "Running Android tests and Release build. Log: $buildLog"
         Push-Location $androidRoot
         $previousPreference = $ErrorActionPreference
         $previousUpdateOrigin = [Environment]::GetEnvironmentVariable('CODEXRM_RELEASE_UPDATE_BASE', 'Process')
+        $previousRuntime = [Environment]::GetEnvironmentVariable('CODEXRM_LOCAL_RUNTIME_RELEASE', 'Process')
         try {
             [Environment]::SetEnvironmentVariable('CODEXRM_RELEASE_UPDATE_BASE', $updateOrigin, 'Process')
+            [Environment]::SetEnvironmentVariable('CODEXRM_LOCAL_RUNTIME_RELEASE', $encodedRuntime, 'Process')
             # PowerShell 5.1 wraps native stderr as errors, including harmless JVM warnings.
             $ErrorActionPreference = 'Continue'
             $global:LASTEXITCODE = 1
@@ -185,6 +198,7 @@ try {
             $gradleExit = $LASTEXITCODE
         } finally {
             [Environment]::SetEnvironmentVariable('CODEXRM_RELEASE_UPDATE_BASE', $previousUpdateOrigin, 'Process')
+            [Environment]::SetEnvironmentVariable('CODEXRM_LOCAL_RUNTIME_RELEASE', $previousRuntime, 'Process')
             $ErrorActionPreference = $previousPreference
             Pop-Location
         }

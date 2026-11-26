@@ -54,4 +54,25 @@ class ModelCatalogTest {
         assertEquals(listOf("", "ccswitch_a", "ccswitch_b"), options.filter { it.model == "shared" }.map { it.providerId })
         assertEquals("当前 Codex 配置 · Shared", options.first().label)
     }
+
+    @Test fun `local catalog hides native aliases and official providers but not third party GPT names`() {
+        val json = JSONObject(fixture.replace("cc-only", "gpt-from-sub2api"))
+        json.getJSONArray("providers").put(JSONObject("""
+            {"id":"ccswitch_official", "runtimeId":"openai", "name":"Official", "models":[{"model":"gpt-official"}]}
+        """))
+        val local = ModelCatalog(json, localOnly = true)
+        val models = local.options("")
+        assertEquals(listOf("shared", "gpt-from-sub2api", "shared"), models.map { it.model })
+        assertEquals(listOf("ccswitch_a", "ccswitch_a", "ccswitch_b"), models.map { it.providerId })
+        assertEquals(null, local.selectedOption(models, "", "shared"))
+        assertEquals("ccswitch_a", local.selectedOption(models, "ccswitch_a", "gpt-from-sub2api")?.providerId)
+        assertEquals("ccswitch_official", ModelCatalog(json).options("").first { it.model == "gpt-official" }.providerId)
+    }
+
+    @Test fun `local catalog is empty when only native defaults exist`() {
+        val native = JSONObject("""{"providers":[{"id":"", "models":[{"model":"gpt-native"}]}]}""")
+        assertEquals(emptyList<ModelOption>(), ModelCatalog(native, localOnly = true).options(""))
+        assertEquals(listOf("gpt-native"), ModelCatalog(native).options("").map { it.model })
+    }
+
 }

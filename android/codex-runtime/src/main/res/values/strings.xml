@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="runtime_title">Codex 本地运行扩展</string>
+    <string name="runtime_permission_granted">文件权限已开启。请返回 CodexRM，选择「本机 Codex」。</string>
+    <string name="runtime_permission_required">尚未开启文件访问权限</string>
+    <string name="runtime_permission_description">本机 Codex 需要访问设备上的工作区文件。此权限不允许读取其他应用的私有数据，可以随时在系统设置撤销。</string>
+    <string name="runtime_permission_settings">打开所有文件访问权限设置</string>
+</resources>
