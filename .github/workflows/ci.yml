@@ -5,6 +5,11 @@ on:
     # 00:23 the following day in Asia/Singapore.
     - cron: '23 16 * * *'
   workflow_dispatch:
+    inputs:
+      build_only:
+        description: Build and verify bundles without publishing any release
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,7 +20,7 @@ concurrency:
 
 jobs:
   select-commit:
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.repository == 'CyL-Cly/CodexRM' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.select.outputs.sha }}
@@ -74,6 +79,16 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Verify central release scripts
+        shell: pwsh
+        run: |
+          go test -mod=readonly ./...
+          if ($LASTEXITCODE) { throw 'Go tests failed.' }
+          powershell -NoProfile -File ./build/scripts/test-release.ps1
+          if ($LASTEXITCODE) { throw 'Windows release script tests failed.' }
+          powershell -NoProfile -File ./build/scripts/test-release-android.ps1
+          if ($LASTEXITCODE) { throw 'Android release script tests failed.' }
+
       - name: Install Inno Setup 7
         shell: pwsh
         run: |
@@ -95,13 +110,12 @@ jobs:
       - name: Package Windows Agent offline installer
         shell: pwsh
         env:
-          CODEXRM_RELEASE_UPDATE_BASE: ${{ secrets.CODEXRM_RELEASE_UPDATE_BASE }}
+          CODEXRM_RELEASE_UPDATE_BASE: ${{ inputs.build_only && 'https://updates.example.invalid' || secrets.CODEXRM_RELEASE_UPDATE_BASE }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:CODEXRM_RELEASE_UPDATE_BASE)) { throw 'Release update origin is not configured.' }
           & ./build/scripts/build.ps1 -Target Agent
-          $origin = $env:CODEXRM_RELEASE_UPDATE_BASE.Trim().TrimEnd('/')
-          $binary = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $PWD 'build/bin/codexrm-agent.exe')))
-          if (!$binary.Contains($origin)) { throw 'Release update origin is missing from the Windows Agent.' }
+          . ./build/scripts/release-update-flags.ps1
+          Assert-ReleaseOriginEmbedded (Join-Path $PWD 'build/bin/codexrm-agent.exe')
           & ./build/scripts/package-setup.ps1 -OutputPath "nightly-dist/CodexRM-$env:TAG-windows-amd64-Setup.exe"
 
       - uses: actions/upload-artifact@v7.0.2
@@ -119,6 +133,7 @@ jobs:
     timeout-minutes: 35
     env:
       TAG: ${{ needs.select-commit.outputs.tag }}
+      SOURCE_SHA: ${{ needs.select-commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -129,48 +144,34 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Package Linux Agents for amd64 and arm64
+      - name: Package Linux Agent and Server from pinned modules
+        shell: pwsh
         env:
-          CODEXRM_RELEASE_UPDATE_BASE: ${{ secrets.CODEXRM_RELEASE_UPDATE_BASE }}
-          CGO_ENABLED: 0
-          GOOS: linux
+          CODEXRM_RELEASE_UPDATE_BASE: ${{ inputs.build_only && 'https://updates.example.invalid' || secrets.CODEXRM_RELEASE_UPDATE_BASE }}
         run: |
-          origin=${CODEXRM_RELEASE_UPDATE_BASE%/}
-          [[ "$origin" =~ ^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$ ]] || { echo '::error::A valid release update origin is required.'; exit 1; }
-          out="$PWD/nightly-dist"
-          mkdir -p "$out"
-          for arch in amd64 arm64; do
-            agent="$RUNNER_TEMP/codexrm-linux-$arch-agent"
-            mkdir -p "$agent"
-            GOARCH="$arch" go build -trimpath -ldflags "-s -w -X github.com/codexrm/codexrm/internal/release.updateBaseURL=$origin" -o "$agent/codexrm-agent" ./cmd/codexrm-agent
-            grep -aFq -- "$origin" "$agent/codexrm-agent" || { echo '::error::Release update origin is missing from the Linux Agent.'; exit 1; }
-            cp LICENSE "$agent/"
-            tar -czf "$out/CodexRM-$TAG-linux-$arch-agent.tar.gz" -C "$agent" .
-          done
-
-      - name: Package Linux amd64 Server
-        env:
-          CODEXRM_RELEASE_UPDATE_BASE: ${{ secrets.CODEXRM_RELEASE_UPDATE_BASE }}
-          CGO_ENABLED: 0
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          server="$RUNNER_TEMP/codexrm-linux-amd64-server"
-          mkdir -p "$server"
-          go build -trimpath -ldflags "-s -w" -o "$server/codexrm-server" ./cmd/codexrm-server
-          git archive HEAD web | tar -x -C "$server"
-          rm -f "$server/web/app.test.mjs" "$server/web/sw.test.mjs"
-          cp LICENSE "$server/"
-          install -m 0755 build/scripts/install-server.sh "$server/install-server.sh"
-          install -d "$server/deploy"
-          install -m 0644 deploy/codexrm.service deploy/nginx-location.conf "$server/deploy/"
-          # Older commits can still be selected for a Nightly; package the updater when present.
-          if [[ -d cmd/codexrm-server-updater ]]; then
-            go build -trimpath -ldflags "-s -w -X github.com/codexrm/codexrm/internal/release.updateBaseURL=${CODEXRM_RELEASE_UPDATE_BASE%/}" -o "$server/codexrm-server-updater" ./cmd/codexrm-server-updater
-            grep -aFq -- "${CODEXRM_RELEASE_UPDATE_BASE%/}" "$server/codexrm-server-updater" || { echo '::error::Release update origin is missing from the Server updater.'; exit 1; }
-            install -m 0644 deploy/codexrm-server-update.{service,timer,env.example} "$server/deploy/"
-          fi
-          tar -czf "nightly-dist/CodexRM-$TAG-linux-amd64-server.tar.gz" -C "$server" .
+          if ([string]::IsNullOrWhiteSpace($env:CODEXRM_RELEASE_UPDATE_BASE)) { throw 'Release update origin is not configured.' }
+          . ./build/scripts/component-sources.ps1
+          . ./build/scripts/release-update-flags.ps1
+          $agentSource = Get-CodexRMComponentDir Agent
+          $out = Join-Path $PWD 'nightly-dist'
+          [void][IO.Directory]::CreateDirectory($out)
+          foreach ($arch in @('amd64', 'arm64')) {
+            & ./build/scripts/build.ps1 -Linux -Target Agent -Arch $arch
+            $binary = Join-Path $PWD "build/bin/codexrm-agent-linux-$arch"
+            Assert-ReleaseOriginEmbedded $binary
+            $stage = Join-Path $env:RUNNER_TEMP "codexrm-linux-$arch-agent"
+            [void][IO.Directory]::CreateDirectory($stage)
+            Copy-Item -LiteralPath $binary -Destination (Join-Path $stage 'codexrm-agent')
+            chmod 0755 (Join-Path $stage 'codexrm-agent')
+            if ($LASTEXITCODE) { throw "Could not mark the $arch Agent executable." }
+            Copy-Item -LiteralPath (Join-Path $agentSource 'LICENSE') -Destination $stage
+            tar -czf (Join-Path $out "CodexRM-$env:TAG-linux-$arch-agent.tar.gz") -C $stage .
+            if ($LASTEXITCODE) { throw "Could not package $arch Agent." }
+          }
+          & ./build/scripts/release-server.ps1 -InstallerOutput (Join-Path $out "CodexRM-$env:TAG-linux-amd64-server.tar.gz")
+          $pins = Invoke-CodexRMGo list -mod=readonly -m -f '{{.Path}} {{.Version}}' $script:CodexRMComponentModules.Agent $script:CodexRMComponentModules.Server
+          if ($LASTEXITCODE) { throw 'Could not record the pinned source versions.' }
+          @("$env:GITHUB_REPOSITORY $env:SOURCE_SHA") + $pins | Set-Content -Encoding utf8NoBOM (Join-Path $out 'SOURCES.txt')
 
       - uses: actions/upload-artifact@v7.0.2
         with:
@@ -181,6 +182,7 @@ jobs:
           retention-days: 7
 
   publish:
+    if: github.repository == 'CyL-Cly/CodexRM' && !inputs.build_only
     needs: [select-commit, build-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
@@ -205,8 +207,9 @@ jobs:
             "CodexRM-$TAG-linux-amd64-agent.tar.gz"
             "CodexRM-$TAG-linux-arm64-agent.tar.gz"
             "CodexRM-$TAG-linux-amd64-server.tar.gz"
+            "SOURCES.txt"
           )
-          notes="Build from commit $SOURCE_SHA. The Windows Agent setup includes the files needed for offline installation."
+          notes="Build from commit $SOURCE_SHA; see SOURCES.txt for the exact Agent and Server module versions. The Windows Agent setup includes the files needed for offline installation."
           sha256sum "${assets[@]}" > SHA256SUMS.txt
           assets+=(SHA256SUMS.txt)
           if existing=$(gh release view "$TAG" --json isDraft,targetCommitish --jq '[.isDraft, .targetCommitish] | @tsv'); then

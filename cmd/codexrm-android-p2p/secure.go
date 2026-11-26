@@ -13,7 +13,7 @@ import (
 	"runtime/cgo"
 	"unsafe"
 
-	"github.com/codexrm/codexrm/internal/securechannel"
+	"github.com/CyL-Cly/CodexRM-Server/securechannel"
 	"github.com/flynn/noise"
 )
 

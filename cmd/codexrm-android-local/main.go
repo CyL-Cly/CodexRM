@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/codexrm/codexrm/internal/agent"
+	"github.com/CyL-Cly/CodexRM-Agent/agent"
 )
 
 func main() {

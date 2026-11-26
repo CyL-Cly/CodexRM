@@ -2,7 +2,8 @@ param([int]$Port = 8080)
 $ErrorActionPreference = 'Stop'
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $root = Split-Path -Parent $buildRoot
-$webRoot = [IO.Path]::GetFullPath((Join-Path $root 'web'))
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
+$webRoot = Join-Path (Get-CodexRMComponentDir Server) 'web'
 Push-Location $root
 try {
     & (Join-Path $PSScriptRoot 'build.ps1')

@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 if ($LocalInstallDir -and -not $TestLocalUpdate) { throw '-LocalInstallDir requires -TestLocalUpdate.' }
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $projectRoot = Split-Path -Parent $buildRoot
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
 if (-not $Config) { $Config = Join-Path $buildRoot 'publish.config.json' }
 $Config = [IO.Path]::GetFullPath($Config)
 if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
@@ -24,11 +25,9 @@ if ($DeployServer) {
 }
 $localUpdateArguments = @{}
 if ($LocalInstallDir) { $localUpdateArguments.InstallDir = $LocalInstallDir }
-$versionPath = Join-Path $projectRoot 'internal\release\release.go'
-$originalVersion = [IO.File]::ReadAllBytes($versionPath)
+$versionPath = Join-Path (Get-CodexRMComponentDir Agent) 'internal/release/release.go'
 $publisher = Join-Path $buildRoot 'bin\codexrm-publish.exe'
 $builtPackage = $false
-$versionChanged = $false
 function Assert-ReleasePackage([string]$Archive, [string]$Manifest, [long]$Code, [string]$Name) {
     $metadata = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([long]$metadata.versionCode -ne $Code -or [string]$metadata.versionName -cne $Name) {
@@ -67,29 +66,17 @@ function Assert-ReleasePackage([string]$Archive, [string]$Manifest, [long]$Code,
 }
 Push-Location $projectRoot
 try {
-    $text = [Text.Encoding]::UTF8.GetString($originalVersion)
+    $text = Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8
     $codeMatch = [regex]::Match($text, 'const VersionCode int64 = (\d+)')
     $nameMatch = [regex]::Match($text, 'const VersionName = "(\d+\.\d+\.\d+)"')
     if (-not $codeMatch.Success -or -not $nameMatch.Success) { throw 'Unsupported release version format.' }
     $code = [long]$codeMatch.Groups[1].Value
     $name = $nameMatch.Groups[1].Value
-    if (-not $PublishOnly) {
-        $code++
-        $parts = $name.Split('.')
-        $parts[2] = [string]([long]$parts[2] + 1)
-        $name = $parts -join '.'
-        $text = [regex]::Replace($text, 'const VersionCode int64 = \d+', 'const VersionCode int64 = ' + $code)
-        $text = [regex]::Replace($text, 'const VersionName = "\d+\.\d+\.\d+"', 'const VersionName = "' + $name + '"')
-    }
     if ($TestLocalUpdate) {
         & (Join-Path $PSScriptRoot 'update-local-client.ps1') -ExpectedVersionCode $code -ExpectedVersionName $name -ValidateOnly @localUpdateArguments
     }
-    if (-not $PublishOnly) {
-        [IO.File]::WriteAllText($versionPath, $text, (New-Object Text.UTF8Encoding $false))
-        $versionChanged = $true
-    }
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $publisher))
-    go build -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
+    Invoke-CodexRMGo build -mod=readonly -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
     if ($LASTEXITCODE) { throw 'Publisher build failed.' }
     $archive = Join-Path $buildRoot ("dist\CodexRM-windows-amd64-v$name-$code.zip")
     $manifest = Join-Path $buildRoot 'dist\update.json'
@@ -124,15 +111,12 @@ try {
         & (Join-Path $PSScriptRoot 'update-local-client.ps1') -ExpectedVersionCode $code -ExpectedVersionName $name @localUpdateArguments
     }
 } catch {
-    if ($versionChanged -and -not $builtPackage) {
-        [IO.File]::WriteAllBytes($versionPath, $originalVersion)
-        Write-Host 'Build/package failed; release version restored.' -ForegroundColor Yellow
-    } elseif ($builtPackage) {
+    if ($builtPackage) {
         $retry = 'build\release.cmd nopause -PublishOnly'
         if ($DeployServer) { $retry += ' -DeployServer' }
         if ($TestLocalUpdate) { $retry += ' -TestLocalUpdate' }
         if ($LocalInstallDir) { $retry += ' -LocalInstallDir "' + $LocalInstallDir + '"' }
-        Write-Host "Package retained. Retry without another version bump: $retry" -ForegroundColor Yellow
+        Write-Host "Package retained. Retry with the same pinned Agent: $retry" -ForegroundColor Yellow
     }
     throw
 } finally { Pop-Location }

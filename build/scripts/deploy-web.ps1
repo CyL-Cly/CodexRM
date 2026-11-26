@@ -4,6 +4,7 @@ param(
     [switch]$ValidateOnly
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
 $rmTarget = & (Join-Path $PSScriptRoot 'get-rm-target.ps1') -RM $RM
 $server = $rmTarget.Server
 $sshTarget = $rmTarget.SshTarget
@@ -11,9 +12,10 @@ $installDir = $rmTarget.InstallDir
 foreach ($command in @('ssh', 'scp', 'tar')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "Required frontend deployment command missing: $command" }
 }
-if (-not $WebDir) { $WebDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'web' }
+$serverSource = Get-CodexRMComponentDir Server
+if (-not $WebDir) { $WebDir = Join-Path $serverSource 'web' }
 $WebDir = [IO.Path]::GetFullPath($WebDir)
-$files = @(& (Join-Path $PSScriptRoot 'get-server-web-files.ps1') -WebDir $WebDir)
+$files = @(& (Join-Path $serverSource 'build/scripts/get-server-web-files.ps1') -WebDir $WebDir)
 if ($ValidateOnly) { return }
 
 $id = [Guid]::NewGuid().ToString('N')

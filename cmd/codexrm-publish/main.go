@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/codexrm/codexrm/internal/publisher"
+	"github.com/CyL-Cly/CodexRM/internal/publisher"
 )
 
 func main() {

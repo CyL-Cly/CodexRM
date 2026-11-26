@@ -4,7 +4,7 @@ $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = Join-Path $tempRoot ('CodexRM-web-tests-' + [Guid]::NewGuid().ToString('N'))
 $webDir = Join-Path $testRoot 'web'
 [void][IO.Directory]::CreateDirectory((Join-Path $webDir 'icons'))
-$files = @('index.html','app.js','styles.css','dsh-theme.css','dsh-LICENSE.txt','pwa.js','sw.js','theme.js','manifest.webmanifest','icons/icon.svg','icons/icon-192.png','icons/icon-512.png','icons/maskable-512.png')
+$files = @('index.html','app.js','styles.css','dsh-theme.css','dsh-LICENSE.txt','pwa.js','secure-relay.js','sw.js','theme.js','manifest.webmanifest','icons/icon.svg','icons/icon-192.png','icons/icon-512.png','icons/maskable-512.png')
 foreach ($file in $files) { Set-Content -LiteralPath (Join-Path $webDir $file) -Value ('fixture:' + $file) -Encoding UTF8 }
 Set-Content -LiteralPath (Join-Path $webDir 'app.test.mjs') -Value 'test only'
 Set-Content -LiteralPath (Join-Path $webDir 'private.json') -Value 'not a web asset'

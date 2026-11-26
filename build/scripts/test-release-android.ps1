@@ -7,7 +7,7 @@ $androidRoot = Join-Path $testRoot 'android'
 foreach ($directory in @($scriptDir, (Join-Path $androidRoot 'app'), (Join-Path $androidRoot 'gradle\wrapper'))) {
     [void][IO.Directory]::CreateDirectory($directory)
 }
-foreach ($name in @('release-android.ps1', 'package-android.ps1', 'assert-android-package.ps1')) {
+foreach ($name in @('component-sources.ps1', 'release-android.ps1', 'package-android.ps1', 'assert-android-package.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $scriptDir $name)
 }
 Copy-Item -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'android\build.bat') -Destination (Join-Path $androidRoot 'build.bat')

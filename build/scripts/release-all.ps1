@@ -14,6 +14,7 @@ if ($Help) {
     Write-Host '-WxBotImageLock PATH: embed and include the verified wxbot release manifest.'
     return
 }
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $projectRoot = Split-Path -Parent $buildRoot
 if (-not $Config) { $Config = Join-Path $buildRoot 'publish.config.json' }
@@ -24,7 +25,8 @@ if (-not $cfg.cloudreve.base -or -not $cfg.cloudreve.email -or (-not $cfg.cloudr
 }
 
 function Publish-LinuxAgent {
-    $versionPath = Join-Path $projectRoot 'internal\release\release.go'
+    $agentSource = Get-CodexRMComponentDir Agent
+    $versionPath = Join-Path $agentSource 'internal/release/release.go'
     $text = Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8
     $code = [regex]::Match($text, 'const VersionCode int64 = (\d+)')
     $name = [regex]::Match($text, 'const VersionName = "(\d+\.\d+\.\d+)"')
@@ -49,8 +51,8 @@ function Publish-LinuxAgent {
                 $wxbotLock = [IO.Path]::GetFullPath($WxBotImageLock)
                 if (-not (Test-Path -LiteralPath $wxbotLock -PathType Leaf)) { throw 'wxbot image lock missing.' }
                 [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $wxbotLock, 'wx-images.json')
-                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $PSScriptRoot 'install-wxbot-bootstrap.sh'), 'install-wxbot-bootstrap.sh')
-                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $projectRoot 'deploy/codexrm-wx-docker-bootstrap.service'), 'codexrm-wx-docker-bootstrap.service')
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $agentSource 'build/scripts/install-wxbot-bootstrap.sh'), 'install-wxbot-bootstrap.sh')
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $agentSource 'deploy/codexrm-wx-docker-bootstrap.service'), 'codexrm-wx-docker-bootstrap.service')
             }
             $writer = New-Object IO.StreamWriter($zip.CreateEntry('README.md').Open())
             try { $writer.WriteLine('Unpack, run chmod +x codexrm-agent, then run ./codexrm-agent --help.') } finally { $writer.Dispose() }
@@ -69,7 +71,7 @@ function Publish-LinuxAgent {
     }
     [IO.File]::WriteAllText($manifest, ($meta | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
     $publisher = Join-Path $buildRoot 'bin\codexrm-publish.exe'
-    go build -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
+    Invoke-CodexRMGo build -mod=readonly -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
     if ($LASTEXITCODE) { throw 'Publisher build failed.' }
     & $publisher -config $Config -package $archive -manifest $manifest
     if ($LASTEXITCODE) { throw 'Standalone Linux Agent publication failed; retry with -LinuxOnly.' }

@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/CyL-Cly/CodexRM-Server/protocol"
 )
 
 const latencyProbePrefix = "android-rtt:"

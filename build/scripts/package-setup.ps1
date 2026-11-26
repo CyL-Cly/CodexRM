@@ -5,6 +5,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $buildRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
 . (Join-Path $PSScriptRoot 'client-install.ps1')
 if (-not $AgentPath) { $AgentPath = Join-Path $buildRoot 'bin\codexrm-agent.exe' }
 $AgentPath = [IO.Path]::GetFullPath($AgentPath)
@@ -40,7 +41,7 @@ if ([IO.Path]::GetExtension($OutputPath) -ine '.exe') { throw 'Setup output must
 $outputDir = Split-Path -Parent $OutputPath
 [void][IO.Directory]::CreateDirectory($outputDir)
 $outputName = [IO.Path]::GetFileNameWithoutExtension($OutputPath)
-$script = Join-Path $buildRoot 'installer\CodexRM.iss'
+$script = Join-Path (Get-CodexRMComponentDir Agent) 'build/installer/CodexRM.iss'
 & $InnoCompiler '/Qp' "/DAgentPath=$AgentPath" "/DAppVersion=$($version.versionName)" "/O$outputDir" "/F$outputName" $script
 if ($LASTEXITCODE -or -not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
     throw "Inno Setup build failed (exit code $LASTEXITCODE)."

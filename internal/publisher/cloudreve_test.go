@@ -16,7 +16,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/codexrm/codexrm/internal/updater"
+	"github.com/CyL-Cly/CodexRM-Server/updater"
 )
 
 func TestPackageContentType(t *testing.T) {

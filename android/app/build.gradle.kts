@@ -31,12 +31,13 @@ abstract class BuildDirectLibraries @Inject constructor(private val exec: ExecOp
         val output = destination.get().file("arm64-v8a/libcodexrm_p2p.so").asFile
         exec.exec {
             workingDir(repo.get().asFile)
+            environment("GOWORK", "off")
             environment("GOOS", "android")
             environment("GOARCH", "arm64")
             environment("CGO_ENABLED", "1")
             environment("CC", cc.absolutePath)
             environment("CGO_LDFLAGS", "-Wl,-z,max-page-size=16384")
-            commandLine("go", "build", "-buildmode=c-shared", "-trimpath", "-ldflags", "-s -w", "-o", output.absolutePath, "./cmd/codexrm-android-p2p")
+            commandLine("go", "build", "-mod=readonly", "-buildmode=c-shared", "-trimpath", "-ldflags", "-s -w", "-o", output.absolutePath, "./cmd/codexrm-android-p2p")
         }
         output.resolveSibling("libcodexrm_p2p.h").delete()
     }
@@ -169,9 +170,8 @@ androidComponents {
         minApi.set(28)
         ndk.set(sdkComponents.ndkDirectory)
         repo.set(repoDir)
-        sources.from(repoDir.files("go.mod", "go.sum"),
-            repoDir.dir("cmd/codexrm-android-p2p"), repoDir.dir("internal/p2p"), repoDir.dir("internal/protocol"),
-            repoDir.dir("internal/securechannel"))
+        // Shared transport comes from the Server revision pinned by go.mod and go.sum.
+        sources.from(repoDir.files("go.mod", "go.sum"), repoDir.dir("cmd/codexrm-android-p2p"))
         destination.set(layout.buildDirectory.dir("generated/direct-libs/arm64-v8a"))
     }
     onVariants { variant ->

@@ -4,9 +4,16 @@ $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = Join-Path $tempRoot ('CodexRM-release-tests-' + [Guid]::NewGuid().ToString('N'))
 $scriptDir = Join-Path $testRoot 'build\scripts'
 [void][IO.Directory]::CreateDirectory($scriptDir)
-[void][IO.Directory]::CreateDirectory((Join-Path $testRoot 'internal\release'))
+[void][IO.Directory]::CreateDirectory((Join-Path $testRoot 'agent-module\internal\release'))
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'release.ps1') -Destination (Join-Path $scriptDir 'release.ps1')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'client-install.ps1') -Destination (Join-Path $scriptDir 'client-install.ps1')
+@'
+function Get-CodexRMComponentDir([string]$Component) {
+    if ($Component -cne 'Agent') { throw "Unexpected source component: $Component" }
+    return Join-Path (Split-Path -Parent $env:CODEXRM_RELEASE_TEST_LOG) 'agent-module'
+}
+function Invoke-CodexRMGo { go @args }
+'@ | Set-Content -LiteralPath (Join-Path $scriptDir 'component-sources.ps1') -Encoding UTF8
 $logPath = Join-Path $testRoot 'events.log'
 $previousLog = $env:CODEXRM_RELEASE_TEST_LOG
 $previousFixtureAgent = $env:CODEXRM_RELEASE_FIXTURE_AGENT
@@ -114,7 +121,7 @@ $config = Join-Path $testRoot 'publish.config.json'
 @'
 {"cloudreve":{"base":"https://cloud.example","email":"test@example.com"},"rm":{"server":"https://rm.example","sshTarget":"test-rm","updateDir":"/opt/codexrm/data/updates","installDir":"/opt/codexrm","service":"codexrm"}}
 '@ | Set-Content -LiteralPath $config -Encoding UTF8
-$versionPath = Join-Path $testRoot 'internal\release\release.go'
+$versionPath = Join-Path $testRoot 'agent-module\internal\release\release.go'
 $releaseScript = Join-Path $scriptDir 'release.ps1'
 function Set-ReleaseVersion([long]$Code,[string]$Name) {
     @"
@@ -131,47 +138,47 @@ try {
     & $releaseScript -Config $config -ReleaseNotes 'fixture release'
     $events = Get-ReleaseEvents
     $version = Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8
-    Assert-Release ($version.Contains('VersionCode int64 = 11') -and $version.Contains('VersionName = "1.2.4"')) 'Default release did not increment both versions.'
+    Assert-Release ($version.Contains('VersionCode int64 = 10') -and $version.Contains('VersionName = "1.2.3"')) 'Default release changed the pinned Agent source.'
     Assert-Release (@($events | Where-Object { $_ -eq 'build:False:Agent' }).Count -eq 1) 'Default release did not build the Agent.'
     Assert-Release (-not @($events | Where-Object { $_ -like 'build:True:*' -or $_ -like 'deploy:*' -or $_ -like 'web:*' -or $_ -like 'local:*' }).Count) 'Default release executed an optional step.'
     Assert-Release (($events[-2] -ceq 'publisher') -and ($events[-1] -ceq 'manifest:False')) 'Cloudreve publication and manifest publication are out of order.'
-    Write-Host 'PASS: Default release retains its existing behavior and leaves both optional steps disabled.'
+    Write-Host 'PASS: Default release keeps the pinned Agent source immutable and leaves both optional steps disabled.'
 
     Clear-Content -LiteralPath $logPath
     Set-ReleaseVersion 20 '2.0.0'
     & $releaseScript -Config $config -DeployServer -TestLocalUpdate -LocalInstallDir 'D:\custom client'
     $events = Get-ReleaseEvents
     $version = Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8
-    Assert-Release ($version.Contains('VersionCode int64 = 21') -and $version.Contains('VersionName = "2.0.1"')) 'Optional release changed the version unexpectedly.'
+    Assert-Release ($version.Contains('VersionCode int64 = 20') -and $version.Contains('VersionName = "2.0.0"')) 'Optional release changed the version unexpectedly.'
     Assert-Release (@($events | Where-Object { $_ -eq 'build:True:Server' }).Count -eq 1) '-DeployServer did not build Linux Server.'
     $manifestIndex = [Array]::LastIndexOf([object[]]$events, [object]'manifest:False')
     $deployIndex = [Array]::LastIndexOf([object[]]$events, [object]'deploy:False')
     $webIndex = [Array]::LastIndexOf([object[]]$events, [object]'web:False')
-    $localIndex = [Array]::LastIndexOf([object[]]$events, [object]'local:21:2.0.1:D:\custom client')
-    $preflightIndex = [Array]::IndexOf([object[]]$events, [object]'local-preflight:21:2.0.1:D:\custom client')
+    $localIndex = [Array]::LastIndexOf([object[]]$events, [object]'local:20:2.0.0:D:\custom client')
+    $preflightIndex = [Array]::IndexOf([object[]]$events, [object]'local-preflight:20:2.0.0:D:\custom client')
     $packageIndex = [Array]::IndexOf([object[]]$events, [object]'package')
     Assert-Release ($preflightIndex -ge 0 -and $packageIndex -gt $preflightIndex) 'Local installation preflight did not run before packaging.'
     Assert-Release ($manifestIndex -ge 0 -and $deployIndex -gt $manifestIndex -and $webIndex -gt $deployIndex -and $localIndex -gt $webIndex) 'Optional steps did not run after client publication in the requested order.'
-    Assert-Release (@($events | Where-Object { $_ -eq 'deploy:True' }).Count -eq 1) 'Server configuration was not validated before the version change.'
-    Assert-Release (@($events | Where-Object { $_ -eq 'web:True' }).Count -eq 1) 'Frontend configuration was not validated before the version change.'
+    Assert-Release (@($events | Where-Object { $_ -eq 'deploy:True' }).Count -eq 1) 'Server configuration was not validated before packaging.'
+    Assert-Release (@($events | Where-Object { $_ -eq 'web:True' }).Count -eq 1) 'Frontend configuration was not validated before packaging.'
     Write-Host 'PASS: Optional Server deployment builds Linux Server, then Server, frontend and local verification follow client publication.'
 
     Clear-Content -LiteralPath $logPath
     & $releaseScript -Config $config -PublishOnly -DeployServer -TestLocalUpdate
     $events = Get-ReleaseEvents
     $version = Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8
-    Assert-Release ($version.Contains('VersionCode int64 = 21') -and $version.Contains('VersionName = "2.0.1"')) '-PublishOnly bumped the version.'
+    Assert-Release ($version.Contains('VersionCode int64 = 20') -and $version.Contains('VersionName = "2.0.0"')) '-PublishOnly bumped the version.'
     Assert-Release (-not @($events | Where-Object { $_ -like 'build:*' -or $_ -eq 'package' }).Count) '-PublishOnly rebuilt or repackaged the release.'
-    Assert-Release (@($events | Where-Object { $_ -eq 'deploy:False' }).Count -eq 1 -and @($events | Where-Object { $_ -eq 'local:21:2.0.1:' }).Count -eq 1) '-PublishOnly could not retry the optional steps.'
+    Assert-Release (@($events | Where-Object { $_ -eq 'deploy:False' }).Count -eq 1 -and @($events | Where-Object { $_ -eq 'local:20:2.0.0:' }).Count -eq 1) '-PublishOnly could not retry the optional steps.'
     Assert-Release (@($events | Where-Object { $_ -eq 'web:False' }).Count -eq 1) '-PublishOnly did not retry frontend deployment.'
     Write-Host 'PASS: Publish-only retries reuse artifacts and can rerun deployment and local verification without another version bump.'
 
-    $archive = Join-Path $testRoot 'build\dist\CodexRM-windows-amd64-v2.0.1-21.zip'
+    $archive = Join-Path $testRoot 'build\dist\CodexRM-windows-amd64-v2.0.0-20.zip'
     $manifestPath = Join-Path $testRoot 'build\dist\update.json'
     $validManifest = [IO.File]::ReadAllText($manifestPath)
     foreach ($field in @('versionCode','versionName')) {
         $metadata = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($field -eq 'versionCode') { $metadata.versionCode = 20 } else { $metadata.versionName = '2.0.0' }
+        if ($field -eq 'versionCode') { $metadata.versionCode = 19 } else { $metadata.versionName = '1.9.9' }
         [IO.File]::WriteAllText($manifestPath, ($metadata | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
         Clear-Content -LiteralPath $logPath
         $rejected = $false
@@ -182,8 +189,8 @@ try {
     }
     Write-Host 'PASS: Publish-only rejects dist update.json versionCode/versionName mismatches before upload.'
 
-    $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE = '20'
-    $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE = '2.0.0'
+    $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE = '19'
+    $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE = '1.9.9'
     & (Join-Path $scriptDir 'package-client.ps1') -OutputPath $archive
     $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE = $null
     $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE = $null

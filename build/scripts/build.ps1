@@ -1,13 +1,16 @@
 param(
     [switch]$Linux,
+    [ValidateSet('amd64', 'arm64')][string]$Arch = 'amd64',
     [ValidateSet('Agent', 'Server', 'All')][string]$Target = 'All',
     [switch]$Interactive,
-    [string]$WxBotImageLock
+    [string]$WxBotImageLock,
+    [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $root = Split-Path -Parent $buildRoot
 $ldflags = '-s -w'
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
 . (Join-Path $PSScriptRoot 'release-update-flags.ps1')
 
 if ($Interactive) {
@@ -37,6 +40,7 @@ if ($Interactive) {
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw 'Go was not found. Install Go 1.24+ and add it to PATH before building.'
 }
+if (-not $Linux -and $Arch -ne 'amd64') { throw 'Windows packages require amd64.' }
 if ($WxBotImageLock) {
     if (-not $Linux -or $Target -eq 'Server') { throw 'The wxbot image lock requires a Linux Agent build.' }
     $lockPath = [IO.Path]::GetFullPath($WxBotImageLock)
@@ -55,14 +59,15 @@ if ($WxBotImageLock) {
 $previousOS = $env:GOOS
 $previousArch = $env:GOARCH
 $previousCGO = $env:CGO_ENABLED
+if ($OutputDirectory) { $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory) }
 Push-Location $root
 try {
-    $outputDir = Join-Path $buildRoot 'bin'
+    $outputDir = if ($OutputDirectory) { $OutputDirectory } else { Join-Path $buildRoot 'bin' }
     [void][IO.Directory]::CreateDirectory($outputDir)
     $env:GOOS = if ($Linux) { 'linux' } else { 'windows' }
-    $env:GOARCH = 'amd64'
+    $env:GOARCH = $Arch
     $env:CGO_ENABLED = '0'
-    $suffix = if ($Linux) { '-linux-amd64' } else { '.exe' }
+    $suffix = if ($Linux) { "-linux-$Arch" } else { '.exe' }
     $targets = if ($Target -eq 'All') { @('server', 'agent') } else { @($Target.ToLowerInvariant()) }
     foreach ($component in $targets) {
         $outputPath = Join-Path $outputDir ("codexrm-$component" + $suffix)
@@ -72,9 +77,10 @@ try {
         if ($component -eq 'agent') { $componentLdflags += (Get-ReleaseUpdateLinkerFlags) }
         if (-not $Linux -and $component -eq 'agent') { $componentLdflags += ' -H=windowsgui' }
         if ($Linux -and $component -eq 'agent' -and $wxbotLock64) {
-            $componentLdflags += " -X github.com/codexrm/codexrm/internal/agenthost.wxReleaseImageLock=$wxbotLock64"
+            $componentLdflags += " -X github.com/CyL-Cly/CodexRM-Agent/internal/agenthost.wxReleaseImageLock=$wxbotLock64"
         }
-        go build -trimpath -ldflags $componentLdflags -o $outputPath "./cmd/codexrm-$component"
+        $module = $script:CodexRMComponentModules[$component]
+        Invoke-CodexRMGo build -mod=readonly -trimpath -ldflags $componentLdflags -o $outputPath "$module/cmd/codexrm-$component"
         if ($LASTEXITCODE) { throw "$component build failed for $env:GOOS/$env:GOARCH (exit code $LASTEXITCODE)." }
         Write-Host "Built: $outputPath"
     }

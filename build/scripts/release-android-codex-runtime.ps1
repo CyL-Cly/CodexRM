@@ -7,6 +7,7 @@
     [switch]$Publish
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 Push-Location $root
 try {
@@ -37,7 +38,7 @@ try {
             if ($LASTEXITCODE) { throw 'Unable to build the extension app.' }
         } finally { Pop-Location }
         $env:CGO_ENABLED='1'; $env:GOOS='android'; $env:GOARCH='arm64'; $env:CC=$compiler
-        go build -trimpath -buildmode=pie -ldflags '-s -w' -o $agent ./cmd/codexrm-android-local
+        Invoke-CodexRMGo build -mod=readonly -trimpath -buildmode=pie -ldflags '-s -w' -o $agent ./cmd/codexrm-android-local
         if ($LASTEXITCODE) { throw 'Unable to cross-compile the local Agent.' }
     } finally { foreach ($name in $oldEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $oldEnv[$name]) } }
     $previousPreference = $ErrorActionPreference
@@ -49,7 +50,7 @@ try {
     } finally { $ErrorActionPreference = $previousPreference }
     if ($packageExit) { throw 'Unable to package and sign the runtime APK.' }
     if ($Publish) {
-        go run ./cmd/codexrm-publish -config $PublishConfig -package $apk -manifest $manifest
+        Invoke-CodexRMGo run -mod=readonly ./cmd/codexrm-publish -config $PublishConfig -package $apk -manifest $manifest
         if ($LASTEXITCODE) { throw 'Cloudreve runtime publication failed.' }
         Write-Host "Verified Cloudreve release manifest: $manifest"
         Write-Host 'After smoke testing, pass this manifest to release-android.ps1 -LocalRuntimeManifest. Do not commit the published manifest.'

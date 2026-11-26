@@ -12,7 +12,7 @@ import (
 	"os"
 	"unsafe"
 
-	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/CyL-Cly/CodexRM-Server/protocol"
 )
 
 //export CRMDownload

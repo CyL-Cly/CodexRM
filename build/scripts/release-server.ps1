@@ -2,16 +2,21 @@ param(
     [string]$Config,
     [string]$ReleaseNotes = '',
     [switch]$Publish,
-    [switch]$PublishOnly
+    [switch]$PublishOnly,
+    [string]$InstallerOutput,
+    [string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
 . (Join-Path $PSScriptRoot 'release-update-flags.ps1')
 if ($Publish -and $PublishOnly) { throw 'Choose either -Publish or -PublishOnly.' }
+if ($PublishOnly -and $InstallerOutput) { throw '-InstallerOutput requires building the installer.' }
+if ($InstallerOutput) { $InstallerOutput = [IO.Path]::GetFullPath($InstallerOutput) }
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $projectRoot = Split-Path -Parent $buildRoot
 if (-not $Config) { $Config = Join-Path $buildRoot 'publish.config.json' }
 $Config = [IO.Path]::GetFullPath($Config)
-$dist = Join-Path $buildRoot 'dist'
+$dist = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $buildRoot 'dist' }
 $bin = Join-Path $buildRoot 'bin'
 [void][IO.Directory]::CreateDirectory($dist)
 [void][IO.Directory]::CreateDirectory($bin)
@@ -24,7 +29,8 @@ Push-Location $projectRoot
 try {
     try { $lock = [IO.File]::Open((Join-Path $bin '.server-release.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
     catch { throw 'Another Server release is running, or its lock cannot be opened.' }
-    $text = Get-Content -LiteralPath 'internal/release/server.go' -Raw -Encoding UTF8
+    $serverSource = Get-CodexRMComponentDir Server
+    $text = Get-Content -LiteralPath (Join-Path $serverSource 'release/server.go') -Raw -Encoding UTF8
     $codeMatch = [regex]::Match($text, '(?m)^const ServerVersionCode int64 = ([1-9][0-9]*)\s*$')
     $nameMatch = [regex]::Match($text, '(?m)^const ServerVersionName = "(\d+\.\d+\.\d+)"\s*$')
     if (-not $codeMatch.Success -or -not $nameMatch.Success) { throw 'Unsupported Server version format.' }
@@ -32,7 +38,7 @@ try {
     $name = $nameMatch.Groups[1].Value
     $base = "CodexRM-Server-linux-amd64-v$name-$code"
     $archive = Join-Path $dist ("$base.zip")
-    $installer = Join-Path $dist ("$base.tar.gz")
+    $installer = if ($InstallerOutput) { $InstallerOutput } else { Join-Path $dist ("$base.tar.gz") }
 
     if ($Publish -or $PublishOnly) {
         $cfg = Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -42,16 +48,18 @@ try {
         $stage = Join-Path $dist ('.codexrm-server-' + [Guid]::NewGuid().ToString('N'))
         $bundle = Join-Path $stage 'bundle'
         [void][IO.Directory]::CreateDirectory($bundle)
-        $webDir = Join-Path $projectRoot 'web'
-        $files = @(& (Join-Path $PSScriptRoot 'get-server-web-files.ps1') -WebDir $webDir)
+        $webDir = Join-Path $serverSource 'web'
+        $files = @(& (Join-Path $serverSource 'build/scripts/get-server-web-files.ps1') -WebDir $webDir)
         $previousOS, $previousArch, $previousCGO = $env:GOOS, $env:GOARCH, $env:CGO_ENABLED
         try {
             $env:GOOS = 'linux'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
             foreach ($target in @('codexrm-server', 'codexrm-server-updater')) {
                 $ldflags = '-s -w'
                 if ($target -eq 'codexrm-server-updater') { $ldflags += (Get-ReleaseUpdateLinkerFlags) }
-                go build -trimpath -ldflags $ldflags -o (Join-Path $bundle $target) "./cmd/$target"
+                $binary = Join-Path $bundle $target
+                Invoke-CodexRMGo build -mod=readonly -trimpath -ldflags $ldflags -o $binary "$($script:CodexRMComponentModules.Server)/cmd/$target"
                 if ($LASTEXITCODE) { throw "$target build failed." }
+                if ($target -eq 'codexrm-server-updater') { Assert-ReleaseOriginEmbedded $binary }
             }
         } finally {
             $env:GOOS = $previousOS; $env:GOARCH = $previousArch; $env:CGO_ENABLED = $previousCGO
@@ -75,12 +83,17 @@ try {
         } finally { $zip.Dispose() }
         $deploy = Join-Path $bundle 'deploy'
         [void][IO.Directory]::CreateDirectory($deploy)
-        foreach ($unit in @('codexrm.service','codexrm-server-update.service','codexrm-server-update.timer','codexrm-server-update.env.example')) {
-            Copy-Item -LiteralPath (Join-Path $projectRoot "deploy/$unit") -Destination $deploy
+        foreach ($unit in @('codexrm.service','codexrm-server-update.service','codexrm-server-update.timer','codexrm-server-update.env.example','nginx-location.conf')) {
+            Copy-Item -LiteralPath (Join-Path $serverSource "deploy/$unit") -Destination $deploy
         }
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install-server.sh') -Destination $bundle
+        Copy-Item -LiteralPath (Join-Path $serverSource 'build/scripts/install-server.sh') -Destination $bundle
+        if ($env:OS -ne 'Windows_NT') {
+            chmod 0755 (Join-Path $bundle 'install-server.sh')
+            if ($LASTEXITCODE) { throw 'Unable to mark the packaged Server installer executable.' }
+        }
+        Copy-Item -LiteralPath (Join-Path $serverSource 'LICENSE') -Destination $bundle
         $installerNext = Join-Path $stage 'installer.tar.gz'
-        & tar -czf $installerNext -C $bundle codexrm-server codexrm-server-updater install-server.sh web deploy
+        & tar -czf $installerNext -C $bundle codexrm-server codexrm-server-updater install-server.sh web deploy LICENSE
         if ($LASTEXITCODE) { throw 'Server installer archive creation failed.' }
         $meta = [ordered]@{
             versionCode = $code
@@ -91,6 +104,7 @@ try {
             sha256 = (Get-FileHash -LiteralPath $archiveNext -Algorithm SHA256).Hash.ToLowerInvariant()
         }
         [IO.File]::Copy($archiveNext, $archive, $true)
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $installer))
         [IO.File]::Copy($installerNext, $installer, $true)
         [IO.File]::WriteAllText($manifest, ($meta | ConvertTo-Json), $utf8)
         Write-Host "Server installer: $installer"
@@ -115,7 +129,7 @@ try {
             throw 'The feed already has this or a higher Server version with different content. Increase ServerVersionCode before release.'
         }
         $publisher = Join-Path $bin $(if ($env:OS -eq 'Windows_NT') { 'codexrm-server-publish.exe' } else { 'codexrm-server-publish' })
-        go build -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
+        Invoke-CodexRMGo build -mod=readonly -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
         if ($LASTEXITCODE) { throw 'Publisher build failed.' }
         & $publisher -config $Config -package $archive -manifest $manifest
         if ($LASTEXITCODE) { throw 'Server ZIP publication failed. Retry with -PublishOnly.' }

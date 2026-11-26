@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codexrm/codexrm/internal/updater"
+	"github.com/CyL-Cly/CodexRM-Server/updater"
 )
 
 type CloudreveConfig struct {

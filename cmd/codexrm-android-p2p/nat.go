@@ -12,7 +12,7 @@ import (
 	"encoding/json"
 	"unsafe"
 
-	"github.com/codexrm/codexrm/internal/p2p"
+	"github.com/CyL-Cly/CodexRM-Server/p2p"
 )
 
 //export CRMDiagnoseNAT

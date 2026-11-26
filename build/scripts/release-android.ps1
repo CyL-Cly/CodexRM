@@ -164,7 +164,8 @@ try {
 
     $publisher = Join-Path $binDirectory 'codexrm-publish.exe'
     if (-not $BuildOnly) {
-        go build -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
+        . (Join-Path $PSScriptRoot 'component-sources.ps1')
+        Invoke-CodexRMGo build -mod=readonly -trimpath -ldflags '-s -w' -o $publisher ./cmd/codexrm-publish
         if ($LASTEXITCODE) { throw 'Publisher build failed.' }
     }
 

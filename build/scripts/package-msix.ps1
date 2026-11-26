@@ -13,6 +13,8 @@ $ErrorActionPreference = 'Stop'
 $buildRoot = Split-Path -Parent $PSScriptRoot
 $projectRoot = Split-Path -Parent $buildRoot
 
+. (Join-Path $PSScriptRoot 'component-sources.ps1')
+
 function Find-SdkTool([string]$Name) {
     if ($WindowsSdkBin) {
         $path = Join-Path $WindowsSdkBin $Name
@@ -56,7 +58,7 @@ if ($CertificateThumbprint) {
     if (-not $certificate.HasPrivateKey -or $certificate.Subject -cne $Publisher) { throw 'The signing certificate must have a private key and its Subject must exactly match Publisher.' }
     if ($certificate.NotAfter -le (Get-Date) -or $certificate.NotBefore -gt (Get-Date)) { throw 'The signing certificate is not currently valid.' }
 }
-$source = Get-Content -LiteralPath (Join-Path $projectRoot 'internal\release\release.go') -Raw -Encoding UTF8
+$source = Get-Content -LiteralPath (Join-Path (Get-CodexRMComponentDir Agent) 'internal/release/release.go') -Raw -Encoding UTF8
 $versionMatch = [regex]::Match($source, 'const VersionName = "(\d+\.\d+\.\d+)"')
 if (-not $versionMatch.Success) { throw 'Cannot read the release version.' }
 $packageVersion = $versionMatch.Groups[1].Value + '.0'
@@ -78,7 +80,7 @@ try {
     $env:GOOS = 'windows'
     $env:GOARCH = 'amd64'
     $env:CGO_ENABLED = '0'
-    & go build -trimpath -ldflags '-s -w -H=windowsgui' -o (Join-Path $stage 'bin\codexrm-agent.exe') ./cmd/codexrm-agent
+    Invoke-CodexRMGo build -mod=readonly -trimpath -ldflags '-s -w -H=windowsgui' -o (Join-Path $stage 'bin\codexrm-agent.exe') ($script:CodexRMComponentModules.Agent + '/cmd/codexrm-agent')
     if ($LASTEXITCODE) { throw 'MSIX Agent build failed.' }
 } finally {
     $env:GOOS = $oldOS
@@ -88,7 +90,7 @@ try {
 }
 
 Add-Type -AssemblyName System.Drawing
-$icon = [Drawing.Image]::FromFile((Join-Path $projectRoot 'web\icons\icon-192.png'))
+$icon = [Drawing.Image]::FromFile((Join-Path (Get-CodexRMComponentDir Server) 'web/icons/icon-192.png'))
 try {
     foreach ($size in @(44, 50, 150)) {
         $bitmap = New-Object Drawing.Bitmap $size, $size

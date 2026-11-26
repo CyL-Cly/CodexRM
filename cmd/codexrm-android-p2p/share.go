@@ -13,9 +13,9 @@ import (
 	"os"
 	"unsafe"
 
-	"github.com/codexrm/codexrm/internal/p2p"
+	"github.com/CyL-Cly/CodexRM-Server/p2p"
 
-	"github.com/codexrm/codexrm/internal/protocol"
+	"github.com/CyL-Cly/CodexRM-Server/protocol"
 )
 
 //export CRMUpload

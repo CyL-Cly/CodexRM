@@ -12,7 +12,7 @@ Android / Web ←── 端到端加密 ──→ CodexRM 中继 ←── 出�
 
 功能包括设备配对与切换、多工作区与远程目录浏览、按文件夹筛选历史会话和分页、新建/重命名/归档会话、流式 Markdown 回复、模型和思考强度选择、权限设置、执行输出、文件 Diff、审批与用户输入、停止任务、断线重连。未发送的输入按设备、工作区和会话保存在当前浏览器中，切换或刷新后可恢复；发送在途记录独立保存，进程或页面中断后标记为“发送状态未确认”，先同步核对，不自动重发。配对失效可直接重新配对，草稿继续保留。真实会话由本机 Codex 保存；中继仅保存设备、浏览器授权和短期配对信息，不保存对话。
 
-网页采用 DeepSeek Harness 的主题、侧栏、居中新对话页、圆角输入区、消息气泡和模型菜单布局，适配 CodexRM 的设备、工作区和 Codex 通信。模型菜单提供按供应商分组、搜索及思考强度选择。新对话沿用当前浏览器内这台设备最近选择或成功发送使用的供应商、模型和思考强度，跨工作区、刷新后保留；仅查看旧对话不会覆盖最近选择。没有最近使用的模型时，保持当前 Codex 配置，不另选一个模型。复用主题和布局样式的 MIT 许可见 `web/dsh-LICENSE.txt`。
+网页采用 DeepSeek Harness 的主题、侧栏、居中新对话页、圆角输入区、消息气泡和模型菜单布局，适配 CodexRM 的设备、工作区和 Codex 通信。模型菜单提供按供应商分组、搜索及思考强度选择。新对话沿用当前浏览器内这台设备最近选择或成功发送使用的供应商、模型和思考强度，跨工作区、刷新后保留；仅查看旧对话不会覆盖最近选择。没有最近使用的模型时，保持当前 Codex 配置，不另选一个模型。复用主题和布局样式的 MIT 许可见 [Server 仓库的 `web/dsh-LICENSE.txt`](https://github.com/CyL-Cly/CodexRM-Server/blob/main/web/dsh-LICENSE.txt)。
 
 Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、JPEG、GIF、WebP 图片，无需 P2P 直连。普通聊天附件、「发送到电脑」、工作区文件下载和读取远端工作区图片仍需要 Android P2P 直连。聊天附件每个最大 20 MB，每条消息最多 10 个附件、合计 50 MB；附件保存在 Agent 数据目录下，中继不保存图片文件。
 
@@ -203,30 +203,50 @@ Agent 从供应商的 `/models` 接口获取模型。可以手动添加模型，
 
 网页和 Android 可以在原会话更换模型。第三方供应商的会话空闲时，也可以切换到另一第三方接入点，沿用已有历史。Agent 恢复会话时从本机读取对应连接配置，客户端的供应商详情不会返回已保存的 API Key。
 
+## 仓库分工与发布
+
+| 仓库 | 职责 |
+| --- | --- |
+| **CodexRM（本仓库）** | Android App、本机运行时扩展、Android Go/JNI 桥接、集成打包；**唯一的 GitHub Releases 仓库** |
+| [CodexRM-Agent](https://github.com/CyL-Cly/CodexRM-Agent) | Windows/Linux Agent、本机设置、安装、Linux 机器人及 Agent/Server 互操作测试 |
+| [CodexRM-Server](https://github.com/CyL-Cly/CodexRM-Server) | Relay Server、Web/PWA、Server 更新器、STUN、部署文件和共用 Go 协议/传输库 |
+
+旧提交、GitHub Releases 和下载地址都保留。两个组件仓库只跑测试，不发布 Release；Android APK 仍走已有的更新源，不上传到 GitHub Releases。
+
+### 升级构建所用的组件版本
+
+1. 在对应组件仓库修改、测试并推送。如果 Server 协议或依赖变更，先在 Agent 更新 Server 依赖并跑互操作测试。
+2. 在主仓库用**完整提交 SHA**更新 `go.mod` / `go.sum`，不要锁定分支头或提交本地 `replace`：
+
+   ```powershell
+   go get github.com/CyL-Cly/CodexRM-Agent@AGENT_COMMIT github.com/CyL-Cly/CodexRM-Server@SERVER_COMMIT
+   go mod tidy
+   go test -mod=readonly ./...
+   ```
+
+3. 提交两个 Go 模块文件并 push。集中打包脚本从同一模块图取二进制和静态文件，不依赖旁边的本地检出。GitHub Actions 的 Nightly 产物附 `SOURCES.txt`，记录主仓库提交和两个模块版本；手动运行可选 `build_only`，只验证打包，不创建 Release。
+
+Windows/Linux Agent 正式更新前，在 Agent 仓库调整 `internal/release/release.go`；Server 正式更新前，在 Server 仓库调整 `release/server.go`。主仓库的发布脚本只读取锁定版本，不会修改组件源码或替你递增版本号。
+
 ## 构建与测试
 
-需要 Go 1.24+。主工作区使用原生 HTML / CSS / JavaScript，无需 npm 构建。Server 直接从磁盘 `web/` 目录提供页面，不使用 Go embed；更新页面只需替换该目录，无需重新编译或重启 Server。真实模式默认从 Codex 桌面版安装位置查找自带的 CLI，无需另外安装 CLI 或加入 PATH。Windows 上会检查正在运行的桌面版、Store 安装信息及各本地磁盘的常见安装目录，桌面版关闭时也可查找。直接运行 Agent 时，找不到桌面版 CLI 才使用 PATH；也支持用 `--codex` 指定 CLI 路径。
+需要 Go 1.24+。主仓库从锁定的组件模块构建 Agent、Server 与 Android，不需要额外克隆两套源码。
 
 ```powershell
-.\build\scripts\build.ps1
-.\build\scripts\build.ps1 -Linux
-go test ./...
-go test -race ./...
-node --test web/app.test.mjs web/sw.test.mjs
-node --check web/app.js
-node --check web/pwa.js
-node --check web/sw.js
-node --check internal/agenthost/web/app.js
-# 原生安装和单实例测试包含在 go test ./... 中，使用隔离目录和启动项
+./build/scripts/build.ps1
+./build/scripts/build.ps1 -Linux
+go test -mod=readonly ./...
+powershell -NoProfile -File ./build/scripts/test-release.ps1
+powershell -NoProfile -File ./build/scripts/test-release-android.ps1
 ```
 
-构建产物输出到被 Git 忽略的 `build/bin/`。`codex/` 上游参考源码、`ChatGPT*` 设计参考和私人部署记录不参与构建，也不包含在公开仓库中。
+构建产物输出到被 Git 忽略的 `build/bin/`。各组件的单元测试和 UI 测试在对应仓库运行。Server 直接提供 `web/` 下的原生 HTML / CSS / JavaScript，无需 npm 构建。`codex/` 上游参考源码和私人部署记录不参与构建，也不包含在公开仓库中。
 
 ### HiUI 服务状态页
 
 `/hiui/` 使用独立的 React/Vite 入口和 HiUI 组件，读取 Server 的 `/api/v1/health`。构建产物写入 `web/hiui/`，运行 Go Server 后可直接访问。需要 Node.js 20.19+（20.x）或 22.12+。
 
-首次在新检出的仓库配置 HiUI 时，在根目录运行下面的命令。技能和生成的本地运行时由固定的上游提交恢复。
+首次配置 HiUI 时，在 **Server 仓库**的根目录运行下面的命令。技能和生成的本地运行时由固定的上游提交恢复。
 
 ```powershell
 npx --yes skills@1.9.0 add https://github.com/XiaoMi/hiui/tree/57473f4ea93f6764cbad204439b3a2af6f7f10e1/skills/hiui-workflow --skill '*' --agent codex --yes
@@ -250,8 +270,11 @@ Server、Agent 和客户端升级后，旧客户端配对需重新进行一次�
 ## 本地演示
 
 ```powershell
-# 终端 1：服务端，从当前仓库的 web/ 目录读取页面
-.\build\bin\codexrm-server.exe --addr 127.0.0.1:8080 --data .state/demo-server --web web
+# 在主仓库构建，然后从锁定的 Server 模块读取页面
+.\build\scripts\build.ps1
+. .\build\scripts\component-sources.ps1
+$web = Join-Path (Get-CodexRMComponentDir Server) 'web'
+.\build\bin\codexrm-server.exe --addr 127.0.0.1:8080 --data .state/demo-server --web $web
 
 # 终端 2：模拟设备，在系统托盘运行
 .\build\bin\codexrm-agent.exe --server http://127.0.0.1:8080 --mock --data .state/demo-agent
@@ -297,13 +320,13 @@ sudo bash install-server.sh
 curl -fsS http://127.0.0.1:18080/api/v1/health
 ```
 
-若旧版压缩包没有 `install-server.sh`，克隆本仓库，在源码目录中以三个路径调用安装脚本。
+若旧版压缩包没有 `install-server.sh`，克隆 Server 仓库，在源码目录中以三个路径调用安装脚本。
 
 ```bash
 sudo bash build/scripts/install-server.sh /path/to/server-package/codexrm-server ./deploy/codexrm.service /path/to/server-package/web
 ```
 
-从源码部署时，可用 `CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o codexrm-server ./cmd/codexrm-server` 构建当前 Linux 架构，再将二进制和仓库的 `web/` 分别传给同一个安装脚本。源码构建需要 Go 1.24 或更高版本。
+从 Server 仓库源码部署时，可用 `CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o codexrm-server ./cmd/codexrm-server` 构建当前 Linux 架构，再将二进制和仓库的 `web/` 分别传给同一个安装脚本。源码构建需要 Go 1.24 或更高版本。
 
 1. 将 `deploy/nginx-location.conf` 中的代理配置合入中继域名的 TLS `server` 块，保留 WebSocket 升级请求头。运行 `sudo nginx -t`，通过后执行 `sudo systemctl reload nginx`。
 2. 从客户端网络访问 `https://你的中继域名/api/v1/health`，确认返回 `ok: true`。若本机健康检查失败，用 `sudo systemctl status codexrm` 和 `sudo journalctl -u codexrm -n 50 --no-pager` 排查服务。
@@ -336,7 +359,7 @@ CODEXRM_SERVER_UPDATE_TZ=Asia/Singapore
 
 **构建时配置默认更新源**：正式打包前设置 `CODEXRM_RELEASE_UPDATE_BASE`，值为 HTTPS 站点 origin，不带路径、查询参数或凭据。GitHub Actions 从同名 Secret 获取该地址，不把它写入源码。包内的地址可以被下载者提取，不要在 URL 中放入凭据。
 
-**发布 Server 更新（Windows 构建机）**：首次用 `build\release-server.cmd nopause` 构建。后续发布前分别修改 `internal/release/server.go` 的 `ServerVersionName` 并递增 `ServerVersionCode`，不要重复使用已发布的版本号。输出在 `build/dist/`，其中 `.tar.gz` 是手动安装包，`.zip` 是自动更新包，`server-update.json` 是清单。使用 `build\release-server.cmd nopause -Publish` 构建并通过现有的 Cloudreve/RM 配置发布，失败可用 `-PublishOnly` 重试原包。首发前须先手动安装支持该接口的 Server。发布更新清单不会立即重启中继。
+**发布 Server 更新（Windows 构建机）**：首次用 `build\release-server.cmd nopause` 构建。后续发布前在 Server 仓库修改 `release/server.go` 的 `ServerVersionName` 并递增 `ServerVersionCode`，推送后更新主仓库的 Server 依赖。不要重复使用已发布的版本号。输出在 `build/dist/`，其中 `.tar.gz` 是手动安装包，`.zip` 是自动更新包，`server-update.json` 是清单。使用 `build\release-server.cmd nopause -Publish` 构建并通过现有的 Cloudreve/RM 配置发布，失败可用 `-PublishOnly` 重试原包。首发前须先手动安装支持该接口的 Server。发布更新清单不会立即重启中继。
 
 若自行托管清单，把 ZIP 上传到 HTTPS 存储，填写清单的 `downloadUrl`，再由管理员原子替换 `/opt/codexrm/server-updates/server-update.json`（目录 `root:root`、权限 `0755`，清单 `root:root`、权限 `0644`）。这是和 Agent 清单分开的目录；不要放入 `data/updates/`。
 
@@ -346,9 +369,9 @@ CODEXRM_SERVER_UPDATE_TZ=Asia/Singapore
 
 要部署完整诊断，准备支持两套协议的专用 STUN。一个端点须具有两个可达公网 IPv4 × 两个不同的 UDP 端口，并能从请求指定的备用来源回包。例如可在拥有两条可正确映射的公网 IPv4 的主机上运行 STUNTMAN 的 `full` 模式，为每个地址同时开放主、备用 UDP 端口；若主机绑定的是云内网地址，还需配置对应的公网 advertised 地址并确认 UDP 出站使用对应公网源地址。保留服务的防洪保护，不要把临时公共 STUN 当作唯一生产依赖。有条件时配置两套独立端点。
 
-仓库的 `deploy/codexrm-nat-stun.json.example` 和 `deploy/codexrm-nat-stun.service.example` 是 Linux 自建模板：准备 STUNTMAN 的 `stunserver` 可执行文件（或在 unit 中改为实际路径），替换示例 IP，将配置放到 `/etc/codexrm/nat-stun.json`，将 unit 放到 `/etc/systemd/system/codexrm-nat-stun.service`，再 `systemctl daemon-reload` 和 `systemctl enable --now codexrm-nat-stun.service`。不在主机上直接绑定公网 IP 时，两个 `*interface` 填本机绑定地址、两个 `*advertised` 分别填公网地址。
+Server 仓库的 `deploy/codexrm-nat-stun.json.example` 和 `deploy/codexrm-nat-stun.service.example` 是 Linux 自建模板：准备 STUNTMAN 的 `stunserver` 可执行文件（或在 unit 中改为实际路径），替换示例 IP，将配置放到 `/etc/codexrm/nat-stun.json`，将 unit 放到 `/etc/systemd/system/codexrm-nat-stun.service`，再 `systemctl daemon-reload` 和 `systemctl enable --now codexrm-nat-stun.service`。不在主机上直接绑定公网 IP 时，两个 `*interface` 填本机绑定地址、两个 `*advertised` 分别填公网地址。
 
-只有单公网 IPv4 的主机可以两台配对，各自监听两个 STUN UDP 端口，并通过相互认证的 UDP 通道完成换 IP 回包。参见 [两节点部署说明](deploy/codexrm-nat-stun-pair.md)。
+只有单公网 IPv4 的主机可以两台配对，各自监听两个 STUN UDP 端口，并通过相互认证的 UDP 通道完成换 IP 回包。参见 [两节点部署说明](https://github.com/CyL-Cly/CodexRM-Server/blob/main/deploy/codexrm-nat-stun-pair.md)。
 
 先从可正常收发 IPv4 UDP 的主机检查（替换示例 IPv4）：
 
@@ -358,20 +381,7 @@ codexrm-server --check-nat-stun --p2p-nat-stun '203.0.113.10:3478,198.51.100.10:
 
 该命令不会启动 RM。它会检查两套协议的普通 Binding、备用地址与端口，以及实际回包来源；一项不通过就返回非零退出码。若探测主机自身 NAT/防火墙阻拦换源回复，请换有合适 UDP 路径的主机复核。命令通过只代表该检查主机的路径可用。先在隔离 RM 设置 `CODEXRM_P2P_NAT_STUN`（同一逗号分隔列表，最多四个 `IPv4:UDP端口`），用实际手机蜂窝网络和 Windows Agent 在诊断弹窗中多次复测；双端都能完成分类后，再将同一配置加入生产 RM 并重启。**不要换掉 `CODEXRM_P2P_STUN`**：它仍用于业务直连，不等同于诊断端点。未配专用端点时仍可做现有的基础探测，但普通 STUN 的 Binding 回包不足以拿到完整分类。
 
-## 结构与接口
-
-```text
-cmd/codexrm-server/   HTTP / WebSocket 服务入口
-cmd/codexrm-agent/    本地连接器入口
-internal/agent/      出站重连、RPC 并发与审批回传
-internal/appserver/  Codex stdio / WS 客户端与模拟服务
-internal/server/     配对、鉴权、中继与磁盘静态 UI
-internal/store/      JSON 状态原子持久化
-internal/protocol/   中继消息结构
-web/                 响应式前端
-deploy/              systemd 与 Nginx 示例
-build/scripts/       开发构建、发布与服务器安装脚本
-```
+## 中继接口
 
 | 接口 | 用途 |
 | --- | --- |
