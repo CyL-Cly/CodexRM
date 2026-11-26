@@ -87,8 +87,8 @@ android {
         minSdk = 28
         targetSdk = 35
         ndk { abiFilters.add("arm64-v8a") }
-        versionCode = 66
-        versionName = "1.6.15"
+        versionCode = 67
+        versionName = "1.6.16"
         testInstrumentationRunner = if (p2pQa || fileTransferQa || secureRelayQa) {
             "com.codexrm.mobile.DirectInstrumentation"
         } else if (mathQa) {

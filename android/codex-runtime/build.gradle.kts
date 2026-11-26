@@ -10,8 +10,8 @@ android {
         applicationId = "com.codexrm.runtime"
         minSdk = 30
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.0.4"
+        versionCode = 6
+        versionName = "1.0.5"
     }
 
     // Android's package installer extracts these PIEs into its read-only native library
