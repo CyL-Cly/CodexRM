@@ -1,10 +1,10 @@
 # CodexRM
 
-**用 Android 手机远程操作电脑上的 Codex。** 扫码配对后，可以在手机上切换工作区、继续已有会话、发起任务、查看进度和处理审批。代码、命令和 Codex 都在 Windows 或 Linux 电脑上运行；手机不需要安装 Codex，也不是在远程操控整个桌面。Web 是免安装的备用入口。远程使用需要 CodexRM 中继，但可以用默认公共中继，不必自己部署。
+**用 Android 手机远程操作电脑上的 Codex。** 扫码配对后，可以在手机上切换工作区、继续已有会话、发起任务、查看进度和处理审批。远程模式下，代码、命令和 Codex 都在 Windows 或 Linux 电脑上运行；手机不需要安装 Codex，也不是在远程操控整个桌面。安卓也可选用[本机 Codex](#安卓本机-codex)。Web 是免安装的备用入口。远程使用需要 CodexRM 中继，但可以用默认公共中继，不必自己部署。
 
 **[下载 Android 客户端](https://github.com/CyL-Cly/CodexRM/releases)** · [下载 Windows / Linux Agent 与 Server](#选择下载包) · [中继与网络要求](#中继与网络要求) · [配对指南](#首次配对和发起任务) · [Linux Agent 专有功能](#linux-agent-专有功能)
 
-> CodexRM 是独立的社区项目，不是 OpenAI 官方产品。使用真实模式前，请安装并登录 Codex 桌面版，或自行安装并配置 Codex CLI。
+> CodexRM 是独立的社区项目，不是 OpenAI 官方产品。电脑端可安装并登录 Codex 桌面版，或安装并配置 Codex CLI；安卓本机模式请按下文安装独立扩展。
 
 ```text
 Android / Web ←── 端到端加密 ──→ CodexRM 中继 ←── 出站 WebSocket ──→ 电脑连接器（Agent） ←→ 本地 Codex
@@ -28,6 +28,14 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 - 扫描 Agent 的配对二维码，或输入一次性配对码；可在多台已配对电脑之间切换。
 - 支持后台任务通知、深色模式、自定义聊天背景和系统分享。下载位置可在设置中调整。
 - **文件传输助手** 通过 P2P 直连在手机与电脑之间发送文件或文字，不需要创建 Codex 会话。在 Windows 上可从 Agent 托盘打开对应的文件传输页。
+
+### 安卓本机 Codex
+
+在 Android 11 或更新的 ARM64 设备上，从设备列表选择「本机 Codex」。首次使用时从 Cloudreve 下载并安装独立 APK「Codex 本地运行扩展」，随后按系统提示给**扩展**开启「所有文件访问权限」。主 APK 不包含 Codex；扩展可单独卸载。该授权覆盖共享存储，不包含其他应用的私有目录。
+
+默认工作区是共享存储下的 `CodexRM` 文件夹，也可以选择其他可访问的文件夹。在「设置 → 本机 Codex 设置 → 模型供应商」添加兼容 `/v1/responses` 的服务地址、API Key 和模型 ID，再为新会话选择该供应商。不需要电脑、中继或 ChatGPT 登录；模型推理仍由选定的在线供应商处理。本机任务目前随客户端退出前台而停止；远程文件传输不适用于本机设备。
+
+维护者用 `build/scripts/release-android-codex-runtime.ps1` 单独构建、签名和发布扩展。扩展与主 APK 必须使用相同签名；更新扩展时递增它自己的版本号，经 Cloudreve 匿名下载校验后再更新 `android/app/src/main/assets/android-codex-runtime.json`。主包只包含这份含 SHA-256 的下载清单。
 
 ## 界面预览
 

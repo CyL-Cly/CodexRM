@@ -58,6 +58,7 @@ internal class CodexClient(
         fun onAuthorizationExpired()
         fun onDirectFallback()
         fun onDirectStatusChanged() = Unit
+        fun onLocalPermissionRequired() = Unit
     }
 
     private data class Pending(val callback: RpcCallback, val timeout: Runnable, val direct: Boolean)
@@ -73,6 +74,8 @@ internal class CodexClient(
     private val main = Handler(Looper.getMainLooper())
     private val pending = HashMap<Int, Pending>()
     private var socket: WebSocket? = null
+    private var local: LocalCodexConnection? = null
+    private val isLocal get() = device.agentId == LocalCodex.AGENT
     private var active = false
     private var online = false
     private var generation = 0
@@ -177,6 +180,15 @@ internal class CodexClient(
     fun start() {
         if (active) return
         active = true
+        if (isLocal) {
+            listener.onState(ConnectionState.CONNECTING, null)
+            local = LocalCodexConnection(appContext, { handle(it, authenticated = true) }, { message, permission ->
+                stop()
+                listener.onState(ConnectionState.OFFLINE, null)
+                if (permission) listener.onLocalPermissionRequired() else listener.onFailure(message)
+            }).also { it.start() }
+            return
+        }
         defaultNetwork = connectivity?.activeNetwork
         runCatching { connectivity?.registerDefaultNetworkCallback(networkCallback) }
         if (!relayOnly && NativeP2P.available) {
@@ -269,7 +281,7 @@ internal class CodexClient(
                     rejectPending("远程设备已离线")
                     finishNAT("远程设备已离线。")
                 }
-                if (online) tryDirect()
+                if (online && !isLocal) tryDirect()
             }
             "p2p" -> envelope.optJSONObject("p2p")?.let {
                 if (it.string("kind").startsWith("diagnose_")) handleNAT(it) else directSignal(it)
@@ -638,6 +650,7 @@ internal class CodexClient(
     }
 
     private fun sendBusiness(text: String, onDirect: Boolean): Boolean {
+        if (isLocal) return local?.send(text) == true
         if (!onDirect) return secureRelay?.send(text) ?: (device.secureKey.isEmpty() && socket?.send(text) == true)
         val transport = direct
         if (transport?.send(text) == true) return true
@@ -663,7 +676,7 @@ internal class CodexClient(
     }
 
     fun requestProviderSettings(operation: String, params: JSONObject, requireDirect: Boolean, callback: RpcCallback) {
-        request("codexrm/provider/$operation", params, requireDirect, timeoutMs = 35_000, callback)
+        request("codexrm/provider/$operation", params, requireDirect && !isLocal, timeoutMs = 35_000, callback)
     }
 
     fun requestPhoneTransfer(operation: String, params: JSONObject, callback: RpcCallback) {
@@ -694,7 +707,7 @@ internal class CodexClient(
             main.post { callback.onComplete(null, IOException("P2P 直连已断开。")) }
             return
         }
-        if (!active || !online || socket == null) {
+        if (!active || !online || (socket == null && local == null)) {
             main.post { callback.onComplete(null, IOException("设备未连接，请确认本地 Agent 正在运行")) }
             return
         }
@@ -784,6 +797,11 @@ internal class CodexClient(
         if (!active && socket == null) return
         active = false
         online = false
+        if (isLocal) {
+            local?.close(); local = null
+            rejectPending("本机 Codex 已关闭")
+            return
+        }
         runCatching { connectivity?.unregisterNetworkCallback(networkCallback) }
         runCatching { connectivity?.unregisterNetworkCallback(directNetworksCallback) }
         main.removeCallbacks(refreshDirectSources)

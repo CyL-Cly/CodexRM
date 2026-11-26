@@ -13,7 +13,10 @@
     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
+    <uses-permission android:name="com.codexrm.runtime.BIND_LOCAL_CODEX" />
+
     <queries>
+        <package android:name="com.codexrm.runtime" />
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>

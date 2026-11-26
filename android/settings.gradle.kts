@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "CodexRM-Mobile"
 include(":app")
+include(":codex-runtime")

@@ -118,6 +118,7 @@ type approval struct {
 }
 type Agent struct {
 	cfg            Config
+	localEvent     sendEnvelope // In-process pipe transport, immutable after startup.
 	mentionedFiles mentionedFileIndex
 	creds          creds
 	credsDirty     bool
@@ -860,7 +861,7 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 				return
 			}
 		}
-		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "conversationTools": true, "providerModels": true, "providerManagement": a.supportsProviderManagement(), "sameModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "", "threadModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "" && a.cfg.DataDir != "", "messageQueue": true, "images": true, "directFiles": a.allowsFileManagement(), "computerFiles": a.allowsFileManagement(), "mentionedFileDownloads": a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize, "relayImages": true}, "phoneTransfer": true, "phoneTransferBatches": desktop.ReceivesFiles, "desktopShare": a.cfg.AllowFileManagement && desktop.ReceivesFiles, "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
+		a.respond(send, env, mustJSON(map[string]any{"name": a.cfg.Name, "cwd": a.cfg.Cwd, "mock": a.cfg.Mock, "version": release.VersionName, "os": runtime.GOOS, "workspaces": true, "threadSnapshots": true, "conversationTools": true, "providerModels": true, "providerManagement": a.supportsProviderManagement(), "sameModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "", "threadModelProviderSwitch": !a.cfg.Mock && a.cfg.AppServerURL == "" && a.cfg.DataDir != "", "messageQueue": true, "images": a.localEvent == nil, "directFiles": a.localEvent == nil && a.allowsFileManagement(), "computerFiles": a.localEvent == nil && a.allowsFileManagement(), "mentionedFileDownloads": a.localEvent == nil && a.supportsDirectFiles(), "attachments": map[string]any{"maxSize": attachmentMaxSize, "chunkSize": attachmentChunkSize, "relayImages": true}, "phoneTransfer": a.localEvent == nil, "phoneTransferBatches": a.localEvent == nil && desktop.ReceivesFiles, "desktopShare": a.localEvent == nil && a.cfg.AllowFileManagement && desktop.ReceivesFiles, "remoteUpdate": a.cfg.CheckForUpdate != nil, "transport": map[bool]string{true: "websocket", false: "stdio"}[a.cfg.AppServerURL != ""]}), nil)
 		a.mu.Lock()
 		pending := []approval{}
 		for _, p := range a.approvals {
@@ -913,7 +914,7 @@ func (a *Agent) handle(ctx context.Context, app *appserver.Client, send sendEnve
 	if strings.HasPrefix(req.Method, "codexrm/provider/") {
 		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
-		result, err := a.providerSettingsRPC(callCtx, app, req.Method, req.Params, direct != nil)
+		result, err := a.providerSettingsRPC(callCtx, app, req.Method, req.Params, direct != nil || a.localEvent != nil)
 		a.respond(send, env, mustJSON(result), err)
 		return
 	}

@@ -45,6 +45,7 @@ internal class SettingsPage(
     private val appearance: ChatAppearance? = null,
     private val pickBackground: (AppearanceArea) -> Unit = {},
     private val reportBackground: (Boolean) -> Unit = {},
+    private val local: Boolean = false,
 ) {
     data class Action(val title: String, val open: () -> Unit, val summary: (() -> String)? = null)
     data class Toggle(val title: String, val checked: () -> Boolean, val change: (Boolean) -> Unit, val summary: String? = null)
@@ -162,8 +163,10 @@ internal class SettingsPage(
         showPageContent(destination, root, canSlide, goBack)
     }
 
+    private val agentTitle get() = if (local) "本机 Codex 设置" else "电脑 Agent 设置"
+
     private fun showHome() = composePage(Page.HOME, "设置", ::dismiss) {
-        sections(Action("电脑 Agent 设置", ::showAgentSettings) { deviceName })
+        sections(Action(agentTitle, ::showAgentSettings) { deviceName })
     }
 
     fun showOpenSourceLicenses() = composePage(Page.LICENSES, "开放源代码许可", ::showHome) {
@@ -199,7 +202,7 @@ internal class SettingsPage(
         }
     }
 
-    private fun showAgentSettings() = composePage(Page.AGENT, "电脑 Agent 设置", ::showHome) {
+    private fun showAgentSettings() = composePage(Page.AGENT, agentTitle, ::showHome) {
         agentSections(Action("模型供应商", { loadCatalog() }) { deviceName })
     }
 
@@ -472,7 +475,7 @@ internal class SettingsPage(
         note(deviceName)
         if (warning.isNotEmpty()) note(warning)
         button("添加供应商") { showEditor() }
-        if (gptProviderSettings) row("当前 Codex 供应商设置", "编辑电脑端 config.toml") { loadNativeProviderSettings() }
+        if (gptProviderSettings) row("当前 Codex 供应商设置", if (local) "编辑手机端 config.toml" else "编辑电脑端 config.toml") { loadNativeProviderSettings() }
         button("刷新模型列表") { loadCatalog() }
         catalogs.forEach { provider ->
             val modelCount = provider.arrayAt("models").length()
@@ -774,7 +777,8 @@ internal class SettingsPage(
         ).also { content.addView(it, match(12)) }
         if (official) note("官方账号登录由电脑端 Codex 管理。")
         else {
-            note("修改现有接入地址或密钥需要 P2P 直连。保存后，选择该供应商即可使用更新后的接入配置。")
+            note(if (local) "配置保存在手机上的本机运行扩展中。保存后，选择该供应商即可使用。"
+                else "修改现有接入地址或密钥需要 P2P 直连。保存后，选择该供应商即可使用更新后的接入配置。")
             if (id.isNotEmpty() && initialBase.isEmpty()) note("现有地址未显示，留空可保留。")
         }
         val defaultModel = field("默认模型 ID（可选）", initialModel)

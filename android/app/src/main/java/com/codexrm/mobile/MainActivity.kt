@@ -82,6 +82,11 @@ private const val ATTACHMENT_CAMERA_URI_FLAGS = Intent.FLAG_GRANT_READ_URI_PERMI
 
 internal class MainActivity : ComponentActivity() {
     private lateinit var store: DeviceStore
+    private val localCodexDevice = Device("", "", "", LocalCodex.AGENT, "本机 Codex", os = "android")
+    private var offerLocalPermission = false
+    private var waitingLocalInstall = false
+    private var waitingLocalInstallSource = false
+    private var downloadingLocalCodex = false
     private lateinit var attachmentStore: AttachmentStore
     private lateinit var imageLoader: MessageImageLoader
     private lateinit var workspaceFiles: WorkspaceFileUi
@@ -359,7 +364,10 @@ internal class MainActivity : ComponentActivity() {
         Ui.configure(this, store.darkTheme)
         devices = store.load()
         restoreThreadId = savedInstanceState?.getString("threadId").orEmpty()
-        device = devices.firstOrNull { it.agentId == store.selectedId } ?: devices.firstOrNull()
+        waitingLocalInstall = savedInstanceState?.getBoolean("waitingLocalInstall") == true
+        waitingLocalInstallSource = savedInstanceState?.getBoolean("waitingLocalInstallSource") == true
+        device = if (store.selectedId == LocalCodex.AGENT && LocalCodex.supported) localCodexDevice
+            else devices.firstOrNull { it.agentId == store.selectedId } ?: devices.firstOrNull()
         outboxOwnerAgentId = currentAgent()
         if (device == null) showPair() else showMain(reset = true)
         restoreModelChoice(savedInstanceState)
@@ -401,6 +409,14 @@ internal class MainActivity : ComponentActivity() {
         TaskMonitor.stop(this)
         resumed = true
         transfers.resume()
+        if (waitingLocalInstall && LocalCodex.available(this)) {
+            waitingLocalInstall = false
+            chooseLocalCodex()
+        }
+        if (waitingLocalInstallSource) {
+            waitingLocalInstallSource = false
+            if (UpdateChecker.canInstall(this)) downloadLocalCodex()
+        }
         DeviceRevokeJob.onFailure = ::showRevocationFailure
         showRevocationFailure()
         if (store.pendingRevocations().isNotEmpty()) DeviceRevokeJob.schedule(this)
@@ -418,7 +434,7 @@ internal class MainActivity : ComponentActivity() {
         transfers.pause()
         DeviceRevokeJob.onFailure = null
         handler.removeCallbacks(modelRefresh)
-        if (mainVisible && online && !isChangingConfigurations && TaskMonitor.enabled(this, currentAgent())) {
+        if (mainVisible && online && currentAgent() != LocalCodex.AGENT && !isChangingConfigurations && TaskMonitor.enabled(this, currentAgent())) {
             val activeThreads = threadList.activeIds.toMutableSet()
             if (running && currentThreadId.isNotEmpty()) activeThreads.add(currentThreadId)
             if (activeThreads.isNotEmpty()) {
@@ -475,6 +491,8 @@ internal class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("waitingLocalInstall", waitingLocalInstall)
+        outState.putBoolean("waitingLocalInstallSource", waitingLocalInstallSource)
         pendingBackgroundPicker?.let { outState.putString("backgroundPicker", it.key) }
         saveDraft()
         outState.putString("threadId", currentThreadId)
@@ -568,7 +586,8 @@ internal class MainActivity : ComponentActivity() {
         card.addView(Ui.text(this, "配对码有效期 10 分钟，仅可使用一次。\n只有完成配对的设备才能访问这台电脑。", 12f, Ui.DIM).apply {
             gravity = Gravity.CENTER; setLineSpacing(0f, 1.4f); setPadding(0, Ui.dp(context, 22), 0, 0)
         })
-        if (devices.any { it.agentId !in expiredAgentIds }) card.addView(Ui.button(this, "返回已配对设备") { showMain() }, matchWidth(top = 12))
+        if (device?.agentId == LocalCodex.AGENT || devices.any { it.agentId !in expiredAgentIds }) card.addView(Ui.button(this, "返回设备") { showMain() }, matchWidth(top = 12))
+        if (LocalCodex.supported) card.addView(Ui.button(this, "本机 Codex") { chooseLocalCodex() }, matchWidth(top = 8))
         card.addView(Ui.button(this, "设置") { showAppSettings() }, matchWidth(top = 8))
         Ui.applyWindowInsets(scroll)
         pairPage = scroll
@@ -662,6 +681,10 @@ internal class MainActivity : ComponentActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 7361) {
+            if (device?.agentId == LocalCodex.AGENT && !online) { client?.stop(); client = null; connect() }
+            return
+        }
         if (workspaceFiles.onActivityResult(requestCode, resultCode, data)) {
             settingsPage?.refreshActionSummaries()
             return
@@ -692,8 +715,9 @@ internal class MainActivity : ComponentActivity() {
         mainVisible = true
         pairPage = null
         setContentView(mainRoot)
-        device = devices.firstOrNull { it.agentId == store.selectedId && it.agentId !in expiredAgentIds }
-            ?: devices.firstOrNull { it.agentId !in expiredAgentIds }.also { store.selectedId = it?.agentId.orEmpty() }
+        device = if (store.selectedId == LocalCodex.AGENT && LocalCodex.supported) localCodexDevice
+            else devices.firstOrNull { it.agentId == store.selectedId && it.agentId !in expiredAgentIds }
+                ?: devices.firstOrNull { it.agentId !in expiredAgentIds }.also { store.selectedId = it?.agentId.orEmpty() }
         if (device == null) { showPair(); return }
         outboxOwnerAgentId = currentAgent()
         if (reset) {
@@ -1244,6 +1268,15 @@ internal class MainActivity : ComponentActivity() {
             }
             override fun onRpcEvent(message: JSONObject) { if (device?.agentId == current.agentId) handleRpcEvent(message) }
             override fun onFailure(message: String) { if (mainVisible) toast(message) }
+            override fun onLocalPermissionRequired() {
+                if (device !== current || !mainVisible) return
+                if (!offerLocalPermission) { toast(LocalCodex.PERMISSION); return }
+                offerLocalPermission = false
+                if (runCatching { startActivityForResult(LocalCodex.permissionIntent(), 7361) }.isFailure) {
+                    val fallback = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    if (runCatching { startActivityForResult(fallback, 7361) }.isFailure) toast(LocalCodex.PERMISSION)
+                }
+            }
             override fun onDirectFallback() {
                 if (online && device?.agentId == current.agentId) bootstrap()
             }
@@ -3272,7 +3305,7 @@ internal class MainActivity : ComponentActivity() {
         deviceDropdown.visibility = if (devicesExpanded) View.VISIBLE else View.GONE
         deviceListScroll.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            if (devicesExpanded) min(Ui.dp(this, 56) * devices.size, Ui.dp(this, 224)) else 0,
+            if (devicesExpanded) min(Ui.dp(this, 56) * (devices.size + if (LocalCodex.supported) 1 else 0), Ui.dp(this, 224)) else 0,
         )
         sidebarConnectionButton = null
         deviceRows.removeAllViews()
@@ -3282,9 +3315,70 @@ internal class MainActivity : ComponentActivity() {
             row.setOnClickListener { selectDevice(item, closeSidebarAfter = true) }
             deviceRows.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 56)))
         }
+        if (LocalCodex.supported) {
+            val row = deviceRow(localCodexDevice, device?.agentId == LocalCodex.AGENT, inSidebar = true)
+            row.setOnClickListener { chooseLocalCodex(closeSidebarAfter = true) }
+            deviceRows.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 56)))
+        }
+    }
+
+    private fun chooseLocalCodex(closeSidebarAfter: Boolean = false) {
+        if (!LocalCodex.supported) { toast(LocalCodex.UNSUPPORTED); return }
+        if (!LocalCodex.available(this)) {
+            if (LocalCodex.installed(this)) { toast("运行扩展与 CodexRM 签名不一致，请安装对应来源的版本。"); return }
+            if (downloadingLocalCodex) { toast("正在下载本机运行扩展。"); return }
+            styledDialog(MiuixDialog.Builder(this).setTitle("Codex 本地运行扩展")
+                .setMessage("首次使用需要下载并安装独立运行扩展。安装后需要允许它访问设备文件，才能读取和修改工作区。")
+                .setPositiveButton("下载扩展") { _, _ ->
+                    if (UpdateChecker.canInstall(this)) downloadLocalCodex()
+                    else {
+                        waitingLocalInstallSource = true
+                        val settings = Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, android.net.Uri.parse("package:$packageName"))
+                        if (runCatching { startActivity(settings) }.isFailure) {
+                            waitingLocalInstallSource = false
+                            toast("请先在系统设置中允许 CodexRM 安装未知来源应用。")
+                        }
+                    }
+                }.setNegativeButton("取消", null))
+            return
+        }
+        offerLocalPermission = true
+        if (device?.agentId == LocalCodex.AGENT && !mainVisible) {
+            showMain()
+        } else if (device?.agentId == LocalCodex.AGENT && !online) {
+            if (closeSidebarAfter) closeSidebar()
+            disconnect(); connect()
+        } else selectDevice(localCodexDevice, closeSidebarAfter)
+    }
+
+    private fun downloadLocalCodex() {
+        if (downloadingLocalCodex) return
+        downloadingLocalCodex = true
+        val progress = Ui.text(this, "正在准备下载…", 14f)
+        val dialog = styledDialog(MiuixDialog.Builder(this).setTitle("下载本机运行扩展")
+            .setView(progress).setCancelable(false))
+        val app = applicationContext
+        Thread({
+            val result = runCatching { LocalCodexDownload.download(app) { percent ->
+                handler.post { if (!isDestroyed) progress.text = "已下载 $percent%" }
+            } }
+            handler.post {
+                if (isDestroyed) return@post
+                downloadingLocalCodex = false
+                dialog.dismiss()
+                result.onSuccess { apk ->
+                    waitingLocalInstall = true
+                    if (!UpdateChecker.launchNormalPackageInstall(this, apk)) {
+                        waitingLocalInstall = false
+                        toast("无法打开 Android 安装界面。")
+                    }
+                }.onFailure { toast(it.message ?: "下载扩展失败。") }
+            }
+        }, "codex-local-download").start()
     }
 
     private fun selectDevice(item: Device, closeSidebarAfter: Boolean) {
+        if (item.agentId != LocalCodex.AGENT) { offerLocalPermission = false; waitingLocalInstall = false }
         devicePopup?.dismiss()
         devicesExpanded = false
         if (closeSidebarAfter) closeSidebar() else updateBackHandling()
@@ -3309,6 +3403,11 @@ internal class MainActivity : ComponentActivity() {
     }
 
     private fun deviceStatus(item: Device, selected: Boolean): String {
+        if (item.agentId == LocalCodex.AGENT) return when {
+            selected && item.online -> "在此手机上运行 · 已连接"
+            LocalCodex.available(this) -> "在此手机上运行 · 点击连接"
+            else -> "按需安装运行扩展"
+        }
         val version = (if (selected) info.string("version").ifEmpty { item.appVersion } else item.appVersion)
             .takeIf { it.isNotEmpty() }?.let { "Agent v$it · " }.orEmpty()
         return when {
@@ -3545,7 +3644,7 @@ internal class MainActivity : ComponentActivity() {
         val pathInput = MiuixFieldView(this, "输入设备上的绝对目录路径")
         pathRow.addView(pathInput, LinearLayout.LayoutParams(0, Ui.dp(this, 48), 1f))
         lateinit var browseDirectory: (String) -> Unit
-        val canBrowse = info.optBoolean("directFiles")
+        val canBrowse = currentAgent() == LocalCodex.AGENT || info.optBoolean("directFiles")
         val go = Ui.button(this, "前往") { browseDirectory(pathInput.text) }; pathRow.addView(go)
         go.visibility = if (canBrowse) View.VISIBLE else View.GONE
         column.addView(pathRow, matchWidth())
@@ -3649,6 +3748,9 @@ internal class MainActivity : ComponentActivity() {
                     ),
                 )
             }
+            if (LocalCodex.supported) BasicComponent(title = "本机 Codex", summary = deviceStatus(localCodexDevice, device?.agentId == LocalCodex.AGENT),
+                endActions = { RadioButton(selected = device?.agentId == LocalCodex.AGENT, onClick = null) },
+                onClick = { close(); chooseLocalCodex() })
             BasicComponent(title = "添加新设备", onClick = { close(); showPair() })
         }
         popup.setOnDismissListener { if (devicePopup === popup) devicePopup = null }
@@ -3697,8 +3799,9 @@ internal class MainActivity : ComponentActivity() {
         if (mainVisible) closeSidebar()
         settingsPage?.dismiss()
         val agent = currentAgent()
+        val local = agent == LocalCodex.AGENT
         fun availability(): String? = when {
-            agent != currentAgent() || !online -> "请连接这台电脑后重试。"
+            agent != currentAgent() || !online -> if (local) "请启动本机运行扩展后重试。" else "请连接这台电脑后重试。"
             !info.optBoolean("providerManagement") -> "此电脑 Agent 不支持供应商管理，请更新后重试。"
             else -> null
         }
@@ -3707,7 +3810,8 @@ internal class MainActivity : ComponentActivity() {
             appearance = appearance,
             pickBackground = ::pickBackgroundImage,
             reportBackground = ::reportBackgroundResult,
-            direct = { client?.usingDirect == true },
+            local = local,
+            direct = { client?.usingDirect == true || device?.agentId == LocalCodex.AGENT },
             request = { operation, params, requireDirect, callback ->
                 val current = client
                 val blocked = availability()
@@ -3724,7 +3828,7 @@ internal class MainActivity : ComponentActivity() {
                         "外观", actions = listOf(SettingsPage.Action("背景与透明度", { settingsPage?.showAppearance() })),
                         toggle = SettingsPage.Toggle("深色模式", { store.darkTheme }, ::setDarkTheme),
                     ),
-                    device?.let { current ->
+                    device?.takeUnless { it.agentId == LocalCodex.AGENT }?.let { current ->
                         SettingsPage.Section("通知", toggle = SettingsPage.Toggle(
                             title = "后台任务通知",
                             checked = { TaskMonitor.enabled(this, current.agentId) },
@@ -3769,7 +3873,7 @@ internal class MainActivity : ComponentActivity() {
                     if (current != null) {
                         add(SettingsPage.Section("服务与模型", actions = buildList {
                             add(providers)
-                            add(SettingsPage.Action("检查并更新电脑 Agent", ::confirmAgentUpdate))
+                            if (!local) add(SettingsPage.Action("检查并更新电脑 Agent", ::confirmAgentUpdate))
                         }))
                     }
                 }
@@ -4484,7 +4588,7 @@ internal class MainActivity : ComponentActivity() {
         updateBackHandling()
     }
 
-    private fun activeConnectionStatus(): DirectStatus? = client?.directStatus?.takeIf { online }
+    private fun activeConnectionStatus(): DirectStatus? = client?.directStatus?.takeIf { online && device?.agentId != LocalCodex.AGENT }
 
     private fun updateConnectionIndicator() {
         if (!mainBuilt) return
@@ -4615,9 +4719,8 @@ internal class MainActivity : ComponentActivity() {
             HomeAction.CHOOSE_WORKSPACE -> showWorkspaceChoices()
             HomeAction.CHOOSE_DEVICE -> showDevices(welcomeSecondary.takeIf { it.isShown } ?: deviceButton)
             HomeAction.RETRY_CONNECTION -> {
-                disconnect()
-                connect()
-                toast("正在重新连接设备")
+                if (currentAgent() == LocalCodex.AGENT) chooseLocalCodex()
+                else { disconnect(); connect(); toast("正在重新连接设备") }
             }
             HomeAction.RETRY_SYNC -> {
                 if (online && !bootstrapping) bootstrap() else {
@@ -4654,6 +4757,12 @@ internal class MainActivity : ComponentActivity() {
         val notice = if (cachedAt > 0) {
             val time = java.text.DateFormat.getDateTimeInstance().format(java.util.Date(cachedAt))
             "本机记录 · $time · 等待同步"
+        } else if (currentAgent() == LocalCodex.AGENT) {
+            when (connectionState) {
+                ConnectionState.ONLINE -> ""
+                ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> "正在启动本机 Codex…"
+                ConnectionState.OFFLINE -> "本机 Codex 未运行，点击重试。"
+            }
         } else if (!online && getSystemService(android.net.ConnectivityManager::class.java).activeNetwork == null) {
             "手机未连接网络 · 查看连接状态"
         } else when (connectionState) {
@@ -5663,7 +5772,7 @@ internal class MainActivity : ComponentActivity() {
     private fun showConnectionActions() {
         val current = device ?: return
         val actions = linkedMapOf<String, () -> Unit>()
-        actions["重新连接"] = { disconnect(); connect() }
+        actions["重新连接"] = { if (current.agentId == LocalCodex.AGENT) chooseLocalCodex() else { disconnect(); connect() } }
         val onlineAt = conversationPrefs.getLong("seen:${current.agentId}", 0)
         val lastSeen = if (onlineAt > 0) "\n上次在线：${java.text.DateFormat.getDateTimeInstance().format(java.util.Date(onlineAt))}" else ""
         val status = connectionNotice.text.toString().ifBlank { "电脑已连接" }

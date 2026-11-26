@@ -120,6 +120,10 @@ func (a *Agent) writeEncryptedRelayEvents(ctx context.Context, queue *relayEvent
 }
 
 func (a *Agent) publishEvent(env protocol.Envelope) {
+	if a.localEvent != nil {
+		_ = a.localEvent.write(env)
+		return
+	}
 	a.eventMu.Lock()
 	defer a.eventMu.Unlock()
 	queue := a.relayEvents

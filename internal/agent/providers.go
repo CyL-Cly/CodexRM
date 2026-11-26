@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/codexrm/codexrm/internal/appserver"
 	"github.com/codexrm/codexrm/internal/providers"
@@ -47,7 +48,14 @@ func (a *Agent) modelCatalog(ctx context.Context, app *appserver.Client) (any, e
 func (a *Agent) modelCatalogWithSettings(ctx context.Context, app *appserver.Client, management bool) (any, error) {
 	groups := []any{}
 	warnings := []string{}
-	models, err := nativeModels(ctx, app, "")
+	nativeCtx := ctx
+	if a.localEvent != nil {
+		// An offline/unconfigured official catalog must not block adding third-party keys.
+		var cancel context.CancelFunc
+		nativeCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+	}
+	models, err := nativeModels(nativeCtx, app, "")
 	if err != nil {
 		warnings = append(warnings, "当前 Codex 模型列表暂不可用")
 		models = []json.RawMessage{}
