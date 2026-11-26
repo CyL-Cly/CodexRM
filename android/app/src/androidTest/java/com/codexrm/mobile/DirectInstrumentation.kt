@@ -50,19 +50,27 @@ class DirectInstrumentation : Instrumentation() {
                 return
             }
             check(NativeP2P.available)
-            check(!targetContext.getSystemService(KeyguardManager::class.java).isKeyguardLocked) {
+            val initialSync = args.getString("initialSync")
+            check(initialSync != null || !targetContext.getSystemService(KeyguardManager::class.java).isKeyguardLocked) {
                 "Unlock the device normally before running this test"
             }
             val cm = targetContext.getSystemService(ConnectivityManager::class.java)
             val verifyImageReference = args.getString("imageReference") == "true"
             val verifyFiles = args.getString("files") == "true"
-            val verifyLan = args.getString("lan") == "true"
+            val verifyLan = args.getString("lan") == "true" || initialSync != null
             fun onExpectedNetwork(): Boolean {
                 val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
                 val transport = if (verifyLan) NetworkCapabilities.TRANSPORT_WIFI else NetworkCapabilities.TRANSPORT_CELLULAR
                 return caps.hasTransport(transport) && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
             }
             check(transferMode == "seed" || verifyFiles || verifyImageReference || onExpectedNetwork()) { "Default network does not match the test" }
+            if (initialSync != null) {
+                check(initialSync == "lan" || initialSync == "timeout")
+                val device = SecureRelayCheck.pair(args)
+                val summary = InitialSyncCheck.run(this, device, expectLan = initialSync == "lan")
+                finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "\n$summary\n") })
+                return
+            }
             val url = requireNotNull(args.getString("rm"))
             val code = requireNotNull(args.getString("pair"))
             val rounds = (args.getString("rounds")?.toIntOrNull() ?: 20).coerceIn(1, 200)

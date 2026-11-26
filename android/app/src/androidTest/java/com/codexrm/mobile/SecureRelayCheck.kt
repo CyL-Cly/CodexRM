@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 internal object SecureRelayCheck {
-    fun run(test: Instrumentation, args: Bundle): String {
+    fun pair(args: Bundle): Device {
         val invitation = SecureInvitation.parse(requireNotNull(args.getString("pair")))
         val server = requireNotNull(args.getString("rm"))
         val paired = AtomicReference<Device?>()
@@ -28,7 +28,12 @@ internal object SecureRelayCheck {
             }
         }
         check(pairDone.await(20, TimeUnit.SECONDS)) { "Pairing timed out" }
-        val device = checkNotNull(paired.get()) { failure.get() ?: "Pairing failed" }
+        return checkNotNull(paired.get()) { failure.get() ?: "Pairing failed" }
+    }
+
+    fun run(test: Instrumentation, args: Bundle): String {
+        val device = pair(args)
+        val failure = AtomicReference<String?>()
         repeat(2) {
             val rpcDone = CountDownLatch(1)
             lateinit var client: CodexClient

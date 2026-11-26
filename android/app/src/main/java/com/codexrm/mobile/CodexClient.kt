@@ -72,6 +72,10 @@ internal class CodexClient(
     private var pendingNAT: PendingNAT? = null
     private var natRetryAtMs = 0L
     private val main = Handler(Looper.getMainLooper())
+    private val initialSync = InitialSyncGate(
+        postDelayed = { task, delay -> main.postDelayed(task, delay) },
+        remove = main::removeCallbacks,
+    )
     private val pending = HashMap<Int, Pending>()
     private var socket: WebSocket? = null
     private var local: LocalCodexConnection? = null
@@ -94,8 +98,17 @@ internal class CodexClient(
     private val appContext = context.applicationContext
     private var directWifiLock: WifiManager.WifiLock? = null
     internal val usingDirect: Boolean get() = directActive
+    internal val waitingForInitialSync: Boolean get() = initialSync.waiting
     internal fun directTransport(): DirectTransport? = activeDirectTransport
     private val activeDirectTransport: DirectTransport? get() = direct.takeIf { directActive }
+
+    internal fun awaitInitialSync(sync: () -> Unit) {
+        // Availability can arrive just after the authenticated ONLINE event. A
+        // local candidate is enough to give RM signalling a bounded head start.
+        val canTryLan = !isLocal && !relayOnly && !directActive && NativeP2P.available &&
+            collectDirectSources().any { it.lan }
+        initialSync.await(canTryLan, sync)
+    }
 
     internal fun withDesktopShareTransport(ready: (DirectTransport?) -> Unit): () -> Unit {
         val started = SystemClock.elapsedRealtime()
@@ -276,6 +289,7 @@ internal class CodexClient(
                 reconnectAttempt = 0
                 val wasOnline = online
                 online = envelope.string("status") == "connected"
+                if (!online) initialSync.cancel()
                 listener.onState(if (online) ConnectionState.ONLINE else ConnectionState.OFFLINE, envelope.optJSONObject("agent"))
                 if (!online && wasOnline) {
                     dropDirect()
@@ -491,6 +505,7 @@ internal class CodexClient(
         if (directStatus == status) return
         directStatus = status
         listener.onDirectStatusChanged()
+        if (status != DirectStatus.Negotiating) initialSync.release()
     }
 
     private fun clearStartTimeout() {
@@ -551,6 +566,7 @@ internal class CodexClient(
             }
             "start" -> {
                 if (!online || !directAvailable || id.length != 36 || direct != null || !NativeP2P.available) return
+                if (!signal.optBoolean("lan") || signal.optBoolean("forceRelay")) initialSync.release()
                 cancelDirectTimers()
                 directRetry.started(SystemClock.elapsedRealtime())
                 directLan = false
@@ -784,6 +800,7 @@ internal class CodexClient(
         if (!active) return
         main.removeCallbacks(welcomeTimeout)
         online = false
+        initialSync.cancel()
         dropDirect()
         resetDirectStatus()
         generation++
@@ -822,6 +839,7 @@ internal class CodexClient(
         if (!active && socket == null) return
         active = false
         online = false
+        initialSync.cancel()
         if (isLocal) {
             local?.close(); local = null
             rejectPending("本机 Codex 已关闭")
