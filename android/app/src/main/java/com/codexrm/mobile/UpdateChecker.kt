@@ -2,7 +2,6 @@ package com.codexrm.mobile
 
 import android.annotation.TargetApi
 import android.app.PendingIntent
-import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageInstaller
@@ -12,7 +11,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import androidx.core.content.FileProvider
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -28,12 +26,20 @@ import java.io.IOException
 import java.security.MessageDigest
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import java.util.zip.ZipFile
+
+internal enum class UpdateComponent(val label: String, val cacheKey: String) {
+    APP("CodexRM", "app"), RUNTIME("Codex 本地运行扩展", "runtime");
+
+    fun packageName(host: String): String = if (this == APP) host else LocalCodex.PACKAGE
+}
 
 internal object UpdateChecker {
     const val MAX_PACKAGE_SIZE = 512L * 1024L * 1024L
-    internal const val SILENT_INSTALL_FALLBACK_MS = 20_000L
+    internal const val INSTALL_WAIT_NOTICE_MS = 20_000L
     private const val MAX_MANIFEST_SIZE = 1024 * 1024
     private val main by lazy { Handler(Looper.getMainLooper()) }
+    private val updateClient by lazy { Network.client.newBuilder().followSslRedirects(false).build() }
     private val manifestUrl = updateEndpoint(BuildConfig.DEFAULT_UPDATE_SERVER, "android-update.json")
     private val historyUrl = updateEndpoint(BuildConfig.DEFAULT_UPDATE_SERVER, "release-history.json")
     val isAvailable: Boolean get() = manifestUrl != null
@@ -45,6 +51,7 @@ internal object UpdateChecker {
         val downloadUrl: String,
         val fileSize: Long,
         val sha256: String,
+        val component: UpdateComponent = UpdateComponent.APP,
     )
 
     @Suppress("DEPRECATION")
@@ -66,7 +73,7 @@ internal object UpdateChecker {
     fun canInstall(context: Context): Boolean =
         context.packageManager.canRequestPackageInstalls()
 
-    internal fun shouldUseSilentInstallFlag(sdkInt: Int): Boolean = sdkInt >= 31
+    internal fun shouldUseSilentInstallFlag(sdkInt: Int, isUpdate: Boolean = true): Boolean = sdkInt >= 31 && isUpdate
 
     internal fun shouldRetryWithInteractiveInstall(
         status: Int,
@@ -82,9 +89,6 @@ internal object UpdateChecker {
             else -> false
         }
     }
-
-    internal fun isUserCancelledInstall(status: Int): Boolean =
-        status == PackageInstaller.STATUS_FAILURE_ABORTED
 
     fun requestInstallPermission(context: Context) {
         context.startActivity(
@@ -133,7 +137,7 @@ internal object UpdateChecker {
     }
 
     private fun <T> fetchJson(url: String, parse: (String) -> T, callback: (T?, ApiException?) -> Unit): Call {
-        val call = Network.client.newCall(
+        val call = updateClient.newCall(
             Request.Builder()
                 .url(url)
                 .header("Accept", "application/json")
@@ -167,7 +171,11 @@ internal object UpdateChecker {
         return call
     }
 
-    internal fun parseManifest(text: String, manifestUrl: String): VersionInfo {
+    internal fun parseManifest(
+        text: String,
+        manifestUrl: String,
+        component: UpdateComponent = UpdateComponent.APP,
+    ): VersionInfo {
         require(text.length <= MAX_MANIFEST_SIZE) { "更新清单超过 1 MiB" }
         val json = JSONObject(text)
         val versionCode = json.optLong("versionCode", 0L)
@@ -183,6 +191,7 @@ internal object UpdateChecker {
         val base = manifestUrl.toHttpUrl()
         val download = base.resolve(rawDownloadUrl)
             ?: throw IllegalArgumentException("下载地址必须是 HTTP(S) 地址或相对路径")
+        require(download.isHttps) { "安装包下载必须使用 HTTPS" }
         require(download.username.isEmpty() && download.password.isEmpty() && download.fragment == null) {
             "下载地址不能包含凭据或片段"
         }
@@ -193,6 +202,7 @@ internal object UpdateChecker {
             downloadUrl = download.toString(),
             fileSize = fileSize,
             sha256 = sha256,
+            component = component,
         )
     }
 
@@ -202,7 +212,9 @@ internal object UpdateChecker {
         onProgress: (Int) -> Unit,
         onComplete: (File?, ApiException?) -> Unit,
     ): Call {
-        val call = Network.client.newCall(
+        val directory = File(context.cacheDir, "updates/${info.component.cacheKey}")
+        val target = File(directory, "${info.versionCode}.apk")
+        val call = updateClient.newCall(
             Request.Builder().url(info.downloadUrl).header("Accept", "application/vnd.android.package-archive").build(),
         )
         call.enqueue(object : Callback {
@@ -211,31 +223,32 @@ internal object UpdateChecker {
             }
 
             override fun onResponse(call: Call, response: Response) {
-                val directory = File(context.cacheDir, "updates")
-                val partial = File(directory, "CodexRM-${info.versionCode}.apk.part")
-                val target = File(directory, "CodexRM-${info.versionCode}.apk")
+                var partial: File? = null
                 var lastProgress = -1
                 val result = runCatching {
                     response.use {
                         if (!it.isSuccessful) throw ApiException("下载服务器返回 HTTP ${it.code}", it.code)
                         if (!directory.exists() && !directory.mkdirs()) throw IOException("无法创建更新缓存目录")
-                        partial.delete()
-                        downloadBody(it.body, partial, info) { progress ->
+                        if (!it.request.url.isHttps) throw IOException("安装包下载重定向到了非 HTTPS 地址")
+                        val staged = File.createTempFile("staging-${info.versionCode}-", ".apk", directory)
+                        partial = staged
+                        downloadBody(it.body, staged, info) { progress ->
                             if (progress != lastProgress) {
                                 lastProgress = progress
                                 main.post { onProgress(progress) }
                             }
                         }
-                        if (partial.length() != info.fileSize) throw IOException("安装包大小与清单不一致")
-                        if (!sha256Hex(partial).equals(info.sha256, ignoreCase = true)) {
+                        if (staged.length() != info.fileSize) throw IOException("安装包大小与清单不一致")
+                        if (!sha256Hex(staged).equals(info.sha256, ignoreCase = true)) {
                             throw IOException("安装包 SHA-256 校验失败")
                         }
-                        if (target.exists() && !target.delete()) throw IOException("无法替换旧安装包")
-                        if (!partial.renameTo(target)) throw IOException("无法保存已校验的安装包")
+                        validateArchive(context, staged, info)
+                        if (call.isCanceled()) throw IOException("已取消下载")
+                        if (!staged.renameTo(target)) throw IOException("无法保存已校验的安装包")
                         target
                     }
                 }
-                if (result.isFailure) partial.delete()
+                partial?.delete()
                 main.post {
                     result.fold(
                         onSuccess = { onComplete(it, null) },
@@ -319,84 +332,76 @@ internal object UpdateChecker {
         )
     }
 
-    fun abandonMySessions(context: Context) {
-        runCatching {
-            val installer = context.packageManager.packageInstaller
-            for (session in installer.mySessions) {
-                runCatching { installer.abandonSession(session.sessionId) }
-            }
-        }
+    fun abandonSession(context: Context, sessionId: Int) {
+        if (sessionId >= 0) runCatching { context.packageManager.packageInstaller.abandonSession(sessionId) }
     }
 
-    fun launchNormalPackageInstall(context: Context, apk: File): Boolean {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.downloads", apk)
-        val view = Intent(Intent.ACTION_VIEW)
-            .setDataAndType(uri, "application/vnd.android.package-archive")
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        view.clipData = ClipData.newRawUri("CodexRM-update", uri)
-        grantPackageUri(context, view, uri)
-        if (runCatching { context.startActivity(view) }.isSuccess) return true
-        view.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return runCatching { context.startActivity(view) }.isSuccess
-    }
+    private val runtimeLibraries = setOf(
+        "libcodex_android.so", "libcodexrm_local_agent.so", "libssl_3.so", "libcrypto_3.so",
+    )
 
-    @Suppress("DEPRECATION")
-    private fun grantPackageUri(context: Context, intent: Intent, uri: Uri) {
-        val matches = if (Build.VERSION.SDK_INT >= 33) {
-            context.packageManager.queryIntentActivities(
-                intent,
-                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong()),
-            )
-        } else {
-            context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
-        }
-        for (match in matches) {
-            val packageName = match.activityInfo?.packageName ?: continue
-            runCatching { context.grantUriPermission(packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+    internal fun verifyRuntimeComponents(apk: File) {
+        ZipFile(apk).use { archive ->
+            val missing = runtimeLibraries.filter { (archive.getEntry("lib/arm64-v8a/$it")?.size ?: 0L) <= 0L }
+            require(missing.isEmpty()) { "本机运行扩展缺少组件：${missing.joinToString()}" }
         }
     }
 
     @Suppress("DEPRECATION")
-    fun install(context: Context, apk: File, expectedVersionCode: Long, requestId: String, silent: Boolean) {
-        val archive = if (Build.VERSION.SDK_INT >= 33) {
-            context.packageManager.getPackageArchiveInfo(apk.absolutePath, PackageManager.PackageInfoFlags.of(0))
-        } else {
-            context.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
+    fun validateArchive(context: Context, apk: File, info: VersionInfo) {
+        val pm = context.packageManager
+        val flags = PackageManager.GET_SIGNING_CERTIFICATES
+        val archive = pm.getPackageArchiveInfo(apk.absolutePath, flags)
+        val targetPackage = info.component.packageName(context.packageName)
+        require(archive != null && archive.packageName == targetPackage) { "安装包不是有效的${info.component.label}更新" }
+        require(archive.longVersionCode == info.versionCode) { "安装包版本与更新清单不一致" }
+        val installed = runCatching { pm.getPackageInfo(targetPackage, flags) }.getOrNull()
+        val trusted = pm.getPackageInfo(context.packageName, flags).signingInfo?.apkContentsSigners?.toSet().orEmpty()
+        val incoming = archive.signingInfo?.apkContentsSigners?.toSet().orEmpty()
+        require(trusted.isNotEmpty() && incoming == trusted) { "安装包与 CodexRM 的签名不一致" }
+        if (installed != null) {
+            require(installed.signingInfo?.apkContentsSigners?.toSet() == incoming) { "现有应用与更新包签名不一致" }
+            require(archive.longVersionCode > installed.longVersionCode) { "已安装同版本或更新的版本" }
         }
-        require(archive != null && archive.packageName == context.packageName) { "安装包不是有效的 CodexRM 更新" }
-        require(archive.longVersionCode == expectedVersionCode) { "安装包版本与更新清单不一致" }
+        if (info.component == UpdateComponent.RUNTIME) verifyRuntimeComponents(apk)
+    }
+
+    fun install(context: Context, apk: File, info: VersionInfo, requestId: String, silent: Boolean) {
+        validateArchive(context, apk, info)
+        val targetPackage = info.component.packageName(context.packageName)
         val installer = context.packageManager.packageInstaller
         val useSilent = silent && shouldUseSilentInstallFlag(Build.VERSION.SDK_INT)
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
-            setAppPackageName(context.packageName)
-            // Android 12+ can update this app without another confirmation. Keep the
-            // calling activity alive; the system kills the process when it applies the
-            // package. Devices that reject silent install get the normal confirmation UI.
+            setAppPackageName(targetPackage)
+            setSize(apk.length())
+            // Android decides based on the package's install source and platform policy.
+            // A pending-user-action result is handled by the same installer for both packages.
             if (Build.VERSION.SDK_INT >= 31) configureUserAction31(this, useSilent)
         }
         val sessionId = installer.createSession(params)
-        val session = installer.openSession(sessionId)
         try {
-            session.openWrite("CodexRM-update.apk", 0L, apk.length()).use { output ->
-                apk.inputStream().use { input -> input.copyTo(output) }
-                session.fsync(output)
+            installer.openSession(sessionId).use { session ->
+                session.openWrite("CodexRM-update.apk", 0L, apk.length()).use { output ->
+                    apk.inputStream().use { input -> input.copyTo(output) }
+                    session.fsync(output)
+                }
+                val statusIntent = Intent(context, UpdateInstallReceiver::class.java)
+                    .setAction(UpdateInstallReceiver.ACTION_INSTALL_STATUS)
+                    .putExtra(UpdateInstallReceiver.EXTRA_REQUEST_ID, requestId)
+                    .putExtra(UpdateInstallReceiver.EXTRA_COMPONENT, info.component.name)
+                    .putExtra(UpdateInstallReceiver.EXTRA_OWN_SESSION_ID, sessionId)
+                // PackageInstaller fills in status and user-action extras, so it rejects an immutable callback.
+                val pendingIntent = PendingIntent.getBroadcast(
+                    context,
+                    sessionId,
+                    statusIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0,
+                )
+                session.commit(pendingIntent.intentSender)
             }
-            val statusIntent = Intent(context, UpdateInstallReceiver::class.java)
-                .setAction(UpdateInstallReceiver.ACTION_INSTALL_STATUS)
-                .putExtra(UpdateInstallReceiver.EXTRA_REQUEST_ID, requestId)
-            // PackageInstaller fills in status and user-action extras, so it rejects an immutable callback.
-            val pendingIntent = PendingIntent.getBroadcast(
-                context,
-                sessionId,
-                statusIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0,
-            )
-            session.commit(pendingIntent.intentSender)
         } catch (error: Exception) {
-            session.abandon()
+            abandonSession(context, sessionId)
             throw error
-        } finally {
-            session.close()
         }
     }
 

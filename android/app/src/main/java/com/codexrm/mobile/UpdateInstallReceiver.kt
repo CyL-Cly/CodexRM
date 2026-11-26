@@ -11,6 +11,7 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
     @Suppress("DEPRECATION")
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_INSTALL_STATUS) return
+        val component = UpdateComponent.entries.firstOrNull { it.name == intent.getStringExtra(EXTRA_COMPONENT) } ?: UpdateComponent.APP // Older CodexRM sessions had no component extra.
         when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
                 dispatch(
@@ -24,7 +25,8 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
             }
             PackageInstaller.STATUS_SUCCESS -> {
                 dispatch(context, intent, ACTION_INSTALL_FINISHED, status, null, null)
-                toast(context, "CodexRM 更新安装完成")
+                toast(context, "${component.label}安装完成")
+                if (component != UpdateComponent.APP) return
                 val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
                 if (launch != null) {
                     launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
@@ -66,6 +68,7 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
         val outgoing = Intent(action)
             .setPackage(context.packageName)
             .putExtra(EXTRA_REQUEST_ID, requestId)
+            .putExtra(EXTRA_OWN_SESSION_ID, status.getIntExtra(EXTRA_OWN_SESSION_ID, -1))
             .putExtra(EXTRA_STATUS, statusCode)
         if (confirmation != null) outgoing.putExtra(EXTRA_CONFIRM_INTENT, confirmation)
         if (message != null) outgoing.putExtra(EXTRA_MESSAGE, message)
@@ -82,6 +85,8 @@ internal class UpdateInstallReceiver : BroadcastReceiver() {
         const val ACTION_INSTALL_INTERACTIVE = "com.codexrm.mobile.action.UPDATE_INSTALL_INTERACTIVE"
         const val ACTION_INSTALL_FINISHED = "com.codexrm.mobile.action.UPDATE_INSTALL_FINISHED"
         const val EXTRA_REQUEST_ID = "com.codexrm.mobile.extra.UPDATE_REQUEST_ID"
+        const val EXTRA_COMPONENT = "com.codexrm.mobile.extra.UPDATE_COMPONENT"
+        const val EXTRA_OWN_SESSION_ID = "com.codexrm.mobile.extra.UPDATE_OWN_SESSION_ID"
         const val EXTRA_STATUS = "com.codexrm.mobile.extra.UPDATE_INSTALL_STATUS_CODE"
         const val EXTRA_MESSAGE = "com.codexrm.mobile.extra.UPDATE_INSTALL_MESSAGE"
         const val EXTRA_CONFIRM_INTENT = "com.codexrm.mobile.extra.UPDATE_INSTALL_CONFIRM"

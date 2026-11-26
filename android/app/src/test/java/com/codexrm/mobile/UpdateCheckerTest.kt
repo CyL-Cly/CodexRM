@@ -100,12 +100,52 @@ class UpdateCheckerTest {
         UpdateChecker.parseManifest(validManifest.replace("123456", (UpdateChecker.MAX_PACKAGE_SIZE + 1L).toString()), manifestUrl)
     }
 
+    @Test fun runtimeAndAppUseSharedManifestValidationWithSeparateTargets() {
+        val runtime = UpdateChecker.parseManifest(validManifest, manifestUrl, UpdateComponent.RUNTIME)
+        assertEquals(LocalCodex.PACKAGE, runtime.component.packageName("com.codexrm.mobile"))
+        assertEquals("runtime", runtime.component.cacheKey)
+        val app = UpdateChecker.parseManifest(validManifest, manifestUrl)
+        assertEquals("com.codexrm.mobile", app.component.packageName("com.codexrm.mobile"))
+        assertEquals("app", app.component.cacheKey)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun rejectsHttpDowngradeForRuntime() {
+        UpdateChecker.parseManifest(validManifest.replace("updates/CodexRM.apk", "http://cloud.example/runtime.apk"),
+            manifestUrl, UpdateComponent.RUNTIME)
+    }
+
+    @Test fun runtimePackageMustContainAllFourNonEmptyArm64Components() {
+        val apk = File.createTempFile("runtime-check", ".apk")
+        val names = listOf("libcodex_android.so", "libcodexrm_local_agent.so", "libssl_3.so", "libcrypto_3.so")
+        fun writePackage(emptyFile: String? = null, missingFile: String? = null) {
+            java.util.zip.ZipOutputStream(apk.outputStream()).use { zip ->
+                names.filter { it != missingFile }.forEach { name ->
+                    zip.putNextEntry(java.util.zip.ZipEntry("lib/arm64-v8a/$name"))
+                    if (name != emptyFile) zip.write(1)
+                    zip.closeEntry()
+                }
+            }
+        }
+        try {
+            writePackage()
+            UpdateChecker.verifyRuntimeComponents(apk)
+            names.forEach { name ->
+                writePackage(missingFile = name)
+                check(runCatching { UpdateChecker.verifyRuntimeComponents(apk) }.exceptionOrNull()?.message?.contains(name) == true)
+                writePackage(emptyFile = name)
+                check(runCatching { UpdateChecker.verifyRuntimeComponents(apk) }.exceptionOrNull()?.message?.contains(name) == true)
+            }
+        } finally { apk.delete() }
+    }
+
     @Test fun silentInstallFlagIsLimitedToAndroid12AndNewer() {
         assertEquals(false, UpdateChecker.shouldUseSilentInstallFlag(28))
         assertEquals(false, UpdateChecker.shouldUseSilentInstallFlag(29))
         assertEquals(false, UpdateChecker.shouldUseSilentInstallFlag(30))
         assertEquals(true, UpdateChecker.shouldUseSilentInstallFlag(31))
         assertEquals(true, UpdateChecker.shouldUseSilentInstallFlag(35))
+        assertEquals(false, UpdateChecker.shouldUseSilentInstallFlag(35, isUpdate = false))
     }
 
     @Test fun hashesFilesAsLowercaseHex() {
@@ -193,8 +233,6 @@ class UpdateCheckerTest {
                 interactiveAlreadyStarted = false,
             ),
         )
-        assertEquals(true, UpdateChecker.isUserCancelledInstall(PackageInstaller.STATUS_FAILURE_ABORTED))
-        assertEquals(false, UpdateChecker.isUserCancelledInstall(PackageInstaller.STATUS_FAILURE))
     }
 
 }

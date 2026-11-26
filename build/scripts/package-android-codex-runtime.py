@@ -179,8 +179,11 @@ def main():
         if args.host and signers(apksigner, args.host.resolve(strict=True)) != certs:
             raise ValueError("Runtime and CodexRM APKs must have the same signer")
         with zipfile.ZipFile(signed) as extension_apk:
-            if "lib/arm64-v8a/libcodex_android.so" not in extension_apk.namelist():
-                raise ValueError("Missing Codex binary in the signed runtime")
+            required = ("libcodex_android.so", "libcodexrm_local_agent.so", "libssl_3.so", "libcrypto_3.so")
+            files = {entry.filename for entry in extension_apk.infolist() if entry.file_size > 0}
+            missing = [name for name in required if f"lib/arm64-v8a/{name}" not in files]
+            if missing:
+                raise ValueError(f"Missing components in the signed runtime: {', '.join(missing)}")
         pending = target.with_suffix(".pending")
         try:
             with signed.open("rb") as source, pending.open("wb") as dest:

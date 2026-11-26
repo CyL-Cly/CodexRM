@@ -40,8 +40,14 @@ try {
         go build -trimpath -buildmode=pie -ldflags '-s -w' -o $agent ./cmd/codexrm-android-local
         if ($LASTEXITCODE) { throw 'Unable to cross-compile the local Agent.' }
     } finally { foreach ($name in $oldEnv.Keys) { [Environment]::SetEnvironmentVariable($name, $oldEnv[$name]) } }
-    & python build/scripts/package-android-codex-runtime.py --sdk $AndroidSdk --extension android/codex-runtime/build/outputs/apk/release/codex-runtime-release-unsigned.apk --host $HostApk --output $apk --manifest $manifest --keystore $Keystore --alias $Alias --cache $work --agent $agent
-    if ($LASTEXITCODE) { throw 'Unable to package and sign the runtime APK.' }
+    $previousPreference = $ErrorActionPreference
+    try {
+        # PowerShell 5.1 can turn Java signer warnings on stderr into terminating errors.
+        $ErrorActionPreference = 'Continue'
+        & python build/scripts/package-android-codex-runtime.py --sdk $AndroidSdk --extension android/codex-runtime/build/outputs/apk/release/codex-runtime-release-unsigned.apk --host $HostApk --output $apk --manifest $manifest --keystore $Keystore --alias $Alias --cache $work --agent $agent
+        $packageExit = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousPreference }
+    if ($packageExit) { throw 'Unable to package and sign the runtime APK.' }
     if ($Publish) {
         go run ./cmd/codexrm-publish -config $PublishConfig -package $apk -manifest $manifest
         if ($LASTEXITCODE) { throw 'Cloudreve runtime publication failed.' }

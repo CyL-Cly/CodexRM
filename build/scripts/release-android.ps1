@@ -35,7 +35,7 @@ Signing uses .signature/debug.keystore in the project root (-Pcodexrm.testSign),
 matching the APKs currently distributed by this project. Official builds use
 rm.server from the local publication config as their default update origin.
 For a local build without a config, set CODEXRM_RELEASE_UPDATE_BASE to inject
-an origin, or leave it unset to build without a default update source.
+an origin. An update origin is mandatory for every APK.
 '@
     return
 }
@@ -175,6 +175,10 @@ try {
             [IO.File]::WriteAllBytes($versionPath, $changedVersion)
         }
         $encodedRuntime = ''
+        if (-not $LocalRuntimeManifest) {
+            $publishedRuntime = Join-Path $buildRoot 'dist/android-codex-runtime.json'
+            if (Test-Path -LiteralPath $publishedRuntime -PathType Leaf) { $LocalRuntimeManifest = $publishedRuntime }
+        }
         if ($LocalRuntimeManifest) {
             $runtime = Get-Content -LiteralPath $LocalRuntimeManifest -Raw -Encoding utf8 | ConvertFrom-Json
             $download = [Uri]$runtime.downloadUrl

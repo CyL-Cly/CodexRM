@@ -84,9 +84,6 @@ internal class MainActivity : ComponentActivity() {
     private lateinit var store: DeviceStore
     private val localCodexDevice = Device("", "", "", LocalCodex.AGENT, "本机 Codex", os = "android")
     private var offerLocalPermission = false
-    private var waitingLocalInstall = false
-    private var waitingLocalInstallSource = false
-    private var downloadingLocalCodex = false
     private lateinit var attachmentStore: AttachmentStore
     private lateinit var imageLoader: MessageImageLoader
     private lateinit var workspaceFiles: WorkspaceFileUi
@@ -120,13 +117,13 @@ internal class MainActivity : ComponentActivity() {
 
     private var updateFailureReceiver: BroadcastReceiver? = null
     private var updateInstallStatus: TextView? = null
-    private var updateInstallApk: File? = null
-    private var updateInstallInfo: UpdateChecker.VersionInfo? = null
-    private var updateInstallOperation = 0
     private var updateInstallRequest = ""
-    private var ignoredAbortRequest = ""
     private var updateInstallPhase = UpdateInstallPhase.IDLE
-    private val updateSilentFallback = Runnable { fallBackFromSilentInstall() }
+    private val updateWaitNotice = Runnable {
+        if (updateInstallPhase == UpdateInstallPhase.SILENT || updateInstallPhase == UpdateInstallPhase.INTERACTIVE) {
+            updateInstallStatus?.text = "仍在等待 Android 完成安装，请勿重复提交"
+        }
+    }
     private var connectionDialog: MiuixDialog? = null
     private var dialogShowsDirect = false
     private var updateOperation = 0
@@ -364,8 +361,6 @@ internal class MainActivity : ComponentActivity() {
         Ui.configure(this, store.darkTheme)
         devices = store.load()
         restoreThreadId = savedInstanceState?.getString("threadId").orEmpty()
-        waitingLocalInstall = savedInstanceState?.getBoolean("waitingLocalInstall") == true
-        waitingLocalInstallSource = savedInstanceState?.getBoolean("waitingLocalInstallSource") == true
         device = if (store.selectedId == LocalCodex.AGENT && LocalCodex.supported) localCodexDevice
             else devices.firstOrNull { it.agentId == store.selectedId } ?: devices.firstOrNull()
         outboxOwnerAgentId = currentAgent()
@@ -409,14 +404,6 @@ internal class MainActivity : ComponentActivity() {
         TaskMonitor.stop(this)
         resumed = true
         transfers.resume()
-        if (waitingLocalInstall && LocalCodex.available(this)) {
-            waitingLocalInstall = false
-            chooseLocalCodex()
-        }
-        if (waitingLocalInstallSource) {
-            waitingLocalInstallSource = false
-            if (UpdateChecker.canInstall(this)) downloadLocalCodex()
-        }
         DeviceRevokeJob.onFailure = ::showRevocationFailure
         showRevocationFailure()
         if (store.pendingRevocations().isNotEmpty()) DeviceRevokeJob.schedule(this)
@@ -424,7 +411,7 @@ internal class MainActivity : ComponentActivity() {
         val pending = pendingUpdate
         if (pending != null) {
             pendingUpdate = null
-            if (UpdateChecker.canInstall(this)) startUpdateDownload(pending) else showUpdateAvailable(pending)
+            if (UpdateChecker.canInstall(this)) startUpdateDownload(pending)
         }
         showStartupUpdateIfReady()
         reviewSharedDraft()
@@ -491,8 +478,6 @@ internal class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putBoolean("waitingLocalInstall", waitingLocalInstall)
-        outState.putBoolean("waitingLocalInstallSource", waitingLocalInstallSource)
         pendingBackgroundPicker?.let { outState.putString("backgroundPicker", it.key) }
         saveDraft()
         outState.putString("threadId", currentThreadId)
@@ -3353,7 +3338,6 @@ internal class MainActivity : ComponentActivity() {
         if (!LocalCodex.supported) { toast(LocalCodex.UNSUPPORTED); return }
         if (!LocalCodex.available(this)) {
             if (LocalCodex.installed(this)) { toast("运行扩展与 CodexRM 签名不一致，请安装对应来源的版本。"); return }
-            if (downloadingLocalCodex) { toast("正在下载本机运行扩展。"); return }
             styledDialog(MiuixDialog.Builder(this).setTitle("Codex 本地运行扩展")
                 .setMessage("首次使用需要下载并安装独立运行扩展。安装后需要允许它访问设备文件，才能读取和修改工作区。")
                 .setPositiveButton("下载扩展") { _, _ ->
@@ -3371,45 +3355,17 @@ internal class MainActivity : ComponentActivity() {
     }
 
     private fun requestLocalCodexDownload() {
-        if (UpdateChecker.canInstall(this)) downloadLocalCodex()
-        else {
-            waitingLocalInstallSource = true
-            val settings = Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, android.net.Uri.parse("package:$packageName"))
-            if (runCatching { startActivity(settings) }.isFailure) {
-                waitingLocalInstallSource = false
-                toast("请先在系统设置中允许 CodexRM 安装未知来源应用。")
+        if (!LocalCodex.supported) { toast(LocalCodex.UNSUPPORTED); return }
+        if (updateDialog?.isShowing == true) { toast("已有安装或更新正在进行"); return }
+        runCatching { LocalCodexDownload.release(this) }
+            .onSuccess(::prepareUpdateDownload)
+            .onFailure { error ->
+                showUpdateFailure(error.message ?: "本机运行扩展的发布信息不可用") { requestLocalCodexDownload() }
             }
-        }
-    }
-
-    private fun downloadLocalCodex() {
-        if (downloadingLocalCodex) return
-        downloadingLocalCodex = true
-        val progress = Ui.text(this, "正在准备下载…", 14f)
-        val dialog = styledDialog(MiuixDialog.Builder(this).setTitle("下载本机运行扩展")
-            .setView(progress).setCancelable(false))
-        val app = applicationContext
-        Thread({
-            val result = runCatching { LocalCodexDownload.download(app) { percent ->
-                handler.post { if (!isDestroyed) progress.text = "已下载 $percent%" }
-            } }
-            handler.post {
-                if (isDestroyed) return@post
-                downloadingLocalCodex = false
-                dialog.dismiss()
-                result.onSuccess { apk ->
-                    waitingLocalInstall = true
-                    if (!UpdateChecker.launchNormalPackageInstall(this, apk)) {
-                        waitingLocalInstall = false
-                        toast("无法打开 Android 安装界面。")
-                    }
-                }.onFailure { toast(it.message ?: "下载扩展失败。") }
-            }
-        }, "codex-local-download").start()
     }
 
     private fun selectDevice(item: Device, closeSidebarAfter: Boolean) {
-        if (item.agentId != LocalCodex.AGENT) { offerLocalPermission = false; waitingLocalInstall = false }
+        if (item.agentId != LocalCodex.AGENT) offerLocalPermission = false
         devicePopup?.dismiss()
         devicesExpanded = false
         if (closeSidebarAfter) closeSidebar() else updateBackHandling()
@@ -4148,17 +4104,13 @@ internal class MainActivity : ComponentActivity() {
         startupUpdate = null
         updateCall?.cancel()
         updateCall = null
-        handler.removeCallbacks(updateSilentFallback)
+        handler.removeCallbacks(updateWaitNotice)
         updateFailureReceiver?.let { runCatching { unregisterReceiver(it) } }
         updateFailureReceiver = null
         updateDialog?.dismiss()
         updateDialog = null
         updateInstallStatus = null
-        updateInstallApk = null
-        updateInstallInfo = null
-        updateInstallOperation = 0
         updateInstallRequest = ""
-        ignoredAbortRequest = ""
         updateInstallPhase = UpdateInstallPhase.IDLE
     }
 
@@ -4180,34 +4132,36 @@ internal class MainActivity : ComponentActivity() {
                 .setTitle("发现新版本 ${info.versionName}")
                 .setMessage("当前版本 ${UpdateChecker.currentVersionName(this)}\n安装包 $size\n\n$notes\n\n下载校验完成后自动安装。")
                 .setPositiveButton("立即更新") { _, _ ->
-                    if (UpdateChecker.canInstall(this)) {
-                        startUpdateDownload(info)
-                    } else {
-                        pendingUpdate = info
-                        styledDialog(
-                            MiuixDialog.Builder(this)
-                                .setTitle("允许安装应用更新")
-                                .setMessage("首次更新需要在系统设置中允许 CodexRM 安装未知应用。授权后返回即可继续下载。")
-                                .setPositiveButton("去授权") { _, _ ->
-                                    runCatching { UpdateChecker.requestInstallPermission(this) }
-                                        .onFailure {
-                                            pendingUpdate = null
-                                            showUpdateFailure("无法打开安装权限设置") { showUpdateAvailable(info) }
-                                        }
-                                }
-                                .setNegativeButton("取消") { _, _ -> pendingUpdate = null },
-                        )
-                    }
+                    prepareUpdateDownload(info)
                 }
                 .setNegativeButton("稍后", null),
         )
     }
 
+    private fun prepareUpdateDownload(info: UpdateChecker.VersionInfo) {
+        if (UpdateChecker.canInstall(this)) { startUpdateDownload(info); return }
+        styledDialog(
+            MiuixDialog.Builder(this)
+                .setTitle("允许安装应用更新")
+                .setMessage("首次安装或更新需要在系统设置中允许 CodexRM 安装未知应用。授权后返回即可继续下载。")
+                .setPositiveButton("去授权") { _, _ ->
+                    pendingUpdate = info
+                    runCatching { UpdateChecker.requestInstallPermission(this) }.onFailure {
+                        pendingUpdate = null
+                        showUpdateFailure("无法打开安装权限设置") { prepareUpdateDownload(info) }
+                    }
+                }
+                .setNegativeButton("取消", null),
+        )
+    }
+
+    private fun runtimeInUse(info: UpdateChecker.VersionInfo): Boolean =
+        info.component == UpdateComponent.RUNTIME && currentAgent() == LocalCodex.AGENT &&
+            (running || sending || threadList.activeIds.isNotEmpty())
+
     private fun startUpdateDownload(info: UpdateChecker.VersionInfo) {
-        if (!UpdateChecker.canInstall(this)) {
-            showUpdateAvailable(info)
-            return
-        }
+        if (!UpdateChecker.canInstall(this)) { prepareUpdateDownload(info); return }
+        if (runtimeInUse(info)) { toast("请等本机 Codex 任务结束后再更新运行扩展"); return }
         cancelUpdateOperation()
         val operation = updateOperation
         val status = Ui.text(this, "正在下载更新…0%", 13f, Ui.MUTED)
@@ -4219,7 +4173,7 @@ internal class MainActivity : ComponentActivity() {
         }
         val dialog = styledDialog(
             MiuixDialog.Builder(this)
-                .setTitle("下载 CodexRM ${info.versionName}")
+                .setTitle("下载 ${info.component.label} ${info.versionName}")
                 .setView(column)
                 .setNegativeButton("取消下载") { _, _ -> cancelUpdateOperation() },
         )
@@ -4243,21 +4197,17 @@ internal class MainActivity : ComponentActivity() {
             dialog.setCancelable(false)
             dialog.getButton(MiuixDialog.NEGATIVE).visible = false
             status.accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-            status.text = "即将关闭软件，正在安装更新"
+            status.text = "正在安装${info.component.label}…"
             progress.isIndeterminate = true
             updateInstallStatus = status
-            updateInstallApk = apk
-            updateInstallInfo = info
-            updateInstallOperation = operation
-
-            handler.postDelayed({
-                if (operation != updateOperation || isFinishing || isDestroyed) return@postDelayed
-                // Keep this window and the activity open. Android kills the process when a
-                // silent update is applied. Unsupported devices fall back to the normal installer.
-                val silent = UpdateChecker.shouldUseSilentInstallFlag(Build.VERSION.SDK_INT)
-                if (!silent) status.text = "当前系统不支持静默安装，正在打开普通安装"
-                submitPackageInstall(operation, info, apk, silent)
-            }, 2000L)
+            if (runtimeInUse(info)) {
+                cancelUpdateOperation()
+                toast("请等本机 Codex 任务结束后再更新运行扩展")
+                return@download
+            }
+            val isUpdate = info.component == UpdateComponent.APP || LocalCodex.installed(this)
+            val silent = UpdateChecker.shouldUseSilentInstallFlag(Build.VERSION.SDK_INT, isUpdate)
+            submitPackageInstall(operation, info, apk, silent)
         }
     }
 
@@ -4268,9 +4218,10 @@ internal class MainActivity : ComponentActivity() {
         silent: Boolean,
     ) {
         if (operation != updateOperation || isFinishing || isDestroyed) return
-        handler.removeCallbacks(updateSilentFallback)
+        handler.removeCallbacks(updateWaitNotice)
         updateFailureReceiver?.let { runCatching { unregisterReceiver(it) } }
         updateFailureReceiver = null
+        val hadRuntime = LocalCodex.installed(this)
         val requestId = UUID.randomUUID().toString()
         updateInstallRequest = requestId
         updateInstallPhase = if (silent) UpdateInstallPhase.SILENT else UpdateInstallPhase.INTERACTIVE
@@ -4280,11 +4231,16 @@ internal class MainActivity : ComponentActivity() {
                 if (intent.getStringExtra(UpdateInstallReceiver.EXTRA_REQUEST_ID) != requestId) return
                 when (intent.action) {
                     UpdateInstallReceiver.ACTION_INSTALL_FINISHED -> {
-                        handler.removeCallbacks(updateSilentFallback)
+                        handler.removeCallbacks(updateWaitNotice)
                         updateInstallPhase = UpdateInstallPhase.FINISHED
+                        if (info.component == UpdateComponent.RUNTIME) {
+                            cancelUpdateOperation()
+                            if (currentAgent() == LocalCodex.AGENT) { disconnect(); connect() }
+                            else if (!hadRuntime) chooseLocalCodex()
+                        }
                     }
                     UpdateInstallReceiver.ACTION_INSTALL_INTERACTIVE ->
-                        openInteractiveInstall(operation, info, apk, intent)
+                        openInteractiveInstall(info, intent)
                     UpdateInstallReceiver.ACTION_INSTALL_FAILED ->
                         onUpdateInstallFailed(operation, info, apk, intent)
                 }
@@ -4303,22 +4259,19 @@ internal class MainActivity : ComponentActivity() {
         updateFailureReceiver = receiver
         val appContext = applicationContext
         thread(name = "codexrm-update-install") {
-            runCatching { UpdateChecker.install(appContext, apk, info.versionCode, requestId, silent) }
+            runCatching { UpdateChecker.install(appContext, apk, info, requestId, silent) }
                 .onSuccess {
-                    if (!silent) return@onSuccess
                     handler.post {
-                        if (operation != updateOperation || updateInstallPhase != UpdateInstallPhase.SILENT ||
-                            updateInstallRequest != requestId
-                        ) {
-                            return@post
+                        if (operation == updateOperation && updateInstallRequest == requestId &&
+                            (updateInstallPhase == UpdateInstallPhase.SILENT || updateInstallPhase == UpdateInstallPhase.INTERACTIVE)) {
+                            handler.postDelayed(updateWaitNotice, UpdateChecker.INSTALL_WAIT_NOTICE_MS)
                         }
-                        handler.postDelayed(updateSilentFallback, UpdateChecker.SILENT_INSTALL_FALLBACK_MS)
                     }
                 }
                 .onFailure { error ->
                     handler.post {
                         if (operation != updateOperation || isFinishing || isDestroyed) return@post
-                        handler.removeCallbacks(updateSilentFallback)
+                        handler.removeCallbacks(updateWaitNotice)
                         cancelUpdateOperation()
                         showUpdateFailure("无法提交安装：${error.message ?: "系统安装器不可用"}") {
                             startUpdateDownload(info)
@@ -4336,18 +4289,7 @@ internal class MainActivity : ComponentActivity() {
     ) {
         if (updateInstallPhase == UpdateInstallPhase.FINISHED) return
         val statusCode = intent.getIntExtra(UpdateInstallReceiver.EXTRA_STATUS, -1)
-        if (updateInstallRequest == ignoredAbortRequest && UpdateChecker.isUserCancelledInstall(statusCode)) {
-            ignoredAbortRequest = ""
-            return
-        }
-        if (updateInstallPhase == UpdateInstallPhase.HANDED_OFF) {
-            if (!UpdateChecker.isUserCancelledInstall(statusCode)) return
-            val message = intent.getStringExtra(UpdateInstallReceiver.EXTRA_MESSAGE) ?: "已取消安装更新"
-            cancelUpdateOperation()
-            showUpdateFailure(message) { startUpdateDownload(info) }
-            return
-        }
-        handler.removeCallbacks(updateSilentFallback)
+        handler.removeCallbacks(updateWaitNotice)
         if (updateInstallPhase == UpdateInstallPhase.SILENT &&
             UpdateChecker.shouldRetryWithInteractiveInstall(
                 statusCode,
@@ -4364,57 +4306,19 @@ internal class MainActivity : ComponentActivity() {
         showUpdateFailure(message) { startUpdateDownload(info) }
     }
 
-    private fun openInteractiveInstall(
-        operation: Int,
-        info: UpdateChecker.VersionInfo,
-        apk: File,
-        intent: Intent,
-    ) {
+    private fun openInteractiveInstall(info: UpdateChecker.VersionInfo, intent: Intent) {
         if (updateInstallPhase == UpdateInstallPhase.HANDED_OFF || updateInstallPhase == UpdateInstallPhase.FINISHED) return
-        handler.removeCallbacks(updateSilentFallback)
+        handler.removeCallbacks(updateWaitNotice)
         val confirmation = UpdateInstallReceiver.interactiveConfirmation(intent)
-        if (confirmation == null) {
-            ignoredAbortRequest = updateInstallRequest
-            UpdateChecker.abandonMySessions(applicationContext)
-        }
-        if (!handOffToSystemInstaller(operation, apk, confirmation)) {
-            cancelUpdateOperation()
-            showUpdateFailure("无法打开系统安装界面") { startUpdateDownload(info) }
-        }
-    }
-
-    private fun fallBackFromSilentInstall() {
-        if (updateInstallPhase != UpdateInstallPhase.SILENT) return
-        val info = updateInstallInfo ?: return
-        val apk = updateInstallApk ?: return
-        val operation = updateInstallOperation
-        if (operation != updateOperation || isFinishing || isDestroyed) return
-        updateInstallStatus?.text = "当前系统不支持静默安装，正在打开普通安装"
-        ignoredAbortRequest = updateInstallRequest
-        UpdateChecker.abandonMySessions(applicationContext)
-        if (!handOffToSystemInstaller(operation, apk, confirmation = null)) {
-            submitPackageInstall(operation, info, apk, silent = false)
-        }
-    }
-
-    private fun handOffToSystemInstaller(operation: Int, apk: File, confirmation: Intent?): Boolean {
-        if (operation != updateOperation || isFinishing || isDestroyed) return false
         updateInstallPhase = UpdateInstallPhase.HANDED_OFF
-        var opened = confirmation != null && openInstallConfirmation(confirmation)
-        if (!opened) {
-            if (confirmation != null) {
-                ignoredAbortRequest = updateInstallRequest
-                UpdateChecker.abandonMySessions(applicationContext)
-            }
-            opened = UpdateChecker.launchNormalPackageInstall(this, apk)
+        if (confirmation != null && openInstallConfirmation(confirmation)) {
+            updateInstallStatus?.text = "Android 要求确认此次安装，请在系统界面继续"
+            return
         }
-        if (!opened) {
-            updateInstallPhase = UpdateInstallPhase.IDLE
-            return false
-        }
-        updateInstallStatus?.text = "请在系统界面确认安装"
-        updateDialog?.setCancelable(true)
-        return true
+        // Only abandon this failed handoff, never another in-flight package session.
+        UpdateChecker.abandonSession(applicationContext, intent.getIntExtra(UpdateInstallReceiver.EXTRA_OWN_SESSION_ID, -1))
+        cancelUpdateOperation()
+        showUpdateFailure("Android 要求确认，但无法打开系统安装界面") { startUpdateDownload(info) }
     }
 
     private fun openInstallConfirmation(confirmation: Intent): Boolean {
