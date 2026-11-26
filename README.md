@@ -25,7 +25,7 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 
 ### Android 客户端
 
-Android APK 不在 GitHub Releases 或 Nightly 发布。首次安装请向部署方获取已签名的 APK；已安装的用户可在 CodexRM「设置 → 检查更新」内更新。
+首次安装请从 GitHub Release 的附件中下载已签名的 ARM64 APK；未附带 APK 的版本可向部署方获取。已安装的用户可在 CodexRM「设置 → 检查更新」内从主站更新。
 
 - 扫描 Agent 的配对二维码，或输入一次性配对码；可在多台已配对电脑之间切换。
 - 支持后台任务通知、深色模式、自定义聊天背景和系统分享。下载位置可在设置中调整。
@@ -87,16 +87,19 @@ adb shell am instrument -w -r -e visualizationCheck true com.codexrm.mobile.imag
 
 ### 选择下载包
 
-从 [GitHub Releases](https://github.com/CyL-Cly/CodexRM/releases) 打开相应的 Nightly 预发布，在 **Assets** 中按用途选择附件，不要下载源码压缩包。
+[GitHub Releases](https://github.com/CyL-Cly/CodexRM/releases) 的 **Assets** 提供手动安装包，不要下载源码压缩包。主站的 ZIP / APK 和更新清单供应用内自动更新使用，不作为 GitHub 安装附件发布。签名 APK 可同时用于首次安装和覆盖升级。
 
 | 用途 | 附件后缀 | 如何使用 |
 | --- | --- | --- |
-| Windows x64 被控电脑 | `windows-amd64-Setup.exe` | 双击安装 Agent，启动后在系统托盘打开设置 |
+| Windows x64 被控电脑 | `CodexRM-Setup.exe` 或 `windows-amd64-Setup.exe` | 双击安装 Agent，启动后在系统托盘打开设置 |
 | Linux x86-64 被控电脑 | `linux-amd64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux ARM64 被控电脑 | `linux-arm64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux x86-64 中继主机（仅自部署时下载） | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
+| Android ARM64 手机 | 签名 `.apk`（如该 Release 提供） | 安装后扫描 Agent 的配对二维码 |
 
-Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。没有 Android 安装包时，可以直接用手机浏览器连接。
+Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一 Release 中的 `SHA256SUMS.txt` 校验文件。没有 Android 安装包时，可以直接用手机浏览器连接。
+
+维护者可在 GitHub Actions 手动运行 **Nightly** 构建安装包。勾选 `include_android` 会用 `android-release-signing` 环境构建、签名并校验 APK；未勾选时仅构建 Windows / Linux 安装包。勾选 `build_only` 只生成构建产物，不创建 Release。主站更新仍通过本地发布脚本和 Cloudreve/RM 清单单独发布。
 
 ### 首次配对和发起任务
 
