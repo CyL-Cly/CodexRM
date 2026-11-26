@@ -3,7 +3,7 @@ module github.com/CyL-Cly/CodexRM
 go 1.24
 
 require (
-	github.com/CyL-Cly/CodexRM-Agent v0.0.0-20261126134521-0de705a0c076
+	github.com/CyL-Cly/CodexRM-Agent v0.0.0-20261126150552-ad5cdb9a114f
 	github.com/CyL-Cly/CodexRM-Server v0.0.0-20261126133803-f2ed27111db2
 	github.com/flynn/noise v1.1.0
 )

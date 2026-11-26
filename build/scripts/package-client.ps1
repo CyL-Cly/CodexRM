@@ -3,6 +3,7 @@
     [string]$Server,
     [string]$DownloadUrl,
     [string]$ReleaseNotes = '',
+    [switch]$UpdateOnly,
     [switch]$IncludeEnrollmentKey
 )
 $ErrorActionPreference = 'Stop'
@@ -15,8 +16,11 @@ if (-not $OutputPath) {
 }
 $OutputPath = [IO.Path]::GetFullPath($OutputPath)
 $stage = Join-Path $root ('.work\client-package-' + [Guid]::NewGuid().ToString('N') + '\CodexRM')
-& (Join-Path $PSScriptRoot 'package-setup.ps1')
-$files = @('bin\codexrm-agent.exe', 'dist\CodexRM-Setup.exe')
+$files = @('bin\codexrm-agent.exe')
+if (-not $UpdateOnly) {
+    & (Join-Path $PSScriptRoot 'package-setup.ps1')
+    $files += 'dist\CodexRM-Setup.exe'
+}
 foreach ($relativePath in $files) {
     $source = Join-Path $root $relativePath
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Package source missing: $source" }
@@ -39,7 +43,9 @@ $installGuide = @'
 
 Full setup guide: https://github.com/CyL-Cly/CodexRM#readme
 '@
-[IO.File]::WriteAllText((Join-Path $stage 'README.md'), $installGuide, [Text.UTF8Encoding]::new($false))
+if (-not $UpdateOnly) {
+    [IO.File]::WriteAllText((Join-Path $stage 'README.md'), $installGuide, [Text.UTF8Encoding]::new($false))
+}
 # Old automatic updaters require these ZIP entries. Native installers/updaters
 # only extract the exe; a fresh installation never installs these placeholders.
 $compatScripts = Join-Path $stage 'scripts'

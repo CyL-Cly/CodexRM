@@ -10,6 +10,10 @@ on:
         description: Build and verify bundles without publishing any release
         type: boolean
         default: false
+      release_artifacts:
+        description: Build Windows Setup and the self-hosted updater ZIP with the configured update origin
+        type: boolean
+        default: false
       include_android:
         description: Build a signed Android installer using the protected signing environment
         type: boolean
@@ -114,13 +118,21 @@ jobs:
       - name: Package Windows Agent offline installer
         shell: pwsh
         env:
-          CODEXRM_RELEASE_UPDATE_BASE: ${{ inputs.build_only && 'https://updates.example.invalid' || secrets.CODEXRM_RELEASE_UPDATE_BASE }}
+          CODEXRM_RELEASE_UPDATE_BASE: ${{ inputs.build_only && !inputs.release_artifacts && 'https://updates.example.invalid' || secrets.CODEXRM_RELEASE_UPDATE_BASE }}
+          RELEASE_ARTIFACTS: ${{ inputs.release_artifacts }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:CODEXRM_RELEASE_UPDATE_BASE)) { throw 'Release update origin is not configured.' }
           & ./build/scripts/build.ps1 -Target Agent
           . ./build/scripts/release-update-flags.ps1
           Assert-ReleaseOriginEmbedded (Join-Path $PWD 'build/bin/codexrm-agent.exe')
           & ./build/scripts/package-setup.ps1 -OutputPath "nightly-dist/CodexRM-$env:TAG-windows-amd64-Setup.exe"
+          if ($env:RELEASE_ARTIFACTS -eq 'true') {
+            . ./build/scripts/client-install.ps1
+            $version = Get-CodexRMBinaryVersion (Join-Path $PWD 'build/bin/codexrm-agent.exe')
+            $archive = "update-dist/CodexRM-windows-amd64-v$($version.versionName)-$($version.versionCode).zip"
+            & ./build/scripts/package-client.ps1 -OutputPath $archive -UpdateOnly
+          }
+
 
       - uses: actions/upload-artifact@v7.0.2
         with:
@@ -130,9 +142,18 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+      - uses: actions/upload-artifact@v7.0.2
+        if: inputs.release_artifacts
+        with:
+          name: ${{ env.TAG }}-windows-update
+          path: update-dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   build-linux:
     needs: select-commit
-    if: needs.select-commit.outputs.sha != ''
+    if: needs.select-commit.outputs.sha != '' && !inputs.release_artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
@@ -283,7 +304,7 @@ jobs:
 
   publish:
     if: >-
-      ${{ !cancelled() && github.repository == 'CyL-Cly/CodexRM' && !inputs.build_only &&
+      ${{ !cancelled() && github.repository == 'CyL-Cly/CodexRM' && !inputs.build_only && !inputs.release_artifacts &&
       needs.build-windows.result == 'success' && needs.build-linux.result == 'success' &&
       (!inputs.include_android || needs.build-android.result == 'success') }}
     needs: [select-commit, build-windows, build-linux, build-android]
