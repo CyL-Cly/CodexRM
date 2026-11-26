@@ -53,3 +53,4 @@ Thumbs.db
 /.qoder-input-images/
 .web-reverse-tool-dir
 .web-reverse-workspace-root
+__pycache__/
