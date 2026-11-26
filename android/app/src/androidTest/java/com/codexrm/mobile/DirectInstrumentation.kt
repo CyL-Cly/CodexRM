@@ -65,9 +65,13 @@ class DirectInstrumentation : Instrumentation() {
             }
             check(transferMode == "seed" || verifyFiles || verifyImageReference || onExpectedNetwork()) { "Default network does not match the test" }
             if (initialSync != null) {
-                check(initialSync == "lan" || initialSync == "timeout")
-                val device = SecureRelayCheck.pair(args)
-                val summary = InitialSyncCheck.run(this, device, expectLan = initialSync == "lan")
+                check(initialSync == "lan" || initialSync == "lan-offline" || initialSync == "relay")
+                val paired = SecureRelayCheck.pair(args)
+                val device = if (initialSync == "lan-offline") paired.copy(serverUrl = "http://127.0.0.1:1") else paired
+                var summary = InitialSyncCheck.run(this, device, expectLan = initialSync != "relay")
+                if (initialSync == "lan-offline") {
+                    summary += "\nReconnect with authenticated LAN address cached: " + InitialSyncCheck.run(this, device, expectLan = true)
+                }
                 finish(Activity.RESULT_OK, Bundle().apply { putString("stream", "\n$summary\n") })
                 return
             }

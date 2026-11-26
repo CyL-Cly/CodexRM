@@ -72,10 +72,6 @@ internal class CodexClient(
     private var pendingNAT: PendingNAT? = null
     private var natRetryAtMs = 0L
     private val main = Handler(Looper.getMainLooper())
-    private val initialSync = InitialSyncGate(
-        postDelayed = { task, delay -> main.postDelayed(task, delay) },
-        remove = main::removeCallbacks,
-    )
     private val pending = HashMap<Int, Pending>()
     private var socket: WebSocket? = null
     private var local: LocalCodexConnection? = null
@@ -83,6 +79,7 @@ internal class CodexClient(
     private val isLocal get() = device.agentId == LocalCodex.AGENT
     private var active = false
     private var online = false
+    private var relayOnline = false
     private var generation = 0
     private var nextId = 0
     private var reconnectAttempt = 0
@@ -90,6 +87,8 @@ internal class CodexClient(
     private var secureRelay: SecureRelay? = null
     private val welcomeTimeout = Runnable { scheduleReconnect() }
     private var direct: DirectTransport? = null
+    private var lanAttempt: DirectTransport? = null
+    private var independentLAN = false
     private var directId = ""
     private var directActive = false
     private var directLan = false
@@ -98,17 +97,8 @@ internal class CodexClient(
     private val appContext = context.applicationContext
     private var directWifiLock: WifiManager.WifiLock? = null
     internal val usingDirect: Boolean get() = directActive
-    internal val waitingForInitialSync: Boolean get() = initialSync.waiting
     internal fun directTransport(): DirectTransport? = activeDirectTransport
     private val activeDirectTransport: DirectTransport? get() = direct.takeIf { directActive }
-
-    internal fun awaitInitialSync(sync: () -> Unit) {
-        // Availability can arrive just after the authenticated ONLINE event. A
-        // local candidate is enough to give RM signalling a bounded head start.
-        val canTryLan = !isLocal && !relayOnly && !directActive && NativeP2P.available &&
-            collectDirectSources().any { it.lan }
-        initialSync.await(canTryLan, sync)
-    }
 
     internal fun withDesktopShareTransport(ready: (DirectTransport?) -> Unit): () -> Unit {
         val started = SystemClock.elapsedRealtime()
@@ -164,9 +154,12 @@ internal class CodexClient(
             val sources = collectDirectSources()
             if (sources != directSources) {
                 directSources = sources
-                // Let a live QUIC connection finish on its current network. If it
-                // goes away the native link fails and the next offer uses this list.
                 directRetry.onNetworkChanged()
+                cancelLANAttempt()
+                if (independentLAN && sources.none { it.lan && it.handle == directNetworkHandle }) {
+                    dropDirect("局域网已切换。")
+                }
+                startLAN()
                 tryDirect()
             }
         }
@@ -184,7 +177,7 @@ internal class CodexClient(
     private val renewDirectLease = object : Runnable {
         override fun run() {
             if (!active) return
-            if (online && directActive) {
+            if (relayOnline && directActive && !independentLAN) {
                 if (SystemClock.elapsedRealtime() >= directLease) dropDirect("直连授权续期超时。")
                 else if (!sendSignal("renew", directId)) dropDirect("无法通过 RM 续期直连授权。")
             }
@@ -213,6 +206,7 @@ internal class CodexClient(
         }
         main.postDelayed(renewDirectLease, 4_000)
         listener.onState(ConnectionState.CONNECTING, null)
+        startLAN()
         open()
     }
 
@@ -226,9 +220,7 @@ internal class CodexClient(
         reconnect = null
         directAvailable = false
         directRetry.reset()
-        resetDirectStatus()
-        rejectPending("连接已中断")
-        online = false
+        if (!independentLAN && lanAttempt == null) resetDirectStatus()
         val currentGeneration = ++generation
         closeSecureRelay()
         if (device.secureKey.isNotEmpty()) {
@@ -287,17 +279,19 @@ internal class CodexClient(
             "welcome", "agent_status" -> {
                 main.removeCallbacks(welcomeTimeout)
                 reconnectAttempt = 0
-                val wasOnline = online
-                online = envelope.string("status") == "connected"
-                if (!online) initialSync.cancel()
+                val wasRelayOnline = relayOnline
+                relayOnline = envelope.string("status") == "connected"
+                online = relayOnline || independentLAN
                 listener.onState(if (online) ConnectionState.ONLINE else ConnectionState.OFFLINE, envelope.optJSONObject("agent"))
-                if (!online && wasOnline) {
-                    dropDirect()
-                    resetDirectStatus()
-                    rejectPending("远程设备已离线")
+                if (!relayOnline && wasRelayOnline) {
+                    if (!independentLAN) {
+                        dropDirect(signalPeer = false)
+                        if (lanAttempt == null) resetDirectStatus()
+                    }
+                    rejectPending("远程设备已离线", onDirect = false)
                     finishNAT("远程设备已离线。")
                 }
-                if (online && !isLocal) tryDirect()
+                if (relayOnline && !isLocal) tryDirect()
             }
             "p2p" -> envelope.optJSONObject("p2p")?.let {
                 if (it.string("kind").startsWith("diagnose_")) handleNAT(it) else directSignal(it)
@@ -361,7 +355,7 @@ internal class CodexClient(
 
     fun diagnoseNAT(callback: (NatDiagnosticResult) -> Unit) {
         val unavailable = when {
-            !active || !online -> "Agent 未连接。"
+            !active || !relayOnline -> "RM 尚未连接，无法进行 NAT 诊断。"
             !NativeP2P.available -> "手机无法加载 P2P 原生库。"
             pendingNAT != null -> "诊断已在进行，请稍后再试。"
             SystemClock.elapsedRealtime() < natRetryAtMs -> "诊断刚刚发起过，请稍后重试。"
@@ -472,10 +466,68 @@ internal class CodexClient(
         return ((addresses.mapNotNull { it.getOrNull(0) }) + addresses.mapNotNull { it.getOrNull(1) }).take(12)
     }
 
+    private val retryLAN = Runnable { startLAN() }
+
+    private fun cancelLANAttempt() {
+        main.removeCallbacks(retryLAN)
+        val attempt = lanAttempt
+        lanAttempt = null
+        attempt?.close()
+    }
+
+    private fun startLAN() {
+        if (!active || relayOnly || device.secureKey.isEmpty() || direct != null || lanAttempt != null || !NativeP2P.available) return
+        val sources = directSources.filter { it.lan }
+        if (sources.isEmpty()) return
+        cancelDirectTimers()
+        main.removeCallbacks(retryLAN)
+        val hints = appContext.getSharedPreferences("lan_peers", Context.MODE_PRIVATE)
+        val hintKey = "${device.agentId}:${device.clientId}"
+        val config = JSONObject().put("kind", "local_lan").put("version", 1)
+            .put("clientId", device.clientId).put("pairKey", device.secureKey)
+            .put("cachedHost", hints.getString(hintKey, "").orEmpty())
+            .put("localSources", JSONArray(sources.map {
+                JSONObject().put("network", it.handle.toString()).put("prefix", it.prefix).put("lan", true)
+            }))
+        val transport = DirectTransport.open(config) ?: return
+        lanAttempt = transport
+        reportDirectStatus(DirectStatus.Negotiating)
+        transport.read(main, { text ->
+            if (lanAttempt === transport) {
+                val frame = runCatching { JSONObject(text) }.getOrNull()
+                if (frame?.string("type") == "native_lan_active") {
+                    lanAttempt = null
+                    direct = transport
+                    independentLAN = true
+                    directActive = true
+                    directLan = true
+                    directNetworkHandle = frame.string("network").toLongOrNull() ?: 0L
+                    acquireDirectWifiLock()
+                    hints.edit().putString(hintKey, frame.string("host")).apply()
+                    val wasOnline = online
+                    online = true
+                    reportDirectStatus(DirectStatus.Connected(lan = true))
+                    if (!wasOnline) listener.onState(ConnectionState.ONLINE, null)
+                }
+            } else if (direct === transport && independentLAN) {
+                handle(text, onDirect = true)
+            }
+        }, {
+            if (lanAttempt === transport) {
+                lanAttempt = null
+                resetDirectStatus()
+                tryDirect()
+                main.postDelayed(retryLAN, 30_000)
+            } else if (direct === transport && independentLAN) {
+                dropDirect("局域网直连已断开。")
+            }
+        })
+    }
+
     private fun tryDirect() {
         if (relayOnly) return
         val now = SystemClock.elapsedRealtime()
-        if (!active || !online || !directAvailable || direct != null || startTimeout != null || !NativeP2P.available) return
+        if (!active || !relayOnline || !directAvailable || direct != null || lanAttempt != null || startTimeout != null || !NativeP2P.available) return
         main.removeCallbacks(retryDirect)
         val delay = directRetry.delay(now) ?: return
         if (delay > 0) {
@@ -505,7 +557,6 @@ internal class CodexClient(
         if (directStatus == status) return
         directStatus = status
         listener.onDirectStatusChanged()
-        if (status != DirectStatus.Negotiating) initialSync.release()
     }
 
     private fun clearStartTimeout() {
@@ -565,8 +616,12 @@ internal class CodexClient(
                 retryAfterDirectFailure("RM 的直连会话已满。")
             }
             "start" -> {
-                if (!online || !directAvailable || id.length != 36 || direct != null || !NativeP2P.available) return
-                if (!signal.optBoolean("lan") || signal.optBoolean("forceRelay")) initialSync.release()
+                if (!relayOnline || !directAvailable || id.length != 36 || !NativeP2P.available) return
+                if (lanAttempt != null || independentLAN) {
+                    sendSignal("stop", id)
+                    return
+                }
+                if (direct != null) return
                 cancelDirectTimers()
                 directRetry.started(SystemClock.elapsedRealtime())
                 directLan = false
@@ -662,7 +717,10 @@ internal class CodexClient(
     private fun dropDirect(failure: String? = null, signalPeer: Boolean = true) {
         val previous = direct ?: return
         val wasActive = directActive
-        if (signalPeer) sendSignal("stop", directId)
+        val wasIndependent = independentLAN
+        if (signalPeer && !wasIndependent) sendSignal("stop", directId)
+        independentLAN = false
+        if (wasIndependent) online = active && relayOnline
         directActive = false
         directId = ""
         direct = null
@@ -671,18 +729,17 @@ internal class CodexClient(
         }
         directWifiLock = null
         previous.close()
-        if (failure != null) retryAfterDirectFailure(failure, wasActive)
-        val ids = pending.filterValues { it.direct }.keys.toList()
-        ids.forEach { id ->
-            pending.remove(id)?.let {
-                main.removeCallbacks(it.timeout)
-                it.callback.onComplete(null, RpcOutcomeUnknown("直连已中断，请求结果未知，请先同步状态"))
+        rejectPending("直连已中断，请求结果未知，请先同步状态", onDirect = true)
+        if (wasIndependent && active && failure != null) {
+            if (relayOnline) {
+                reportDirectStatus(DirectStatus.Relay("${failure}当前通过 RM 中继。"))
+            } else {
+                listener.onState(ConnectionState.RECONNECTING, null)
+                resetDirectStatus()
             }
-        }
-        if (wasActive) {
-            Log.i("CodexRM-P2P", "Direct transport closed; WebSocket fallback")
-            if (failure != null && online) listener.onDirectFallback()
-        }
+            main.postDelayed(retryLAN, 1_000)
+        } else if (failure != null) retryAfterDirectFailure(failure, wasActive)
+        if (wasActive && failure != null && online) listener.onDirectFallback()
     }
 
     private fun sendBusiness(text: String, onDirect: Boolean): Boolean {
@@ -743,7 +800,7 @@ internal class CodexClient(
             main.post { callback.onComplete(null, IOException("P2P 直连已断开。")) }
             return
         }
-        if (!active || !online || (socket == null && local == null)) {
+        if (!active || !online || (socket == null && local == null && !directActive)) {
             main.post { callback.onComplete(null, IOException("设备未连接，请确认本地 Agent 正在运行")) }
             return
         }
@@ -799,17 +856,19 @@ internal class CodexClient(
     private fun scheduleReconnect(networkRestored: Boolean = false) {
         if (!active) return
         main.removeCallbacks(welcomeTimeout)
-        online = false
-        initialSync.cancel()
-        dropDirect()
-        resetDirectStatus()
+        relayOnline = false
+        online = independentLAN
+        if (!independentLAN) {
+            dropDirect(signalPeer = false)
+            if (lanAttempt == null) resetDirectStatus()
+        }
         generation++
         closeSecureRelay()
         socket?.cancel()
         socket = null
-        rejectPending("服务器连接中断")
+        rejectPending("服务器连接中断", onDirect = false)
         finishNAT("服务器连接中断。")
-        listener.onState(ConnectionState.RECONNECTING, null)
+        if (!online) listener.onState(ConnectionState.RECONNECTING, null)
         reconnect?.let(main::removeCallbacks)
         val delay = if (networkRestored) {
             reconnectAttempt = 0
@@ -824,10 +883,9 @@ internal class CodexClient(
         main.postDelayed(task, delay)
     }
 
-    private fun rejectPending(message: String) {
-        val requests = pending.values.toList()
-        pending.clear()
-        localRunningThreads.clear()
+    private fun rejectPending(message: String, onDirect: Boolean? = null) {
+        val requests = pending.filterValues { onDirect == null || it.direct == onDirect }.keys.mapNotNull { pending.remove(it) }
+        if (onDirect == null) localRunningThreads.clear()
         updateLocalWork()
         requests.forEach {
             main.removeCallbacks(it.timeout)
@@ -839,7 +897,8 @@ internal class CodexClient(
         if (!active && socket == null) return
         active = false
         online = false
-        initialSync.cancel()
+        relayOnline = false
+        cancelLANAttempt()
         if (isLocal) {
             local?.close(); local = null
             rejectPending("本机 Codex 已关闭")

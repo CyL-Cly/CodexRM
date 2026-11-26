@@ -74,7 +74,6 @@ import java.util.UUID
 import kotlin.concurrent.thread
 import kotlin.math.min
 
-private const val INITIAL_SYNC_LAN_COPY = "正在尝试局域网直连…"
 private const val PICK_COMPOSER_ATTACHMENT = 43
 private const val PICK_APPEARANCE_IMAGE = 48
 private const val CAPTURE_ATTACHMENT_PERMISSION = 46
@@ -228,9 +227,7 @@ internal class MainActivity : ComponentActivity() {
     private var online = false
     private var connectionState = ConnectionState.CONNECTING
     private var loaded = false
-    private var bootstrapInProgress = false
-    private val waitingForInitialSync get() = client?.waitingForInitialSync == true
-    private val bootstrapping get() = bootstrapInProgress || waitingForInitialSync
+    private var bootstrapping = false
     private var bootstrapError = ""
     private var approvalRecoveryMessage = ""
     private var loading = false
@@ -1251,17 +1248,7 @@ internal class MainActivity : ComponentActivity() {
                 // A fast restart can replace the peer without an intervening offline status.
                 if (online && (!wasOnline || (versionChanged && current.pendingAgentUpdateFrom.isNotBlank()))) {
                     conversationPrefs.edit().putLong("seen:${current.agentId}", System.currentTimeMillis()).apply()
-                    val connection = client
-                    if (!wasOnline && connection != null) {
-                        connection.awaitInitialSync {
-                            if (client === connection && device === current && mainVisible) bootstrap()
-                        }
-                        if (connection.waitingForInitialSync) {
-                            loaded = false
-                            bootstrapError = ""
-                            updateControls()
-                        }
-                    } else bootstrap()
+                    bootstrap()
                 } else updateControls()
             }
             override fun onRpcEvent(message: JSONObject) { if (device?.agentId == current.agentId) handleRpcEvent(message) }
@@ -1324,7 +1311,7 @@ internal class MainActivity : ComponentActivity() {
         devicesExpanded = false
         updateBackHandling()
         devices.forEach { it.online = false }
-        online = false; loaded = false; bootstrapInProgress = false; sending = false; loading = false
+        online = false; loaded = false; bootstrapping = false; sending = false; loading = false
         connectionState = ConnectionState.CONNECTING
         if (requests.isNotEmpty()) approvalRecoveryMessage = "连接中断，原审批仅作保留展示；重连并同步前不可操作。"
         responding.clear(); messageQueues.clear()
@@ -1336,7 +1323,7 @@ internal class MainActivity : ComponentActivity() {
     private fun bootstrap() {
         val current = device ?: return
         if (bootstrapping || !online) return
-        bootstrapInProgress = true
+        bootstrapping = true
         bootstrapError = ""
         val currentGeneration = ++generation
         loaded = false
@@ -1346,7 +1333,7 @@ internal class MainActivity : ComponentActivity() {
         rpc("codexrm/info") { result, error ->
             if (!active(currentGeneration)) return@rpc
             if (error != null || result == null) {
-                bootstrapInProgress = false
+                bootstrapping = false
                 bootstrapError = error?.message ?: "无法读取设备信息"
                 if (requests.isNotEmpty()) approvalRecoveryMessage = "审批尚未重新同步。请重试初始化，旧审批不会静默清除。"
                 renderApproval(); updateControls()
@@ -1377,7 +1364,6 @@ internal class MainActivity : ComponentActivity() {
     }
 
     private fun refreshAll() {
-        if (waitingForInitialSync) return
         loadConversationPins()
         if (!online) { toast("设备尚未连接"); return }
         if (!loaded) { bootstrap(); return }
@@ -1412,7 +1398,6 @@ internal class MainActivity : ComponentActivity() {
         reopenCurrent: Boolean = false,
         listVersion: Int = ++threadListVersion,
     ): Int {
-        if (waitingForInitialSync) return listVersion
         if (cursor == null) {
             threadListLoading = true
             threadListError = ""
@@ -1432,7 +1417,7 @@ internal class MainActivity : ComponentActivity() {
                 threadListError = "会话加载失败：${error?.message ?: "响应无效"}"
                 if (reopenCurrent) {
                     bootstrapListVersion = 0
-                    bootstrapInProgress = false
+                    bootstrapping = false
                     bootstrapError = "无法读取会话：${error?.message ?: "响应无效"}"
                 }
                 renderWorkspaces(); updateControls(); toast(threadListError); return@rpc
@@ -1455,7 +1440,7 @@ internal class MainActivity : ComponentActivity() {
                 threadListError = "会话列表未完整加载，请重试"
                 if (reopenCurrent) {
                     bootstrapListVersion = 0
-                    bootstrapInProgress = false
+                    bootstrapping = false
                     bootstrapError = threadListError
                 }
                 renderWorkspaces(); updateControls(); toast(threadListError)
@@ -1465,7 +1450,7 @@ internal class MainActivity : ComponentActivity() {
             threadListError = ""
             threadCursor = null
             threadListLoading = false; loaded = true
-            if (reopenCurrent) { bootstrapListVersion = 0; bootstrapInProgress = false; bootstrapError = "" }
+            if (reopenCurrent) { bootstrapListVersion = 0; bootstrapping = false; bootstrapError = "" }
             renderWorkspaces(); updateControls()
             bindNewSessionDraft()
             if (reopenCurrent) {
@@ -1759,7 +1744,7 @@ internal class MainActivity : ComponentActivity() {
         outboxOwnerAgentId = currentAgent()
         outbox = OutboxState(store.pendingSends(outboxOwnerAgentId)); activePendingSendId = ""
         persistOutbox()
-        bootstrapInProgress = false; bootstrapError = ""; approvalRecoveryMessage = ""
+        bootstrapping = false; bootstrapError = ""; approvalRecoveryMessage = ""
         running = false; readOnly = false; loading = false; historyCursor = null
         collapsedPaths = store.collapsed(currentAgent())
         rebindComposer(ComposerBinding(currentAgent(), "", ""))
@@ -2040,10 +2025,6 @@ internal class MainActivity : ComponentActivity() {
     private fun refreshSnapshot() {
         val detached = detachedThreads.isDetached(currentThreadId)
         if ((!readOnly && !detached) || snapshotRunning || !online || currentThreadId.isEmpty()) return
-        if (waitingForInitialSync) {
-            scheduleSnapshot()
-            return
-        }
         snapshotRunning = true
         val requestVersion = ++snapshotRequestVersion
         val id = currentThreadId; val currentGeneration = generation
@@ -4646,7 +4627,6 @@ internal class MainActivity : ComponentActivity() {
                 else { disconnect(); connect(); toast("正在重新连接设备") }
             }
             HomeAction.RETRY_SYNC -> {
-                if (waitingForInitialSync) return
                 if (online && !bootstrapping) bootstrap() else {
                     disconnect()
                     connect()
@@ -4665,11 +4645,11 @@ internal class MainActivity : ComponentActivity() {
         if (welcome.visibility != View.VISIBLE) return
         if (online && loaded) { welcome.visibility = View.INVISIBLE; return }
         val guidance = InteractionCopy.home(online, bootstrapping || online && !loaded, currentCwd)
-        welcomeDescription.text = if (waitingForInitialSync) INITIAL_SYNC_LAN_COPY else guidance.description
+        welcomeDescription.text = guidance.description
         welcomePrimary.visibility = if (guidance.connectionActions) View.VISIBLE else View.GONE
         welcomePrimary.text = guidance.primaryLabel
         welcomePrimary.setOnClickListener { performHomeAction(guidance.primaryAction) }
-        welcomeSecondary.visibility = if (guidance.connectionActions && !waitingForInitialSync) View.VISIBLE else View.GONE
+        welcomeSecondary.visibility = if (guidance.connectionActions) View.VISIBLE else View.GONE
         welcomeSecondary.text = guidance.secondaryLabel
         welcomeSecondary.setOnClickListener { performHomeAction(guidance.secondaryAction) }
     }
@@ -4805,12 +4785,7 @@ internal class MainActivity : ComponentActivity() {
             Ui.padChatCard(this)
             background = Ui.chatCardBackground(context, adapter.bubbleOpacity, error = bootstrapError.isNotEmpty())
         }
-        val message = when {
-            waitingForInitialSync -> INITIAL_SYNC_LAN_COPY
-            bootstrapping -> "正在同步设备信息与会话…"
-            else -> "设备初始化失败：$bootstrapError"
-        }
-        card.addView(Ui.text(this, message, 12f, if (bootstrapError.isEmpty()) Ui.MUTED else Ui.DANGER))
+        card.addView(Ui.text(this, if (bootstrapping) "正在同步设备信息与会话…" else "设备初始化失败：$bootstrapError", 12f, if (bootstrapError.isEmpty()) Ui.MUTED else Ui.DANGER))
         if (!bootstrapping && bootstrapError.isNotEmpty()) {
             card.addView(Ui.button(this, "重试初始化", primary = true) { bootstrap() }, matchWidth(top = 8))
         }

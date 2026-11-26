@@ -8,9 +8,10 @@ import java.util.concurrent.TimeUnit
 
 internal object InitialSyncCheck {
     fun run(test: Instrumentation, device: Device, expectLan: Boolean): String {
-        val done = CountDownLatch(1)
+        val done = CountDownLatch(2)
         lateinit var client: CodexClient
         var started = false
+        var startedAt = 0L
         var delay = 0L
         var status: DirectStatus? = null
         var threads: JSONObject? = null
@@ -21,23 +22,19 @@ internal object InitialSyncCheck {
                 override fun onState(state: ConnectionState, agent: JSONObject?) {
                     if (state != ConnectionState.ONLINE || started) return
                     started = true
-                    val onlineAt = SystemClock.elapsedRealtime()
-                    client.awaitInitialSync {
-                        delay = SystemClock.elapsedRealtime() - onlineAt
-                        status = client.directStatus
-                        client.request("codexrm/info", timeoutMs = 5_000) { result, error ->
-                            if (error != null || result?.optBoolean("mock") != true) {
-                                failure = error ?: IllegalStateException("Expected a mock Agent for startup QA")
-                                done.countDown()
-                            } else {
-                                threadStatus = client.directStatus
-                                client.request("thread/list", JSONObject().put("limit", 10), timeoutMs = 5_000) { list, problem ->
-                                    threads = list
-                                    failure = problem
-                                    done.countDown()
-                                }
-                            }
+                    delay = SystemClock.elapsedRealtime() - startedAt
+                    status = client.directStatus
+                    client.request("codexrm/info", timeoutMs = 5_000) { result, error ->
+                        if (error != null || result?.optBoolean("mock") != true) {
+                            failure = error ?: IllegalStateException("Expected a mock Agent for startup QA")
                         }
+                        done.countDown()
+                    }
+                    threadStatus = client.directStatus
+                    client.request("thread/list", JSONObject().put("limit", 10), timeoutMs = 5_000) { list, problem ->
+                        threads = list
+                        failure = failure ?: problem
+                        done.countDown()
                     }
                 }
                 override fun onRpcEvent(message: JSONObject) = Unit
@@ -45,6 +42,7 @@ internal object InitialSyncCheck {
                 override fun onAuthorizationExpired() = Unit
                 override fun onDirectFallback() = Unit
             })
+            startedAt = SystemClock.elapsedRealtime()
             client.start()
         }
         try {
@@ -54,10 +52,10 @@ internal object InitialSyncCheck {
             if (expectLan) {
                 check((status as? DirectStatus.Connected)?.lan == true) { "First RPC was not LAN direct: $status after ${delay}ms" }
             } else {
-                check(status !is DirectStatus.Connected && delay in 2_500L..3_500L) { "Expected bounded relay fallback: $status after ${delay}ms" }
+                check(status !is DirectStatus.Connected && delay < 1_500L) { "Expected immediate relay sync: $status after ${delay}ms" }
             }
             check(threadStatus == status) { "Transport changed before requesting the first conversation list: $threadStatus" }
-            return "First device info and conversation list: ${if (expectLan) "LAN direct" else "RM relay"}; sync started after ${delay}ms"
+            return "First device info and conversation list: ${if (expectLan) "LAN direct" else "RM relay"}; initial channel ready after ${delay}ms"
         } finally {
             test.runOnMainSync { client.stop() }
         }

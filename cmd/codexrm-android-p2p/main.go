@@ -12,17 +12,21 @@ import "C"
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/CyL-Cly/CodexRM-Server/p2p"
 	"github.com/CyL-Cly/CodexRM-Server/protocol"
+	"github.com/CyL-Cly/CodexRM-Server/securechannel"
 )
 
 type mobileSession struct {
@@ -149,6 +153,33 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 	case <-s.active:
 	}
 	cancel()
+	s.runLink(link)
+	if fb := link.Fallback(); fb.LastReason != "" {
+		failure = fb.LastReason
+		prepared.MarkRelay()
+		log.Printf("CodexRM P2P: fallback to RM relay reason=%s auto=%d manual=%d state=%s", fb.LastReason, fb.AutoRelaySwitches, fb.ManualRelaySwitches, prepared.State())
+	}
+}
+
+func (s *mobileSession) runIndependentLAN(local []p2p.Source, cached netip.Addr, client string, key securechannel.Key) {
+	defer s.cancel()
+	defer close(s.incoming)
+	attempt, cancel := context.WithTimeout(s.ctx, 1700*time.Millisecond)
+	link, err := p2p.DialLAN(attempt, local, cached, client, key)
+	cancel()
+	if err != nil {
+		return
+	}
+	defer link.Close()
+	s.link.Store(link)
+	host, _, _ := net.SplitHostPort(link.RemoteAddr().String())
+	frame, _ := json.Marshal(map[string]string{"type": "native_lan_active", "host": host, "network": link.Path().Network})
+	if s.emitBytes(s.ctx, frame) {
+		s.runLink(link)
+	}
+}
+
+func (s *mobileSession) runLink(link *p2p.Link) {
 	go link.WatchQuality(s.ctx)
 	go func() { <-s.ctx.Done(); link.Close() }()
 	go func() {
@@ -170,11 +201,6 @@ func (s *mobileSession) run(start protocol.P2PSignal, local []p2p.Source) {
 			continue
 		}
 		if err != nil || !s.emitBytes(s.ctx, b) {
-			if fb := link.Fallback(); fb.LastReason != "" {
-				failure = fb.LastReason
-				prepared.MarkRelay()
-				log.Printf("CodexRM P2P: fallback to RM relay reason=%s auto=%d manual=%d state=%s", fb.LastReason, fb.AutoRelaySwitches, fb.ManualRelaySwitches, prepared.State())
-			}
 			return
 		}
 	}
@@ -187,6 +213,9 @@ func CRMOpen(ptr unsafe.Pointer, n C.int) C.int64_t {
 	}
 	var start struct {
 		protocol.P2PSignal
+		ClientID      string   `json:"clientId"`
+		PairKey       string   `json:"pairKey"`
+		CachedHost    string   `json:"cachedHost"`
 		LocalPrefixes []string `json:"localPrefixes"`
 		LocalSources  []struct {
 			Network string `json:"network"`
@@ -194,7 +223,7 @@ func CRMOpen(ptr unsafe.Pointer, n C.int) C.int64_t {
 			LAN     bool   `json:"lan"`
 		} `json:"localSources"`
 	}
-	if json.Unmarshal(C.GoBytes(ptr, n), &start) != nil || start.Kind != protocol.P2PKindStart || start.Version != protocol.P2PVersion || len(start.LocalPrefixes) > protocol.P2PMaxCandidates || len(start.LocalSources) > 12 {
+	if json.Unmarshal(C.GoBytes(ptr, n), &start) != nil || (start.Kind != protocol.P2PKindStart && start.Kind != "local_lan") || start.Version != protocol.P2PVersion || len(start.LocalPrefixes) > protocol.P2PMaxCandidates || len(start.LocalSources) > 12 {
 		return 0
 	}
 	var local []p2p.Source
@@ -219,6 +248,16 @@ func CRMOpen(ptr unsafe.Pointer, n C.int) C.int64_t {
 			return nil
 		}})
 	}
+	var key securechannel.Key
+	var cached netip.Addr
+	if start.Kind == "local_lan" {
+		decoded, err := base64.StdEncoding.DecodeString(start.PairKey)
+		if err != nil || len(decoded) != len(key) || !securechannel.ValidClient(start.ClientID) || len(local) == 0 {
+			return 0
+		}
+		copy(key[:], decoded)
+		cached, _ = netip.ParseAddr(start.CachedHost)
+	}
 	registry.Lock()
 	defer registry.Unlock()
 	// Keep one additional connection for sharing to a non-selected desktop.
@@ -229,7 +268,11 @@ func CRMOpen(ptr unsafe.Pointer, n C.int) C.int64_t {
 	s := &mobileSession{ctx: ctx, cancel: cancel, id: start.ID, offer: make(chan protocol.P2PSignal, 1), ready: make(chan struct{}, 1), active: make(chan struct{}, 1), out: make(chan []byte, 8), incoming: make(chan []byte, 2)}
 	registry.next++
 	registry.m[registry.next] = s
-	go s.run(start.P2PSignal, local)
+	if start.Kind == "local_lan" {
+		go s.runIndependentLAN(local, cached, start.ClientID, key)
+	} else {
+		go s.run(start.P2PSignal, local)
+	}
 	return registry.next
 }
 
