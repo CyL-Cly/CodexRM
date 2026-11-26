@@ -487,8 +487,9 @@ internal class SettingsPage(
         val draft = modelDraft?.takeIf { it.providerId == id }?.apply { replaceModels(models) }
             ?: ProviderModelDraft(id, models).also { modelDraft = it }
         val status = Ui.text(activity, if (draft.hasChanges) "有未保存改动，返回时自动保存" else "暂无未保存改动", 13f, Ui.MUTED)
-        page(Page.PROVIDER, provider.string("name"), canSlide = { !savingModels && !draft.hasChanges }) {
-            saveModelsAndReturn(provider, draft, status)
+        var deleting = false
+        page(Page.PROVIDER, provider.string("name"), canSlide = { !savingModels && !deleting && !draft.hasChanges }) {
+            if (!deleting) saveModelsAndReturn(provider, draft, status)
         }
         if (id.isNotEmpty()) button("编辑供应商配置") { if (!savingModels) loadEditor(id) }
         provider.string("warning").takeIf(String::isNotEmpty)?.let(::note)
@@ -532,10 +533,45 @@ internal class SettingsPage(
             }
         }
         button("刷新模型列表") { if (!savingModels) loadCatalog(id) }
+        if (id.isNotEmpty()) button("删除供应商") {
+            if (!savingModels && !deleting) {
+                confirmProviderDeletion(provider, draft) {
+                    val version = pageVersion
+                    deleting = true
+                    status.text = "正在删除供应商…"
+                    setEnabledRecursively(content, false)
+                    request("delete", JSONObject().put("id", id), false) { result, error ->
+                        deleting = false
+                        val deleted = error == null && result?.optBoolean("deleted") == true
+                        if (deleted) catalogChanged()
+                        if (!dialog.isShowing || version != pageVersion) return@request
+                        if (deleted) {
+                            catalogs = catalogs.filterNot { it.string("id") == id }
+                            modelDraft = null
+                            android.widget.Toast.makeText(activity, "供应商已删除", android.widget.Toast.LENGTH_SHORT).show()
+                            loadCatalog()
+                        } else {
+                            setEnabledRecursively(content, true)
+                            updateStatus()
+                            showError(error)
+                        }
+                    }
+                }
+            }
+        }
         content.addView(status, match(8))
         content.addView(empty, match(8))
         content.addView(rows, match())
         preview.forEachIndexed { index, model -> updateRow(model, index, ::toggle) }
+    }
+
+    private fun confirmProviderDeletion(provider: JSONObject, draft: ProviderModelDraft, delete: () -> Unit) {
+        val unsaved = if (draft.hasChanges) "\n此供应商未保存的模型改动将被丢弃。" else ""
+        MiuixDialog.Builder(activity).setTitle("删除「${provider.string("name")}」？")
+            .setMessage("仅从此 Agent 删除，不影响 CC Switch、Codex 登录或聊天记录。使用此供应商的会话可能需要重新选择供应商。$unsaved")
+            .setPositiveButton("删除") { _, _ -> delete() }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun modelRow(model: JSONObject, modelId: String, onChange: (String, Boolean) -> Unit): View {

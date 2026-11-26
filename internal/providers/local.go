@@ -17,14 +17,16 @@ type LocalStore struct {
 }
 
 var localProvidersMu sync.Mutex
+var errProviderNotFound = errors.New("找不到该模型供应商")
 
 const localProvidersFile = "model-providers.json"
 
 type localProvider struct {
 	ID       string `json:"id"`
-	Name     string `json:"name"`
+	Name     string `json:"name,omitempty"`
 	Notes    string `json:"notes,omitempty"`
-	Settings string `json:"settings"`
+	Settings string `json:"settings,omitempty"`
+	Deleted  bool   `json:"deleted,omitempty"`
 }
 
 func (s LocalStore) read() ([]localProvider, error) {
@@ -61,15 +63,21 @@ func (s LocalStore) write(records []localProvider) error {
 	return nil
 }
 
-func (s LocalStore) Load() ([]Provider, error) {
+// Load returns the visible local providers and the IDs suppressed from CC Switch.
+func (s LocalStore) Load() ([]Provider, map[string]bool, error) {
 	localProvidersMu.Lock()
 	defer localProvidersMu.Unlock()
 	records, err := s.read()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	items := make([]Provider, 0, len(records))
+	deleted := make(map[string]bool)
 	for _, record := range records {
+		if record.Deleted {
+			deleted[providerID(record.ID)] = true
+			continue
+		}
 		p, err := parse(record.ID, record.Name, record.Settings)
 		if err != nil {
 			p = Provider{ID: providerID(record.ID), Name: record.Name, Warning: "Agent 供应商配置无法读取"}
@@ -77,7 +85,7 @@ func (s LocalStore) Load() ([]Provider, error) {
 		p.Source, p.Notes = "Agent", strings.TrimSpace(record.Notes)
 		items = append(items, p)
 	}
-	return items, nil
+	return items, deleted, nil
 }
 
 // Details returns only editable public fields and a flag indicating where the
@@ -91,6 +99,9 @@ func (s LocalStore) Details(id string) (ProviderDetails, bool, error) {
 	}
 	for _, record := range records {
 		if providerID(record.ID) == id {
+			if record.Deleted {
+				return ProviderDetails{}, true, errProviderNotFound
+			}
 			details, err := detailsForRow(providerRow{id: record.ID, name: record.Name, notes: record.Notes, settings: record.Settings}, true)
 			return details, true, err
 		}
@@ -127,12 +138,51 @@ func (s LocalStore) Save(patch ProviderPatch) (id string, found bool, err error)
 		if providerID(records[index].ID) != patch.ID {
 			continue
 		}
+		if records[index].Deleted {
+			return "", true, errProviderNotFound
+		}
 		if err := records[index].apply(patch); err != nil {
 			return "", true, err
 		}
 		return patch.ID, true, s.write(records)
 	}
 	return "", false, nil
+}
+
+// Delete removes local connection settings and records the ID so a legacy
+// CC Switch entry cannot reappear on refresh or during a later bulk import.
+// It never writes to the CC Switch database.
+func (s LocalStore) Delete(ctx context.Context, dbPath, id string) error {
+	if id == "" {
+		return errProviderNotFound
+	}
+	localProvidersMu.Lock()
+	defer localProvidersMu.Unlock()
+	records, err := s.read()
+	if err != nil {
+		return err
+	}
+	for index, record := range records {
+		if providerID(record.ID) != id {
+			continue
+		}
+		if record.Deleted {
+			return nil
+		}
+		records[index] = localProvider{ID: record.ID, Deleted: true}
+		return s.write(records)
+	}
+	// Legacy entries are still listed even if they have never been imported.
+	db, err := openEditor(dbPath, false)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	row, err := findProviderRow(ctx, db, id)
+	if err != nil {
+		return err
+	}
+	return s.write(append(records, localProvider{ID: row.id, Deleted: true}))
 }
 
 func (p *localProvider) apply(patch ProviderPatch) error {
@@ -185,6 +235,7 @@ func (s LocalStore) ImportCCSwitch(ctx context.Context, dbPath string) (int, err
 	if err != nil {
 		return 0, err
 	}
+	// Deleted records also count as seen: bulk import must not undo deletion.
 	seen := make(map[string]bool, len(records))
 	for _, record := range records {
 		seen[record.ID] = true

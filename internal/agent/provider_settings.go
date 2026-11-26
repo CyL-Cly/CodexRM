@@ -222,7 +222,7 @@ func (a *Agent) providerStore() providers.LocalStore {
 }
 
 func (a *Agent) loadProviders(ctx context.Context) ([]providers.Provider, error) {
-	items, err := a.providerStore().Load()
+	items, deleted, err := a.providerStore().Load()
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +238,7 @@ func (a *Agent) loadProviders(ctx context.Context) ([]providers.Provider, error)
 		ids[item.ID] = true
 	}
 	for _, item := range legacy {
-		if !ids[item.ID] {
+		if !ids[item.ID] && !deleted[item.ID] {
 			items = append(items, item)
 		}
 	}
@@ -298,6 +298,17 @@ func (a *Agent) providerSettingsRPC(ctx context.Context, app *appserver.Client, 
 			id, err = providers.SaveProvider(ctx, a.cfg.CCSwitchDB, patch)
 		}
 		return map[string]string{"id": id}, err
+	case "codexrm/provider/delete":
+		var params struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(raw, &params) != nil || params.ID == "" {
+			return nil, errors.New("请选择要删除的供应商；当前 Codex 配置不能删除")
+		}
+		if err := a.providerStore().Delete(ctx, a.cfg.CCSwitchDB, params.ID); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"deleted": true}, nil
 	case "codexrm/provider/models":
 		var params modelChangesRequest
 		if json.Unmarshal(raw, &params) != nil || params.ID == nil {

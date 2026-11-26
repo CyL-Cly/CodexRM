@@ -1,8 +1,10 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -253,5 +255,98 @@ func TestGPTProviderSettingsPersistAndReachRuntimeOverrides(t *testing.T) {
 				t.Fatal("capabilities edit changed existing provider credentials")
 			}
 		}
+	}
+}
+
+func TestDeleteProviderPersistsWithoutChangingCCSwitch(t *testing.T) {
+	for _, source := range []string{"Agent", "CC Switch", "imported CC Switch"} {
+		t.Run(source, func(t *testing.T) {
+			ctx := context.Background()
+			cfg := Config{ProviderDir: t.TempDir(), DataDir: t.TempDir(), CCSwitchDB: providerFixture(t)}
+			a := &Agent{cfg: cfg}
+			legacy, err := providers.Load(ctx, cfg.CCSwitchDB)
+			if err != nil || len(legacy) != 2 {
+				t.Fatalf("CC Switch fixture: %v, %v", legacy, err)
+			}
+			id := legacy[0].ID
+			switch source {
+			case "Agent":
+				result, err := a.LocalProviderSettings(ctx, "save", mustJSON(map[string]string{
+					"name": "Local provider", "baseUrl": "https://local.example.test/v1", "apiKey": "local-delete-test-key",
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				id = result.(map[string]string)["id"]
+			case "imported CC Switch":
+				if count, err := a.providerStore().ImportCCSwitch(ctx, cfg.CCSwitchDB); err != nil || count != len(legacy) {
+					t.Fatalf("initial import: %d, %v", count, err)
+				}
+			}
+			beforeDB, err := os.ReadFile(cfg.CCSwitchDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			params := mustJSON(map[string]string{"id": id})
+			if _, err := a.providerSettingsRPC(ctx, nil, "codexrm/provider/details", params, false); err != nil {
+				t.Fatalf("target missing before deletion: %v", err)
+			}
+			result, err := a.providerSettingsRPC(ctx, nil, "codexrm/provider/delete", params, false)
+			if err != nil || !result.(map[string]bool)["deleted"] {
+				t.Fatalf("delete: %v, %v", result, err)
+			}
+			// A different Agent instance (or offline settings) reads the same machine-wide state.
+			restarted := &Agent{cfg: cfg}
+			if _, err := OfflineProviderSettings(ctx, Config{ProviderDir: cfg.ProviderDir, CCSwitchDB: cfg.CCSwitchDB}, "delete", params); err != nil {
+				t.Fatalf("retrying deletion offline: %v", err)
+			}
+			if _, err := restarted.providerStore().ImportCCSwitch(ctx, cfg.CCSwitchDB); err != nil {
+				t.Fatalf("re-import: %v", err)
+			}
+			items, err := restarted.loadProviders(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unrelated := false
+			for _, item := range items {
+				if item.ID == id {
+					t.Fatal("deleted provider reappeared after restart or import")
+				}
+				unrelated = unrelated || item.ID == legacy[1].ID
+			}
+			if !unrelated {
+				t.Fatal("deletion removed a different provider with the same name")
+			}
+			if _, err := restarted.LocalProviderSettings(ctx, "details", params); err == nil {
+				t.Fatal("deleted provider is still readable via details")
+			}
+			if _, err := restarted.LocalProviderSettings(ctx, "save", mustJSON(map[string]string{"id": id, "name": "Stale edit"})); err == nil {
+				t.Fatal("stale editor succeeded after deletion")
+			}
+			if err := restarted.prepareProvider(ctx, nil, "thread/start", map[string]any{"codexrmProvider": id}); !errors.Is(err, errProviderUnavailable) {
+				t.Fatalf("deleted provider can still be used: %v", err)
+			}
+			localConfig, err := os.ReadFile(filepath.Join(cfg.ProviderDir, "model-providers.json"))
+			if err != nil || bytes.Contains(localConfig, []byte("local-delete-test-key")) || bytes.Contains(localConfig, []byte("secret-1")) && source != "Agent" {
+				t.Fatalf("deleted credentials were not removed from the local store: %v", err)
+			}
+			afterDB, err := os.ReadFile(cfg.CCSwitchDB)
+			if err != nil || !bytes.Equal(beforeDB, afterDB) {
+				t.Fatalf("CC Switch database changed: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeleteProviderRejectsNativeAndUnknownIDs(t *testing.T) {
+	ctx := context.Background()
+	a := &Agent{cfg: Config{DataDir: t.TempDir(), CCSwitchDB: providerFixture(t)}}
+	for _, raw := range []string{`{}`, `{"id":""}`, `{"id":"ccswitch_unknown"}`, `{"id":123}`, `null`} {
+		if _, err := a.LocalProviderSettings(ctx, "delete", json.RawMessage(raw)); err == nil {
+			t.Fatalf("invalid delete succeeded: %s", raw)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(a.cfg.DataDir, "model-providers.json")); !os.IsNotExist(err) {
+		t.Fatalf("invalid deletion wrote local settings: %v", err)
 	}
 }

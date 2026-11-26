@@ -95,6 +95,7 @@
       await saveModels();
       editor(selected.id, await call("details", { id: selected.id }));
     })));
+    if (selected.id) actions.append(button("删除供应商", deleteProvider));
     content.append(actions);
     if (selected.defaultModel) content.append(element("p", `默认模型：${selected.defaultModel}`, "hint"));
     if (selected.warning) content.append(element("p", selected.warning, "hint"));
@@ -134,6 +135,27 @@
       }, "text-button"));
       content.append(row);
     }
+  }
+  function deleteProvider() {
+    if (loading || !selected?.id) return;
+    const { id, name } = selected;
+    const unsaved = changes.size ? "\n此供应商未保存的模型改动将被丢弃。" : "";
+    if (!confirm(`删除「${name}」？\n仅从此 Agent 删除，不影响 CC Switch、Codex 登录或聊天记录。使用此供应商的会话可能需要重新选择供应商。${unsaved}`)) return;
+    void task(async () => {
+      const result = await call("delete", { id });
+      if (result?.deleted !== true) throw new Error("删除未完成，请检查 Agent 版本或重试");
+      groups = groups.filter(provider => provider.id !== id);
+      selected = null;
+      changes.clear();
+      list();
+      try {
+        await catalog();
+        list();
+      } catch (error) {
+        return `供应商已删除，但刷新列表失败：${error.message}`;
+      }
+      return "供应商已删除";
+    });
   }
   async function saveModels() {
     if (!changes.size) return;
