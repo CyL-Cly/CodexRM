@@ -1031,8 +1031,9 @@ test("Android download is available without pairing and opens the Releases guide
   assert.doesNotMatch(button, /\s(?:disabled|hidden)\b/);
   const guide = html.match(/<dialog id="android-download-dialog"[^>]*>[\s\S]*?<\/dialog>/)?.[0];
   assert.ok(guide);
-  assert.match(guide, /href="https:\/\/github\.com\/CyL-Cly\/CodexRM\/releases"/);
-  assert.match(guide, /android-arm64-v8a-release\.apk/);
+  assert.match(guide, /向部署方获取已签名的 Android ARM64 APK/);
+  assert.match(guide, /检查更新/);
+  assert.doesNotMatch(guide, /github\.com.*\/releases/);
 });
 
 test("connection button opens device selection instead of the pairing dialog", () => {

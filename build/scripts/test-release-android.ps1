@@ -30,7 +30,7 @@ function Assert-AndroidRelease([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 function Reset-Fixture {
-    $env:CODEXRM_RELEASE_UPDATE_BASE = ''
+    $env:CODEXRM_RELEASE_UPDATE_BASE = 'https://rm.example'
     $env:CODEXRM_ANDROID_TEST_MODE = ''
     $env:CODEXRM_ANDROID_TEST_PACKAGE = ''
     $env:CODEXRM_ANDROID_TEST_CODE = ''
@@ -196,20 +196,28 @@ if (-not $ValidateOnly -and $env:CODEXRM_ANDROID_TEST_MODE -eq 'manifest failure
 
     Reset-Fixture
     $original = [IO.File]::ReadAllBytes($versionPath)
-    & $releaseScript -BuildOnly -KeepVersion -Config (Join-Path $testRoot 'missing-config.json') -BuildProxy '127.0.0.1:8848'
+    $missingConfig = Join-Path $testRoot 'missing-config.json'
+    $env:CODEXRM_RELEASE_UPDATE_BASE = ''
+    Expect-Failure { & $releaseScript -BuildOnly -Config $missingConfig }
+    Assert-OriginalVersion $original
+    Assert-AndroidRelease ((Get-Events).Count -eq 0) 'An APK build was started without an update origin.'
+    Write-Host 'PASS: Build-only refuses a missing update origin before running Gradle or editing the version.'
+
+    $env:CODEXRM_RELEASE_UPDATE_BASE = 'https://other.example'
+    & $releaseScript -BuildOnly -KeepVersion -Config $missingConfig -BuildProxy '127.0.0.1:8848'
     Assert-OriginalVersion $original
     $events = @(Get-Events)
     Assert-AndroidRelease ($events.Count -eq 1 -and $events[0].Contains('-Dhttp.proxyHost=127.0.0.1') -and $events[0].Contains('-Dhttps.proxyPort=8848')) 'Build-only mode performed publication or lost proxy settings.'
     Assert-AndroidRelease (-not $env:BUILD_PROXY) 'Build proxy settings leaked into the caller environment.'
-    Write-Host 'PASS: Local builds retain the requested version, accept proxy settings, and require no publication configuration.'
+    Write-Host 'PASS: Local builds accept a configured origin and proxy without publication credentials.'
 
     [IO.File]::WriteAllText($logPath, '')
     Expect-Failure { & $releaseScript -Config $config -PublishOnly }
-    Assert-AndroidRelease (@(Get-Events | Where-Object { $_ -eq 'publisher' }).Count -eq 0) 'Publish-only uploaded an APK without the configured update origin.'
+    Assert-AndroidRelease (@(Get-Events | Where-Object { $_ -eq 'publisher' }).Count -eq 0) 'Publish-only uploaded an APK with a different update origin.'
     $env:CODEXRM_RELEASE_UPDATE_BASE = 'https://rm.example/'
     & $releaseScript -BuildOnly -KeepVersion -Config (Join-Path $testRoot 'missing-config.json')
     & $releaseScript -Config $config -PublishOnly
-    Write-Host 'PASS: Publish-only rejects a defaultless APK and accepts a build injected via the environment.'
+    Write-Host 'PASS: Publish-only checks the APK for the exact configured origin.'
 
     foreach ($mode in @('missing origin', 'partial origin')) {
         Reset-Fixture

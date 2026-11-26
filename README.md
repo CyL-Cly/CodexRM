@@ -2,7 +2,7 @@
 
 **用 Android 手机远程操作电脑上的 Codex。** 扫码配对后，可以在手机上切换工作区、继续已有会话、发起任务、查看进度和处理审批。远程模式下，代码、命令和 Codex 都在 Windows 或 Linux 电脑上运行；手机不需要安装 Codex，也不是在远程操控整个桌面。安卓也可选用[本机 Codex](#安卓本机-codex)。Web 是免安装的备用入口。远程使用需要 CodexRM 中继，但可以用默认公共中继，不必自己部署。
 
-**[下载 Android 客户端](https://github.com/CyL-Cly/CodexRM/releases)** · [下载 Windows / Linux Agent 与 Server](#选择下载包) · [中继与网络要求](#中继与网络要求) · [配对指南](#首次配对和发起任务) · [Linux Agent 专有功能](#linux-agent-专有功能)
+**[获取 Android 客户端](#android-客户端)** · [下载 Windows / Linux Agent 与 Server](#选择下载包) · [中继与网络要求](#中继与网络要求) · [配对指南](#首次配对和发起任务) · [Linux Agent 专有功能](#linux-agent-专有功能)
 
 > CodexRM 是独立的社区项目，不是 OpenAI 官方产品。电脑端可安装并登录 Codex 桌面版，或安装并配置 Codex CLI；安卓本机模式请按下文安装独立扩展。
 
@@ -24,6 +24,8 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 - 这个开关不改变聊天、普通聊天附件或 Codex 自身的工具审批和沙箱设置。不要将它用作 Codex 工作区的隔离机制。
 
 ### Android 客户端
+
+Android APK 不在 GitHub Releases 或 Nightly 发布。首次安装请向部署方获取已签名的 APK；已安装的用户可在 CodexRM「设置 → 检查更新」内更新。
 
 - 扫描 Agent 的配对二维码，或输入一次性配对码；可在多台已配对电脑之间切换。
 - 支持后台任务通知、深色模式、自定义聊天背景和系统分享。下载位置可在设置中调整。
@@ -81,9 +83,8 @@ Android 和网页端可通过 RM 中继发送和查看对话中上传的 PNG、J
 | Linux x86-64 被控电脑 | `linux-amd64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux ARM64 被控电脑 | `linux-arm64-agent.tar.gz` | 解压后启动 `codexrm-agent` |
 | Linux x86-64 中继主机（仅自部署时下载） | `linux-amd64-server.tar.gz` | 内含 Server、`web/` 和安装脚本，见[自行部署](#自行部署) |
-| Android ARM64 手机 | `android-arm64-v8a-release.apk` | 下载已签名的 APK，安装后扫描 Agent 的配对二维码 |
 
-Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。Android 请选择包含已签名 APK 的预发布；文件名带 `unsigned` 的安装包无法直接安装。暂时没有签名 APK 时，也可以直接用手机浏览器连接。
+Linux 主机运行 `uname -m`，`x86_64` 对应 `amd64`，`aarch64` 对应 `arm64`。下载后可对照同一预发布中的 `SHA256SUMS.txt` 校验文件。没有 Android 安装包时，可以直接用手机浏览器连接。
 
 ### 首次配对和发起任务
 
@@ -161,7 +162,7 @@ Linux Agent 设置页的「QQ 机器人 → OneBot 11」可直接连接 NapCat�
 
 Windows EXE 与 Linux amd64 Agent 不内置更新服务器。若要启用检查更新，在 Agent 进程环境中设置 `CODEXRM_AGENT_UPDATE_SERVER` 为可信的 HTTPS 更新站点（如 `https://updates.example.com/`），然后重启 Agent。配置后，Agent 启动时及每隔 20 小时检查清单，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。未配置更新源可从 GitHub Releases 手动更新。Windows 离线安装包无需更新源；联网安装器通过 `--manifest` 或 `CODEXRM_UPDATE_MANIFEST` 指定清单。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。
 
-正式 Android APK 由发布脚本读取本地 `build/publish.config.json` 的 `rm.server`，在构建时注入更新源；配置文件和实际地址不提交到仓库。应用内不能查看或编辑更新地址，更新源与中继配对地址分开。未注入更新源的源码构建和公开 Nightly 不提供应用内更新检查。
+正式 Android APK 由发布脚本读取本地 `build/publish.config.json` 的 `rm.server`，在构建时注入更新源；配置文件和实际地址不提交到仓库。应用内不能查看或编辑更新地址，更新源与中继配对地址分开。未配置有效 HTTPS 更新源时不会构建 APK。
 
 ## PWA 与加载缓存
 

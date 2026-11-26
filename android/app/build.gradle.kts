@@ -53,6 +53,21 @@ require(releaseUpdateBase.isEmpty() || (Regex("https://[A-Za-z0-9][A-Za-z0-9.-]*
     "CODEXRM_RELEASE_UPDATE_BASE must be an HTTPS origin without credentials or a path"
 }
 
+abstract class VerifyApkUpdateOrigin : DefaultTask() {
+    @get:Input abstract val updateOriginConfigured: Property<Boolean>
+
+    @TaskAction fun verify() {
+        check(updateOriginConfigured.get()) {
+            "Set CODEXRM_RELEASE_UPDATE_BASE to the HTTPS update origin before building a CodexRM APK."
+        }
+    }
+}
+
+// Unit tests can run from an unconfigured checkout; every installable app APK must carry a valid origin.
+val verifyApkUpdateOrigin = tasks.register<VerifyApkUpdateOrigin>("verifyApkUpdateOrigin") {
+    updateOriginConfigured.set(releaseUpdateBase.isNotEmpty())
+}
+
 android {
     namespace = "com.codexrm.mobile"
     compileSdk = 37
@@ -66,7 +81,7 @@ android {
 
     defaultConfig {
         applicationId = "com.codexrm.mobile"
-        buildConfigField("String", "DEFAULT_UPDATE_SERVER", "\"\"")
+        buildConfigField("String", "DEFAULT_UPDATE_SERVER", "\"$releaseUpdateBase\"")
         buildConfigField("String", "LOCAL_RUNTIME_RELEASE", "\"\"")
         minSdk = 28
         targetSdk = 35
@@ -88,7 +103,6 @@ android {
 
     buildTypes {
         release {
-            buildConfigField("String", "DEFAULT_UPDATE_SERVER", "\"$releaseUpdateBase\"")
             buildConfigField("String", "LOCAL_RUNTIME_RELEASE", "\"$localRuntimeRelease\"")
             isMinifyEnabled = true
             isShrinkResources = true
@@ -182,4 +196,10 @@ dependencies {
     implementation("io.noties.markwon:ext-tasklist:$markwonVersion")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+}
+
+androidComponents.onVariants { variant ->
+    val taskSuffix = variant.name.replaceFirstChar { it.uppercaseChar() }
+    // AGP packages installable APKs through package<Variant>, even when invoked without assemble.
+    tasks.matching { it.name == "package$taskSuffix" }.configureEach { dependsOn(verifyApkUpdateOrigin) }
 }

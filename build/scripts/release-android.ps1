@@ -20,7 +20,7 @@ CodexRM Android one-click release
 Default: bump Android version, run tests, build a signed Release APK,
          upload to Cloudreve, then publish RM android-update.json.
   nopause             Skip the final pause (must be the first argument).
-  -BuildOnly          Build/package locally without uploading.
+  -BuildOnly          Build/package locally without uploading (requires an update origin).
   -KeepVersion        Build the current version without incrementing it.
   -PublishOnly        Retry publication of the current package, without rebuilding.
   -ReleaseNotes TEXT  Update notes stored in android-update.json.
@@ -89,13 +89,14 @@ try {
     if (Test-Path -LiteralPath $Config -PathType Leaf) {
         $publishConfig = Get-Content -LiteralPath $Config -Raw -Encoding UTF8 | ConvertFrom-Json
     }
-    $updateOrigin = ''
-    if (-not $BuildOnly -or ($publishConfig -and $publishConfig.rm.server)) {
-        if (-not $publishConfig) { throw 'Configure build/publish.config.json first, or use -BuildOnly.' }
-        $updateOrigin = Resolve-AndroidUpdateOrigin ([string]$publishConfig.rm.server)
-    } elseif (-not [string]::IsNullOrWhiteSpace($env:CODEXRM_RELEASE_UPDATE_BASE)) {
-        $updateOrigin = Resolve-AndroidUpdateOrigin $env:CODEXRM_RELEASE_UPDATE_BASE
+    $rawUpdateOrigin = [string]$publishConfig.rm.server
+    if ($BuildOnly -and [string]::IsNullOrWhiteSpace($rawUpdateOrigin)) {
+        $rawUpdateOrigin = $env:CODEXRM_RELEASE_UPDATE_BASE
     }
+    if ([string]::IsNullOrWhiteSpace($rawUpdateOrigin)) {
+        throw 'No Android update origin configured. Set rm.server in the local publish config (or CODEXRM_RELEASE_UPDATE_BASE for BuildOnly). No APK was built or uploaded.'
+    }
+    $updateOrigin = Resolve-AndroidUpdateOrigin $rawUpdateOrigin
     if (-not $BuildOnly) {
         if (-not $publishConfig.cloudreve.base -or -not $publishConfig.cloudreve.email -or
             (-not $publishConfig.cloudreve.password -and -not $env:CLOUDREVE_PASSWORD)) {
