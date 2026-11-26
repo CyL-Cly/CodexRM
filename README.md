@@ -161,7 +161,7 @@ Linux Agent 设置页的「QQ 机器人 → OneBot 11」可直接连接 NapCat�
 
 Windows EXE 与 Linux amd64 Agent 不内置更新服务器。若要启用检查更新，在 Agent 进程环境中设置 `CODEXRM_AGENT_UPDATE_SERVER` 为可信的 HTTPS 更新站点（如 `https://updates.example.com/`），然后重启 Agent。配置后，Agent 启动时及每隔 20 小时检查清单，也可在 Agent 设置页手动检查。发现新版本后自动下载；有进行中的对话或排队消息时挂起安装，全部结束后自动替换并重启。失败自动回滚，保留本机配置和配对信息。更新源与远程连接服务器独立。未配置更新源可从 GitHub Releases 手动更新。Windows 离线安装包无需更新源；联网安装器通过 `--manifest` 或 `CODEXRM_UPDATE_MANIFEST` 指定清单。MSIX 版由 Windows 管理更新。开发者可运行 `build\release.cmd` 构建并发布。
 
-正式 Android APK 由发布脚本读取本地 `build/publish.config.json` 的 `rm.server`，在构建时注入默认更新源；配置文件和实际地址不提交到仓库。直接从源码构建或使用公开 Nightly 时不预设地址。可在「设置 → 应用 → 更新源」覆盖默认值，或保存空值关闭应用内更新检查。更新源与中继配对地址分开。
+正式 Android APK 由发布脚本读取本地 `build/publish.config.json` 的 `rm.server`，在构建时注入更新源；配置文件和实际地址不提交到仓库。应用内不能查看或编辑更新地址，更新源与中继配对地址分开。未注入更新源的源码构建和公开 Nightly 不提供应用内更新检查。
 
 ## PWA 与加载缓存
 

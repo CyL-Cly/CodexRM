@@ -20,6 +20,13 @@ class UpdateCheckerTest {
 
     private val manifestUrl = "https://updates.example/base/android-update.json"
 
+    @Test fun updateAvailabilityFollowsTheBuildConfiguration() {
+        assertEquals(
+            UpdateChecker.updateEndpoint(BuildConfig.DEFAULT_UPDATE_SERVER, "android-update.json") != null,
+            UpdateChecker.isAvailable,
+        )
+    }
+
     @Test fun acceptsOnlyAnExplicitHttpsUpdateServer() {
         assertEquals("", UpdateChecker.normalizeUpdateServer("  "))
         assertEquals(null, UpdateChecker.updateEndpoint("", "android-update.json"))

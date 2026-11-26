@@ -34,6 +34,9 @@ internal object UpdateChecker {
     internal const val SILENT_INSTALL_FALLBACK_MS = 20_000L
     private const val MAX_MANIFEST_SIZE = 1024 * 1024
     private val main by lazy { Handler(Looper.getMainLooper()) }
+    private val manifestUrl = updateEndpoint(BuildConfig.DEFAULT_UPDATE_SERVER, "android-update.json")
+    private val historyUrl = updateEndpoint(BuildConfig.DEFAULT_UPDATE_SERVER, "release-history.json")
+    val isAvailable: Boolean get() = manifestUrl != null
 
     data class VersionInfo(
         val versionCode: Long,
@@ -106,13 +109,13 @@ internal object UpdateChecker {
     internal fun updateEndpoint(server: String, file: String): String? =
         normalizeUpdateServer(server)?.takeIf(String::isNotEmpty)?.let { "$it/$file" }
 
-    fun fetchLatest(server: String, callback: (VersionInfo?, ApiException?) -> Unit): Call {
-        val manifestUrl = requireNotNull(updateEndpoint(server, "android-update.json"))
-        return fetchJson(manifestUrl, { parseManifest(it, manifestUrl) }, callback)
+    fun fetchLatest(callback: (VersionInfo?, ApiException?) -> Unit): Call {
+        val url = checkNotNull(manifestUrl)
+        return fetchJson(url, { parseManifest(it, url) }, callback)
     }
 
-    fun fetchHistory(server: String, callback: (List<ReleaseNote>?, ApiException?) -> Unit): Call =
-        fetchJson(requireNotNull(updateEndpoint(server, "release-history.json")), ::parseHistory, callback)
+    fun fetchHistory(callback: (List<ReleaseNote>?, ApiException?) -> Unit): Call =
+        fetchJson(checkNotNull(historyUrl), ::parseHistory, callback)
 
     internal fun parseHistory(text: String): List<ReleaseNote> {
         val history = JSONObject(text)
