@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "output": ".work/promo-video/out/codexrm-promo.mp4",
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "crf": 18,
+  "finalCrf": 20,
+  "voice": {
+    "model": "s2.1-pro-free",
+    "format": "mp3",
+    "mp3_bitrate": 128,
+    "speed": 1.0,
+    "language": "zh-CN"
+  },
+  "style": {
+    "font": "Microsoft YaHei",
+    "accent": "&H003DA3E8&",
+    "muted": "&H00B8B8B8&",
+    "narrationSize": 60,
+    "titleSize": 104,
+    "subtitleSize": 44,
+    "marginV": 88,
+    "solidColor": "0x101418",
+    "phoneHeight": 920,
+    "phoneRightMargin": 150,
+    "phoneTextX": 110,
+    "phoneTextYRatio": 0.46,
+    "phoneHeadingSize": 92,
+    "desktopHeight": 800,
+    "desktopTextX": 110,
+    "desktopTextY": 96,
+    "desktopHeadingSize": 84
+  },
+  "scenes": [
+    {
+      "id": "intro",
+      "kind": "solid",
+      "tts_text": "Codex R M，用手机远程操作电脑上的 Codex。",
+      "narration": "CodexRM，用手机远程操作电脑上的 Codex。",
+      "heading": "CodexRM",
+      "caption": "手机远程操作 Codex",
+      "lead": 0.8,
+      "tail": 1.4
+    },
+    {
+      "id": "pair",
+      "kind": "phone",
+      "image": "docs/screenshots/android-pairing.jpg",
+      "narration": "扫码配对，十秒完成。手机不需要安装 Codex。",
+      "heading": "扫码配对",
+      "lead": 0.5,
+      "tail": 0.9
+    },
+    {
+      "id": "local",
+      "kind": "desktop",
+      "image": "docs/screenshots/web-workspace.png",
+      "trim": { "bottom": 104 },
+      "narration": "代码、命令和 Codex 全部在你的电脑上运行，手机只是遥控器。",
+      "heading": "本地执行",
+      "lead": 0.5,
+      "tail": 0.9
+    },
+    {
+      "id": "workspace",
+      "kind": "phone",
+      "image": "docs/screenshots/android-workspaces.jpg",
+      "narration": "切换工作区，继续已有会话，也可以随时发起新任务。",
+      "heading": "多工作区",
+      "lead": 0.5,
+      "tail": 0.9
+    },
+    {
+      "id": "model",
+      "kind": "phone",
+      "image": "docs/screenshots/android-model-picker.jpg",
+      "narration": "按供应商分组选择模型和思考强度，原会话里也能直接换。",
+      "heading": "模型与强度",
+      "lead": 0.5,
+      "tail": 0.9
+    },
+    {
+      "id": "transfer",
+      "kind": "phone",
+      "image": "docs/screenshots/android-file-transfer.jpg",
+      "narration": "文件传输助手走 P2P 直连，手机和电脑互传文件，不经过中继。",
+      "heading": "P2P 文件传输",
+      "lead": 0.5,
+      "tail": 0.9
+    },
+    {
+      "id": "agent",
+      "kind": "desktop",
+      "image": "docs/screenshots/agent-settings.png",
+      "narration": "电脑端 Agent 管理连接、配对和更新。Linux 还支持 QQ 和微信机器人。",
+      "heading": "电脑端 Agent",
+      "lead": 0.5,
+      "tail": 0.9
+    },
+    {
+      "id": "outro",
+      "kind": "solid",
+      "tts_text": "Codex R M，开源，端到端加密，随时待命。",
+      "narration": "CodexRM，开源，端到端加密，随时待命。",
+      "heading": "CodexRM",
+      "caption": "github.com/CyL-Cly/CodexRM",
+      "lead": 0.7,
+      "tail": 1.8
+    }
+  ]
+}
