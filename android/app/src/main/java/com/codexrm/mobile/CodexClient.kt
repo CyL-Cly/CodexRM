@@ -595,7 +595,7 @@ internal class CodexClient(
             }
             "offer" -> if (id == directId) {
                 if (device.secureKey.isNotEmpty() && !verifyDirectPin(device, id, signal)) {
-                    dropDirect("??????????")
+                    dropDirect("直连身份验证失败。")
                 } else direct?.signal(signal) ?: Unit
             }
             "ready" -> if (id == directId) direct?.signal(signal) ?: Unit

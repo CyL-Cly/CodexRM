@@ -563,7 +563,7 @@ internal class MainActivity : ComponentActivity() {
         }
         pairError = error
         card.addView(error, matchWidth(top = 8))
-        val submit = Ui.button(this, if (pairCall == null) "使用配对码连接" else "正在连接…") { submitManualPair() }.apply {
+        val submit = Ui.button(this, getString(if (pairCall == null) R.string.pair_connect else R.string.pair_connecting)) { submitManualPair() }.apply {
             isEnabled = pairCall == null
         }
         pairSubmit = submit
@@ -582,7 +582,7 @@ internal class MainActivity : ComponentActivity() {
 
     private fun submitManualPair() {
         try { pair(PairingLink.parse(codeInput?.text?.toString().orEmpty(), serverInput?.text?.toString().orEmpty())) }
-        catch (error: Exception) { showPairError(error.message ?: "配对信息无效") }
+        catch (error: Exception) { showPairError(error.message ?: getString(R.string.pair_invalid)) }
     }
 
     private fun cancelPairRequest() {
@@ -593,11 +593,11 @@ internal class MainActivity : ComponentActivity() {
 
     private fun pair(data: PairingData) {
         val invitation = try { SecureInvitation.parse(data.code) } catch (error: IllegalArgumentException) {
-            showPairError(error.message ?: "?????")
+            showPairError(error.message ?: getString(R.string.pair_invalid))
             return
         }
         if (!NativeP2P.available) {
-            showPairError("??????????????? Android App")
+            showPairError(getString(R.string.pair_secure_unavailable))
             return
         }
         connectPair(data.serverUrl, invitation)
@@ -607,11 +607,11 @@ internal class MainActivity : ComponentActivity() {
         cancelPairRequest()
         val operation = ++pairOperation
         pairSubmit?.isEnabled = false
-        pairSubmit?.text = "?????"
+        pairSubmit?.text = getString(R.string.pair_connecting)
         pairError?.visibility = View.GONE
         fun finishPairRequest() {
             pairSubmit?.isEnabled = true
-            pairSubmit?.text = "???????"
+            pairSubmit?.text = getString(R.string.pair_connect)
             pairCall = null
             cancelPairVerification = null
         }
@@ -624,16 +624,16 @@ internal class MainActivity : ComponentActivity() {
             if (error != null || result == null) {
                 finishPairRequest()
                 showPairError(when (error?.status) {
-                    404 -> "????????????????????????"
-                    409 -> "????????????"
-                    410 -> "????????????????"
-                    else -> error?.message ?: "????"
+                    404 -> getString(R.string.pair_not_found)
+                    409 -> getString(R.string.pair_already_used)
+                    410 -> getString(R.string.pair_expired)
+                    else -> error?.message ?: getString(R.string.pair_failed)
                 })
                 return@request
             }
             val routed = try { Device.fromClaim(serverUrl, result) } catch (exception: Exception) {
                 finishPairRequest()
-                showPairError(exception.message ?: "??????")
+                showPairError(exception.message ?: getString(R.string.pair_invalid_response))
                 return@request
             }
             cancelPairVerification = verifySecurePairing(routed, invitation) { key, failure ->
@@ -641,7 +641,7 @@ internal class MainActivity : ComponentActivity() {
                 finishPairRequest()
                 if (key == null) {
                     Network.request(routed.serverUrl, "/api/v1/client/revoke", routed.token, JSONObject()) { _, _ -> }
-                    showPairError(failure ?: "????")
+                    showPairError(failure ?: getString(R.string.pair_verification_failed))
                     return@verifySecurePairing
                 }
                 val paired = routed.copy(secureKey = key)
@@ -652,7 +652,7 @@ internal class MainActivity : ComponentActivity() {
                 disconnect()
                 device = paired; pairMessage = ""; restoreThreadId = ""
                 if (old != null && old.token != paired.token) Network.request(old.serverUrl, "/api/v1/client/revoke", old.token, JSONObject()) { _, _ -> }
-                toast("??? ${paired.serverName}")
+                toast(getString(R.string.pair_success, paired.serverName))
                 settingsPage?.dismiss()
                 settingsPage = null
                 showMain(reset = true)

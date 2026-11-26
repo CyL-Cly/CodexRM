@@ -4,4 +4,15 @@
     <string name="chat_widget_label">CodexRM 会话快捷入口</string>
     <string name="chat_entry_new">新建会话</string>
     <string name="chat_entry_search">搜索会话</string>
+    <string name="pair_connect">使用配对码连接</string>
+    <string name="pair_connecting">正在连接…</string>
+    <string name="pair_success">配对成功：%1$s</string>
+    <string name="pair_invalid">配对信息无效</string>
+    <string name="pair_secure_unavailable">当前版本不支持加密配对，请更新 Android App</string>
+    <string name="pair_not_found">找不到这个配对码，请确认输入正确，或在电脑上重新生成</string>
+    <string name="pair_already_used">配对码已使用，请重新生成</string>
+    <string name="pair_expired">配对码已过期，请在电脑上重新生成</string>
+    <string name="pair_failed">配对失败</string>
+    <string name="pair_invalid_response">配对响应无效</string>
+    <string name="pair_verification_failed">加密配对验证失败</string>
 </resources>

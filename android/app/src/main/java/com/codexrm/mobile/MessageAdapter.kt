@@ -27,7 +27,7 @@ internal class MessageAdapter(
     private val answerQuestions: (ChatMessage) -> Unit = {},
     private val answerState: (ChatMessage) -> String? = { null },
     private val speak: ((ChatMessage) -> Unit)? = null,
-    private val loadVisualization: VisualizationLoader = { _, done -> done(null, "???????????") },
+    private val loadVisualization: VisualizationLoader = { _, done -> done(null, "无法加载可视化预览") },
 ) : BaseAdapter() {
     private val messages = ArrayList<ChatMessage>()
     private val displayRows = ArrayList<MessageDisplayRow>()
