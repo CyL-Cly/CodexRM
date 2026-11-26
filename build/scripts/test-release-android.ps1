@@ -24,7 +24,7 @@ foreach ($key in @('JAVA_EXE','BUILD_PROXY','ANDROID_HOME','ANDROID_SDK_ROOT','C
 $env:JAVA_EXE = $fixtureTool
 $env:BUILD_PROXY = ''
 $env:CODEXRM_ANDROID_TEST_ROOT = $testRoot
-$goCommand = (Get-Command go -CommandType Application -ErrorAction Stop).Source
+$goCommand = (Get-Command go -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 
 function Assert-AndroidRelease([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }

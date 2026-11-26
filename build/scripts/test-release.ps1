@@ -20,7 +20,7 @@ $previousFixtureAgent = $env:CODEXRM_RELEASE_FIXTURE_AGENT
 $previousFixtureCode = $env:CODEXRM_RELEASE_FIXTURE_CODE_OVERRIDE
 $previousFixtureName = $env:CODEXRM_RELEASE_FIXTURE_NAME_OVERRIDE
 $env:CODEXRM_RELEASE_TEST_LOG = $logPath
-$goCommand = (Get-Command go -ErrorAction Stop).Source
+$goCommand = (Get-Command go -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $fixtureSource = Join-Path $testRoot 'publisher.go'
 $fixturePublisher = Join-Path $testRoot 'fixture-publisher.exe'
 @'
