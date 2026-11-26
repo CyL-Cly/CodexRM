@@ -39,9 +39,11 @@ internal class Markdown(
     download: (ArtifactCard) -> Unit = {},
 ) {
     private var streaming = false
+    private var allowVisualizations = false
     private val imagePlugin = MessageImagesPlugin(context, images)
     private val markwon = Markwon.builder(context)
         .usePlugin(imagePlugin)
+        .usePlugin(VisualizationLinks({ allowVisualizations }, { streaming }))
         .usePlugin(MarkwonInlineParserPlugin.create(MathParser.inlineFactory { streaming }))
         .usePlugin(MathParser { streaming })
         .usePlugin(PreparedMath(context))
@@ -100,7 +102,7 @@ internal class Markdown(
                         visitor.builder().append("预览图表")
                         visitor.setSpans(diagram, object : ClickableSpan() {
                             override fun onClick(widget: android.view.View) {
-                                val inline = widget.tag as? InlineMermaid
+                                val inline = (widget.tag as? MessagePreviews)?.diagram
                                 if (inline == null) MermaidPreview.show(widget.context, code, Ui.dark)
                                 else inline.toggle(code)
                             }
@@ -147,7 +149,7 @@ internal class Markdown(
     fun bind(view: TextView, message: ChatMessage, prepared: Spanned? = null, preserveMathScroll: Boolean = false): Boolean {
         val rendered = prepared ?: message.rendered as? Spanned ?: when (message.kind) {
             MessageKind.TOOL, MessageKind.ERROR, MessageKind.STATUS -> SpannedString(message.body)
-            else -> render(message.body, message.id)
+            else -> render(message.body, message.id, assistant = message.kind == MessageKind.ASSISTANT)
         }.also { message.rendered = it }
         val user = message.kind == MessageKind.USER
         val imageSpans = if (user) rendered.getSpans(0, rendered.length, AsyncDrawableSpan::class.java) else emptyArray()
@@ -181,14 +183,16 @@ internal class Markdown(
 
     fun clear(view: TextView) = markwon.setParsedMarkdown(view, SpannedString(""))
 
-    fun render(source: String, messageId: String, streaming: Boolean = false): Spanned {
+    fun render(source: String, messageId: String, streaming: Boolean = false, assistant: Boolean = false): Spanned {
         imagePlugin.messageId = messageId
         this.streaming = streaming
+        allowVisualizations = assistant
         return try {
             markwon.toMarkdown(source)
         } finally {
             imagePlugin.messageId = ""
             this.streaming = false
+            allowVisualizations = false
         }
     }
 

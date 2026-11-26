@@ -31,6 +31,18 @@ Android APK 不在 GitHub Releases 或 Nightly 发布。首次安装请向部署
 - 支持后台任务通知、深色模式、自定义聊天背景和系统分享。下载位置可在设置中调整。
 - **文件传输助手** 通过 P2P 直连在手机与电脑之间发送文件或文字，不需要创建 Codex 会话。在 Windows 上可从 Agent 托盘打开对应的文件传输页。
 
+#### Visualize 互动图表
+
+在启用了 Visualize 技能的会话中请求图表，然后点助手回复里的「展开互动图表」。宽幅图表直接全屏；切换全屏不会重载，收起或离开会话后不会保存图表内部状态。需要连通支持 `inlineVisualizations` 的 Agent 或 Android 本机运行扩展，**无需开启远程文件管理**。普通 HTML 链接和代码块不会在聊天里执行。
+
+Agent 仅返回当前会话助手明确引用的 UTF-8 HTML（上限 1 MiB），文件须位于该会话的可视化目录或工作区。图表在不透明 iframe 中运行，内置共享样式、Floating UI 和 Lucide；标准图表仅可额外加载 `persistent.oaistatic.com` 上有版本的图表模块。自包含图表无需手机访问 CDN；不支持从图表向 Codex 发起追问。
+
+在 `com.codexrm.mobile.imageqa` 测试包中可运行以下真机验收（加 `-e liveChart true` 验证联网标准图表）：
+
+```powershell
+adb shell am instrument -w -r -e visualizationCheck true com.codexrm.mobile.imageqa.test/com.codexrm.mobile.ImageRenderingInstrumentation
+```
+
 ### 安卓本机 Codex
 
 在 Android 11 或更新的 ARM64 设备上，从设备列表选择「本机 Codex」。首次使用时从 Cloudreve 下载并安装独立 APK「Codex 本地运行扩展」，随后按系统提示给**扩展**开启「所有文件访问权限」。主 APK 不包含 Codex；扩展可单独卸载。该授权覆盖共享存储，不包含其他应用的私有目录。 已安装的扩展有新版本时，可进入「设置 → 本机 Codex 设置 → 更新本机运行扩展」。扩展与主应用复用校验和安装流程；首次安装或从其他安装渠道迁移仍可能需要 Android 确认。同一安装来源后续更新在系统允许时免确认。

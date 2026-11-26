@@ -27,6 +27,7 @@ internal class MessageAdapter(
     private val answerQuestions: (ChatMessage) -> Unit = {},
     private val answerState: (ChatMessage) -> String? = { null },
     private val speak: ((ChatMessage) -> Unit)? = null,
+    private val loadVisualization: VisualizationLoader = { _, done -> done(null, "???????????") },
 ) : BaseAdapter() {
     private val messages = ArrayList<ChatMessage>()
     private val displayRows = ArrayList<MessageDisplayRow>()
@@ -64,7 +65,7 @@ internal class MessageAdapter(
         rendering = true
         renderWorker.execute {
             val result = try {
-                streamMarkdown.render(request.text, row.message.id, request.streaming)
+                streamMarkdown.render(request.text, row.message.id, request.streaming, assistant = row.message.kind == MessageKind.ASSISTANT)
             } catch (_: RuntimeException) {
                 SpannedString(request.text)
             }
@@ -227,7 +228,7 @@ internal class MessageAdapter(
         val answer: MiuixButtonView,
         val images: LinearLayout,
         val files: LinearLayout,
-        val diagram: InlineMermaid,
+        val previews: MessagePreviews,
         var answerStatus: String? = null,
         var boundBubbleOpacity: Int = -1,
         var boundMessage: ChatMessage? = null,
@@ -255,7 +256,7 @@ internal class MessageAdapter(
         holder.boundBubbleOpacity = bubbleOpacity
         val sameMessage = holder.boundMessage === message && holder.boundRow?.groupHeader == groupHeader
         val prepared = streamRows[message.id]?.displayed
-        if (!sameMessage) holder.diagram.clear()
+        if (!sameMessage) holder.previews.clear()
         holder.boundMessage = message
         holder.boundRow = row
         // An expanded header and its latest content share a message. Let the content clear dirty.
@@ -476,20 +477,23 @@ internal class MessageAdapter(
         val files = Ui.column(context)
         val diagramPanel = Ui.column(context).apply { visibility = View.GONE }
         val diagram = InlineMermaid(diagramPanel)
-        body.tag = diagram
+        val visualizationPanel = Ui.column(context).apply { visibility = View.GONE }
+        val previews = MessagePreviews(diagram, InlineVisualization(visualizationPanel, loadVisualization))
+        body.tag = previews
         root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(view: View) = Unit
-            override fun onViewDetachedFromWindow(view: View) = diagram.clear()
+            override fun onViewDetachedFromWindow(view: View) = previews.clear()
         })
         val answer = Ui.button(context, "回答问题", primary = true) {}
         content.addView(header)
         content.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         content.addView(diagramPanel, LinearLayout.LayoutParams(-1, -2))
+        content.addView(visualizationPanel, LinearLayout.LayoutParams(-1, -2))
         root.addView(content, LinearLayout.LayoutParams(-1, -2))
         root.addView(images, LinearLayout.LayoutParams(-1, -2))
         root.addView(files, LinearLayout.LayoutParams(-1, -2))
         root.addView(answer)
         root.addView(actions)
-        return Holder(root, content, header, iconFrame, title, status, body, copy, read, answer, images, files, diagram).also { root.tag = it }
+        return Holder(root, content, header, iconFrame, title, status, body, copy, read, answer, images, files, previews).also { root.tag = it }
     }
 }

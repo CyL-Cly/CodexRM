@@ -1,0 +1,7 @@
+# Visualize Page assets
+
+`visualize.html` and `visualize.css` are based on the Apache-2.0 `codex-rs/tui/assets/inline_visualization` files in `openai/codex` at `0ffae14a4316d67eae25a0539e72345d0ece7118`. The template retains the `<!--__INLINE_VISUALIZATION_FRAGMENT__-->` marker. CodexRM replaces the external helper script URLs with app-bundled scripts served from a separate synthetic origin, and supplies the frame, CSP and the `openai` theme globals.
+
+Bundled scripts: `@floating-ui/core` and `@floating-ui/dom` 1.8.0 (MIT), and the minified UMD distribution of `lucide` 1.50.0 (ISC and Feather MIT notice). The matching upstream licenses are included alongside the files and listed in the Android app's open source notices.
+
+The sandbox should contain `allow-scripts` only; do not add `allow-same-origin` or expose an Android JavaScript interface to authored fragments. An app-side resource filter permits local helper scripts and versioned OpenAI chart modules only; it must not forward arbitrary requests, WebView cookies or redirects.

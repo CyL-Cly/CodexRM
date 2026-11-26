@@ -30,6 +30,10 @@ class ImageRenderingInstrumentation : Instrumentation() {
     override fun onCreate(arguments: Bundle?) { super.onCreate(arguments); args = arguments ?: Bundle(); start() }
 
     override fun onStart() {
+        if (args.getString("visualizationCheck") == "true") {
+            VisualizationRenderingCheck.run(this, liveChart = args.getString("liveChart") == "true")
+            return
+        }
         if (args.getString("predictiveBack") == "true") {
             PredictiveBackCheck.run(this, realGesture = args.getString("deviceGesture") == "true")
             return

@@ -725,7 +725,7 @@ internal class MainActivity : ComponentActivity() {
             workspaceFiles.size(RemoteFile(currentCwd, currentThreadId, file.path), done)
         }, ::openMessageFile, { file ->
             workspaceFiles.isDownloaded(RemoteFile(currentCwd, currentThreadId, file.path))
-        }, ::showAsyncQuestions, ::asyncQuestionStatus, { message -> replySpeech.toggle(message.id, message.body) })
+        }, ::showAsyncQuestions, ::asyncQuestionStatus, { message -> replySpeech.toggle(message.id, message.body) }, ::loadVisualization)
         updateDirectFiles()
         mainRoot = SidebarSwipeLayout(
             this,
@@ -5707,6 +5707,27 @@ internal class MainActivity : ComponentActivity() {
             adapter.showFileCards = client?.usingDirect == true && supportsFileDownloads()
         }
     }
+    private fun loadVisualization(ref: VisualizationRef, done: (String?, String?) -> Unit) {
+        val connection = client
+        val thread = currentThreadId
+        if (!online || connection == null || thread.isBlank()) {
+            done(null, "连接运行 Codex 的设备后重试")
+            return
+        }
+        if (!info.optBoolean("inlineVisualizations")) {
+            done(null, "当前 Agent 或本机运行扩展不支持互动图表，请更新后重试")
+            return
+        }
+        val scope = openGeneration
+        connection.request("codexrm/visualization/read", JSONObject().put("threadId", thread).put("path", ref.path), 15_000) { result, error ->
+            if (isDestroyed || client !== connection || currentThreadId != thread || openGeneration != scope) {
+                done(null, "连接或会话已切换，请重试")
+            } else {
+                done(result?.string("html"), error?.message)
+            }
+        }
+    }
+
     private fun openMessageFile(file: ArtifactCard) {
         workspaceFiles.openOrDownload(RemoteFile(currentCwd, currentThreadId, file.path), file.name)
     }
